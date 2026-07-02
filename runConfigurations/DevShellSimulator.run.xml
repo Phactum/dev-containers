@@ -1,0 +1,21 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="DevShellSimulator" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot" nameIsGenerated="true">
+    <module name="dev-shell-simulator" />
+    <option name="PROGRAM_PARAMETERS" value="--spring.config.additional-location=__WORKSPACE_PATH__/blueprint-workflowmodule-springboot-standalone-businesscockpit/dev-shell-users.yaml" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="io.vanillabp.cockpit.devshell.simulator.DevShellSimulator" />
+    <option name="VM_PARAMETERS" value="-Dxspring.datasource.url=&quot;jdbc:h2:file:./dev-shell-simulator.h2;DB_CLOSE_ON_EXIT=FALSE&quot;" />
+    <extension name="net.ashald.envfile">
+      <option name="IS_ENABLED" value="false" />
+      <option name="IS_SUBST" value="false" />
+      <option name="IS_PATH_MACRO_SUPPORTED" value="false" />
+      <option name="IS_IGNORE_MISSING_FILES" value="false" />
+      <option name="IS_ENABLE_EXPERIMENTAL_INTEGRATIONS" value="false" />
+      <ENTRIES>
+        <ENTRY IS_ENABLED="true" PARSER="runconfig" IS_EXECUTABLE="false" />
+      </ENTRIES>
+    </extension>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

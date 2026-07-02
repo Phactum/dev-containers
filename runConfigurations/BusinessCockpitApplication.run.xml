@@ -1,0 +1,24 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="BusinessCockpitApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot" nameIsGenerated="true">
+    <option name="ACTIVE_PROFILES" value="local" />
+    <envs>
+      <env name="workerId" value="local" />
+    </envs>
+    <module name="container" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="io.vanillabp.cockpit.BusinessCockpitApplication" />
+    <option name="VM_PARAMETERS" value="-Dserver.port=9080 -Dxlogging.level.org.springframework.security=TRACE -Dinitializer.rollback.unknown=TRUE -Dspring.kafka.consumer.bootstrap-servers=localhost:9092" />
+    <extension name="net.ashald.envfile">
+      <option name="IS_ENABLED" value="false" />
+      <option name="IS_SUBST" value="false" />
+      <option name="IS_PATH_MACRO_SUPPORTED" value="false" />
+      <option name="IS_IGNORE_MISSING_FILES" value="false" />
+      <option name="IS_ENABLE_EXPERIMENTAL_INTEGRATIONS" value="false" />
+      <ENTRIES>
+        <ENTRY IS_ENABLED="true" PARSER="runconfig" IS_EXECUTABLE="false" />
+      </ENTRIES>
+    </extension>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
