@@ -16,9 +16,9 @@ Each story gets:
 - Claude plugin Caveman installed (mode full)
 
 Watch videos showing:
-1. ![Create the dev-container definition](readme/clone-and-spawn.mov) (00:47)
-2. ![Build the dev-container](readme/dev-container-build.mov) (05:06)
-3. ![Open the dev-container, run Claude, use a predefined run-configuration](readme/claude-and-business-cockpit.mov) (01:34)
+1. *Create the dev-container definition (00:47):* <br> <video src="readme/clone-and-spawn.mov" controls width="600"></video>
+2. *Build the dev-container (05:06):* <br> <video src="readme/dev-container-build.mov" controls width="600"></video>
+3. *Open the dev-container, run Claude, use a predefined run-configuration (01:34):* <br> <video src="readme/claude-and-business-cockpit.mov" controls width="600"></video>
 
 ## Files
 
