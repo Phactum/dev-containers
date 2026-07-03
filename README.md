@@ -15,6 +15,11 @@ Each story gets:
 - all Maven repos are built to ensure all dependencies are available
 - Claude plugin Caveman installed (mode full)
 
+Watch videos showing:
+1. [Create the dev-container definition](readme/clone-and-spawn.mov) (00:47)
+2. [Build the dev-container](readme/dev-container-build.mov) (05:06)
+3. [Open the dev-container, run Claude, use a predefined run-configuration](readme/claude-and-business-cockpit.mov) (01:34)
+
 ## Files
 
 | File / Directory          | Purpose                                                          |
@@ -62,7 +67,7 @@ To add/change run configs:
 *Hint:* To get an XML from an existing run configuration one can use the
 `store as project file` feature:
 
-![store as project file](run-configuration-store-as-project-file.png)
+![store as project file](readme/run-configuration-store-as-project-file.png)
 
 **Avoid `$PROJECT_DIR$` in run config fields passed to external processes.**
 In JetBrains Gateway's ijent/Eel mode (2025.x+), `$PROJECT_DIR$` expands to
