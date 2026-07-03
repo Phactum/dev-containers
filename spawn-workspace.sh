@@ -101,7 +101,11 @@
 # 9. Host integration mounts (read-only where appropriate)
 #    ~/.ssh is mounted readonly so git finds keys out of the box. ~/.m2 is
 #    mounted writable so the Maven cache survives container rebuilds and is
-#    shared across stories. The host's glab config directory is mounted
+#    shared across stories. ~/.npm (npm's package cache) is mounted writable
+#    so npm packages downloaded once are reused across container rebuilds and
+#    stories -- npm's cache format is platform-neutral (tarballs + metadata),
+#    so the macOS host cache is valid inside the Linux container. The host's
+#    glab config directory is mounted
 #    writable onto the container's ~/.config/glab-cli; spawn-workspace.sh
 #    resolves the host path per OS (macOS: ~/Library/Application Support/
 #    glab-cli, Linux: ~/.config/glab-cli) so the GitLab CLI login flows
@@ -462,6 +466,16 @@ fi
 
 mkdir -p "${WS_DIR}"
 
+# Tell macOS Spotlight (mds) to never index this workspace directory.
+# Without this, Spotlight aggressively reads every file that npm writes into
+# node_modules (tens of thousands of files for storybook-scale packages) while
+# npm is still extracting them. The resulting I/O contention makes npm 10-100x
+# slower and freezes the IntelliJ Welcome Screen UI (which can no longer process
+# its event loop). The workspace root is a natural exclusion boundary: the source
+# repos upstream stay fully Spotlight-searchable; only the per-story worktrees
+# (typically build artifacts, node_modules, Maven output) are excluded.
+touch "${WS_DIR}/.metadata_never_index"
+
 # Resolve a base ref against the *current* repo: prefer origin/<ref>, fall back to <ref>.
 resolve_base() {
     local ref="$1"
@@ -584,6 +598,45 @@ for repo in "${REPO_NAMES[@]}"; do
     # detailed mechanism.
     git -C "${src_repo}" config core.checkStat minimal
     git -C "${src_repo}" config core.trustctime false
+done
+
+# Collect npm module directories for Docker named-volume node_modules mounts.
+#
+# Root cause of npm slowness on macOS devcontainers: Docker Desktop's
+# Virtualization.framework (com.apple.Virtualization.VirtualMachine XPC service)
+# bridges every file read/write between the Linux VM and the macOS bind-mount.
+# For storybook-scale packages (40 000+ files in node_modules), this XPC bridge
+# becomes the bottleneck -- the process holds 40 000+ open file descriptors while
+# npm is still writing, making npm 10-100x slower.
+#
+# Fix: mount each module's node_modules as a Docker named volume instead of
+# letting it live in the bind-mounted workspace. Named volumes are backed by the
+# Docker VM's own ext4 filesystem; the Virtualization.framework never touches
+# individual files inside them. npm writes at Linux-native speed.
+#
+# Naming: ${PROJECT_SHORT}-${LEAF}-<slug>-nm, where <slug> is the module's
+# workspace-relative path with / replaced by -. dispose-workspace.sh removes
+# all volumes associated with the container via `docker inspect`, so cleanup
+# is automatic on dispose.
+NPM_MODULE_DIRS=()
+while IFS= read -r pj; do
+    pj_dir="$(dirname "${pj}")"
+    rel="${pj_dir#${WS_DIR}/}"
+    # Guard: skip if WS_DIR was not a prefix (shouldn't happen)
+    [[ "${rel}" == "${pj_dir}" ]] && continue
+    NPM_MODULE_DIRS+=("${rel}")
+done < <(find "${WS_DIR}" -name "package.json" \
+    -not -path "*/node_modules/*" \
+    -not -path "*/.git/*" \
+    2>/dev/null)
+
+# Build the JSON fragment for injection into the devcontainer.json mounts array.
+# Each line adds a leading comma so it can be appended after the last fixed mount.
+NPM_NM_VOLUME_MOUNTS=""
+for rel_dir in "${NPM_MODULE_DIRS[@]}"; do
+    slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
+    vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
+    NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
 done
 
 # NO aggregator pom.xml at the workspace root.
@@ -1030,7 +1083,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
     // glab-cli's source dir is resolved by spawn-workspace.sh (macOS uses
     // ~/Library/Application Support/glab-cli, Linux uses ~/.config/glab-cli)
     // and pre-created there, so no mkdir needed here.
-    "initializeCommand": "mkdir -p ~/.m2 ~/.ssh ~/.claude ~/.claude/projects/__MEMORY_KEY__/memory && touch ~/.claude.json",
+    "initializeCommand": "mkdir -p ~/.m2 ~/.npm ~/.ssh ~/.claude ~/.claude/projects/__MEMORY_KEY__/memory && touch ~/.claude.json",
 
     // Mount order matters: deeper paths must come AFTER their parents so they take
     // precedence. The layering is:
@@ -1052,6 +1105,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
 
         "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.m2,target=/home/vscode/.m2,type=bind",
+        "source=${localEnv:HOME}/.npm,target=/home/vscode/.npm,type=bind",
         // __GLAB_BLOCK_START__
         // glab CLI config (token for the configured GitLab host). Bind-mounted
         // rw so the login is shared between host and container -- 'glab auth
@@ -1073,6 +1127,12 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
         "source=__PROJECT_SHORT__-claude-project-${devcontainerId},target=/home/vscode/.claude/projects/__MEMORY_KEY__,type=volume",
         "source=${localEnv:HOME}/.claude/projects/__MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind"
+        // node_modules volumes: one Docker named volume per npm module. These are
+        // generated by spawn-workspace.sh from the package.json files found in
+        // the workspace. Named volumes bypass the Virtualization.framework XPC
+        // bind-mount bridge, eliminating the I/O bottleneck that makes npm
+        // 10-100x slower on macOS. dispose-workspace.sh removes them automatically.
+__NPM_NM_VOLUME_MOUNTS__
     ],
 
     "remoteUser": "vscode",
@@ -1271,6 +1331,28 @@ for rc in "${WS_DIR}"/.idea/runConfigurations/*.xml; do
     substitute_placeholders "${rc}"
 done
 
+# Substitute __NPM_NM_VOLUME_MOUNTS__ with the actual volume mount JSON lines.
+# substitute_placeholders uses sed which can only do single-line replacements;
+# the node_modules volume mounts span multiple lines, so we use awk + a temp
+# file here. The awk script replaces the placeholder line with the file's
+# contents; if NPM_MODULE_DIRS is empty the temp file is empty and the
+# placeholder line is simply removed.
+{
+    _nm_tmp="$(mktemp)"
+    printf '%b' "${NPM_NM_VOLUME_MOUNTS}" > "${_nm_tmp}"
+    awk -v mf="${_nm_tmp}" '
+        /__NPM_NM_VOLUME_MOUNTS__/ {
+            while ((getline line < mf) > 0) print line
+            next
+        }
+        { print }
+    ' "${WS_DIR}/.devcontainer/devcontainer.json" \
+      > "${WS_DIR}/.devcontainer/devcontainer.json.nm_tmp"
+    mv "${WS_DIR}/.devcontainer/devcontainer.json.nm_tmp" \
+       "${WS_DIR}/.devcontainer/devcontainer.json"
+    rm "${_nm_tmp}"
+}
+
 cat > "${WS_DIR}/.devcontainer/post-create.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1305,6 +1387,23 @@ fi
 
 cd __WORKSPACE_PATH__
 
+# Docker named volumes are created with root:root ownership, but all build
+# tools in this container run as 'vscode'. Every node_modules directory that
+# is backed by a named volume (see devcontainer.json mounts) starts life as
+# a root-owned mount point and must be chowned before npm can write to it.
+# We do this once here, before any Maven/npm invocation, using sudo (which
+# the vscode user has password-free via the base image's sudoers config).
+# `find -name node_modules` discovers ALL such directories including ones
+# for modules that don't exist yet; they still appear as empty root-owned
+# directories because Docker creates the mount point when the volume is mounted.
+sudo find __WORKSPACE_PATH__ \
+    -maxdepth 10 \
+    -name node_modules \
+    -type d \
+    -not -path '*/node_modules/*/node_modules' \
+    2>/dev/null \
+    -exec chown vscode:vscode {} \; || true
+
 # Copy the resolved npmrc that spawn-workspace.sh produced. It already has
 # macOS paths stripped and any forwarded token placeholders substituted with
 # values from the spawn shell, so npm in the container can auth against
@@ -1316,6 +1415,25 @@ if [[ -f "${RESOLVED_NPMRC}" ]]; then
 else
     echo "WARN: ${RESOLVED_NPMRC} not found -- npm install of private packages will 401" >&2
 fi
+
+# Prevent npm audit and fund network requests from hanging the build.
+#
+# npm v10 runs `npm audit` automatically after every install-like operation,
+# including `npm link`. The audit makes an HTTP POST to the npmjs.org security
+# endpoint. When IntelliJ is simultaneously doing its initial Maven sync
+# (on first container start from the Welcome Screen), the competing I/O
+# saturates the connection, and the audit request stalls indefinitely.
+# The node process idles at 0% CPU waiting for a response that never comes.
+#
+# npm always reads ~/.npmrc, regardless of whether the npm binary is the
+# system-installed one or frontend-maven-plugin's own copy in /tmp/. Setting
+# audit=false here therefore disables the problematic network call for ALL
+# npm invocations (install, update, link, publish) without touching the
+# project's pom.xml or package.json.
+cat >> /home/vscode/.npmrc <<'NPMRC'
+audit=false
+fund=false
+NPMRC
 
 # install Claude Code globally — via login shell so npm/node from the Node feature
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
@@ -1583,6 +1701,18 @@ cat > "${WS_DIR}/.devcontainer/post-start.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Step 0: raise inotify limits before any build or IDE watcher starts.
+# Docker Desktop's Linux VM ships conservative defaults (max_user_watches=8192,
+# max_queued_events=16384). Large npm installs (storybook-scale node_modules)
+# generate tens of thousands of filesystem events; if the inotify event queue
+# overflows while ijent's VFS watcher and npm are both active, the kernel drops
+# events and sends IN_Q_OVERFLOW to all watchers. ijent reacts with a full
+# workspace rescan that competes with npm's concurrent file writes, causing npm
+# to stall indefinitely on a file operation that never completes.
+# These are per-user limits, not system-wide, so no security concern.
+sudo sysctl -w fs.inotify.max_user_watches=524288  2>/dev/null || true
+sudo sysctl -w fs.inotify.max_queued_events=1048576 2>/dev/null || true
+
 # Step 1: make sure dockerd is up (via docker-init.sh fallback to direct
 # invocation). The DinD feature relies on its entrypoint to start dockerd,
 # but JetBrains Gateway overrides the entrypoint, so we kick it ourselves.
@@ -1741,6 +1871,24 @@ else
     else
         echo "WARN: sshd failed to start -- DB-tunnel data source won't work" >&2
     fi
+fi
+
+# Step 6: restart docker compose services if an initialize.sh hook exists.
+# postCreateCommand runs initialize.sh once (on first container creation), but
+# docker compose services that use restart: "no" (e.g. Verdaccio, MongoDB) are
+# NOT restarted when the container restarts -- only dockerd comes back via this
+# post-start hook. Without this step, those services stay dead after any
+# container restart (IntelliJ restart, Docker Desktop restart, manual
+# 'docker restart'), and any process that tries to reach them (npm → Verdaccio
+# on localhost:4873) gets a silent hang: Docker's internal port proxy still
+# accepts the TCP connection but no upstream process is listening.
+#
+# "docker compose up -d" is idempotent -- already-running services are left
+# alone, so running this on first start (right after postCreate) is harmless.
+INIT_HOOK="$(dirname "${BASH_SOURCE[0]}")/initialize.sh"
+if [[ -f "${INIT_HOOK}" ]]; then
+    echo "restarting compose services via initialize.sh..."
+    bash "${INIT_HOOK}"
 fi
 
 exit 0

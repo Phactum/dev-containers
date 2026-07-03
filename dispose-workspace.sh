@@ -41,6 +41,11 @@
 #     the devcontainer image (use --keep-container to skip all Docker cleanup, or
 #     --keep-image to remove the container and volumes but keep the image layer cache)
 #
+# Execution order: Docker container + volumes are removed FIRST (before worktrees).
+# This is required when node_modules directories are Docker named volumes: Docker
+# holds a lock on the volume mount-point while the container runs, preventing the
+# Mac from deleting those directories. Removing Docker first releases all locks.
+#
 set -euo pipefail
 
 # Source project config from .env.sh next to this script (PROJECT_NAME,
@@ -195,55 +200,26 @@ if [[ ${#DIRTY[@]} -gt 0 ]]; then
     fi
 fi
 
-# 2. remove worktrees from each source repo
-BRANCH=""   # remember branch name once we read it from a worktree (all repos share the same name)
-
+# 2. Capture branch name from worktrees before removing anything.
+# Done in a separate pass so Docker removal (step 3) can happen before worktree
+# removal (step 4) without losing the branch name needed for step 5.
+BRANCH=""
 for repo in "${REPO_NAMES[@]}"; do
-    src="${SOURCE_WS}/${repo}"
     wt="${WS_DIR}/${repo}"
-    [[ -d "${src}/.git" ]] || continue
-    [[ -e "${wt}"       ]] || continue
-
-    # capture the branch name on first hit (for optional branch deletion later)
-    if [[ -z "${BRANCH}" ]]; then
-        BRANCH="$(git -C "${wt}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    fi
-
-    echo "remove worktree: ${repo}"
-    if [[ ${FORCE} -eq 1 ]]; then
-        git -C "${src}" worktree remove --force "${wt}" 2>/dev/null || rm -rf "${wt}"
-    else
-        git -C "${src}" worktree remove "${wt}"
-    fi
-    git -C "${src}" worktree prune
+    [[ -e "${wt}" ]] || continue
+    BRANCH="$(git -C "${wt}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [[ -n "${BRANCH}" ]] && break
 done
 
-# 3. remove the workspace directory itself (devcontainer config, aggregator pom, claude copy)
-if [[ -d "${WS_DIR}" ]]; then
-    rm -rf "${WS_DIR}"
-    echo "removed: ${WS_DIR}"
-fi
-
-# 4. optional: delete the local branch in each source repo
-if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
-    echo
-    echo "deleting local branch '${BRANCH}' in source repos:"
-    for repo in "${REPO_NAMES[@]}"; do
-        src="${SOURCE_WS}/${repo}"
-        [[ -d "${src}/.git" ]] || continue
-        if git -C "${src}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-            if [[ ${FORCE} -eq 1 ]]; then
-                git -C "${src}" branch -D "${BRANCH}" || true
-            else
-                git -C "${src}" branch -d "${BRANCH}" || \
-                    echo "  ${repo}: branch not fully merged, keep or rerun with --force" >&2
-            fi
-        fi
-    done
-fi
-
-# 5. remove the Docker container, all its named volumes, and (by default) its
+# 3. Remove the Docker container, all its named volumes, and (by default) its
 # devcontainer image to reclaim disk space.
+#
+# IMPORTANT: this must run BEFORE worktree removal (step 4). When node_modules
+# directories are Docker named volumes (mounted over the workspace bind-mount),
+# Docker holds a lock on those paths while the container is running. The Mac
+# cannot delete the mount-point directories until the container and volumes are
+# removed. Removing Docker first releases the locks so step 4's rm -rf succeeds.
+#
 # spawn-workspace.sh names the container '<PROJECT_SHORT>-<leaf>' via runArgs.
 # Named volumes (including the per-story Claude project volume whose name embeds
 # a JetBrains devcontainerId hash) are discovered from the container at runtime.
@@ -270,6 +246,48 @@ if [[ ${KEEP_CONTAINER} -eq 0 ]]; then
     else
         echo "docker not on PATH, skipping container cleanup" >&2
     fi
+fi
+
+# 4. Remove worktrees from each source repo.
+# Docker volumes have been released in step 3, so node_modules mount-point
+# directories are now empty and deletable by the Mac user.
+for repo in "${REPO_NAMES[@]}"; do
+    src="${SOURCE_WS}/${repo}"
+    wt="${WS_DIR}/${repo}"
+    [[ -d "${src}/.git" ]] || continue
+    [[ -e "${wt}"       ]] || continue
+
+    echo "remove worktree: ${repo}"
+    if [[ ${FORCE} -eq 1 ]]; then
+        git -C "${src}" worktree remove --force "${wt}" 2>/dev/null || rm -rf "${wt}"
+    else
+        git -C "${src}" worktree remove "${wt}"
+    fi
+    git -C "${src}" worktree prune
+done
+
+# 5. Remove the workspace directory itself (devcontainer config, .idea, claude copy, …)
+if [[ -d "${WS_DIR}" ]]; then
+    rm -rf "${WS_DIR}"
+    echo "removed: ${WS_DIR}"
+fi
+
+# 6. Optional: delete the local branch in each source repo.
+if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
+    echo
+    echo "deleting local branch '${BRANCH}' in source repos:"
+    for repo in "${REPO_NAMES[@]}"; do
+        src="${SOURCE_WS}/${repo}"
+        [[ -d "${src}/.git" ]] || continue
+        if git -C "${src}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+            if [[ ${FORCE} -eq 1 ]]; then
+                git -C "${src}" branch -D "${BRANCH}" || true
+            else
+                git -C "${src}" branch -d "${BRANCH}" || \
+                    echo "  ${repo}: branch not fully merged, keep or rerun with --force" >&2
+            fi
+        fi
+    done
 fi
 
 echo
