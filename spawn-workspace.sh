@@ -1331,6 +1331,7 @@ substitute_placeholders() {
 }
 substitute_placeholders "${WS_DIR}/.devcontainer/devcontainer.json"
 for rc in "${WS_DIR}"/.idea/runConfigurations/*.xml; do
+    [[ -f "${rc}" ]] || continue
     substitute_placeholders "${rc}"
 done
 
