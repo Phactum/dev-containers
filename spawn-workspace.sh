@@ -632,12 +632,15 @@ done < <(find "${WS_DIR}" -name "package.json" \
 
 # Build the JSON fragment for injection into the devcontainer.json mounts array.
 # Each line adds a leading comma so it can be appended after the last fixed mount.
+# Length-guard: bash 3.2 + set -u fail on empty array expansion.
 NPM_NM_VOLUME_MOUNTS=""
-for rel_dir in "${NPM_MODULE_DIRS[@]}"; do
-    slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
-    vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
-    NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
-done
+if (( ${#NPM_MODULE_DIRS[@]} > 0 )); then
+    for rel_dir in "${NPM_MODULE_DIRS[@]}"; do
+        slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
+        vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
+        NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
+    done
+fi
 
 # NO aggregator pom.xml at the workspace root.
 # Subprojects' parent declarations (e.g. workflow-commons -> commons-web)
