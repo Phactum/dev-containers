@@ -101,11 +101,7 @@
 # 9. Host integration mounts (read-only where appropriate)
 #    ~/.ssh is mounted readonly so git finds keys out of the box. ~/.m2 is
 #    mounted writable so the Maven cache survives container rebuilds and is
-#    shared across stories. ~/.npm (npm's package cache) is mounted writable
-#    so npm packages downloaded once are reused across container rebuilds and
-#    stories -- npm's cache format is platform-neutral (tarballs + metadata),
-#    so the macOS host cache is valid inside the Linux container. The host's
-#    glab config directory is mounted
+#    shared across stories. The host's glab config directory is mounted
 #    writable onto the container's ~/.config/glab-cli; spawn-workspace.sh
 #    resolves the host path per OS (macOS: ~/Library/Application Support/
 #    glab-cli, Linux: ~/.config/glab-cli) so the GitLab CLI login flows
@@ -275,10 +271,29 @@ fi
 # Derive name-only list from REPOS (which is a "<name>:<base-ref>" map).
 # Most loops below only need names; the base-ref is consulted only when
 # creating worktrees for a brand-new branch.
+# Length-guard: bash 3.2 + set -u fail on empty array expansion.
 REPO_NAMES=()
-for entry in "${REPOS[@]}"; do
-    REPO_NAMES+=("${entry%%:*}")
-done
+if (( ${#REPOS[@]} > 0 )); then
+    for entry in "${REPOS[@]}"; do
+        REPO_NAMES+=("${entry%%:*}")
+    done
+fi
+
+# Mono-repo mode: REPOS=() in .env.sh signals that the source workspace IS
+# the git repo (project directory == repo directory). We synthesise a single
+# virtual entry so all downstream loops work without special-casing each one.
+MONO_REPO=0
+if (( ${#REPOS[@]} == 0 )); then
+    MONO_REPO=1
+    REPOS=("${PROJECT_NAME}:")
+    REPO_NAMES=("${PROJECT_NAME}")
+fi
+
+# Mono-repo default: when MAVEN_REPOS is also empty and a pom.xml exists at
+# the repo root, build the project as a single Maven reactor.
+if (( MONO_REPO == 1 )) && (( ${#MAVEN_REPOS[@]} == 0 )); then
+    [[ -f "${SOURCE_WS}/pom.xml" ]] && MAVEN_REPOS=("${PROJECT_NAME}:install")
+fi
 
 # Resolve the workspaces root directory in priority order:
 #   1. --workspaces-root CLI flag
@@ -294,6 +309,9 @@ if [[ ! -d "${WORKSPACES_ROOT}" ]]; then
     echo "Override with --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}." >&2
     exit 1
 fi
+# Canonicalise to an absolute path so bind-mount paths in devcontainer.json
+# are never relative (Docker requires absolute paths in mount source/target).
+WORKSPACES_ROOT="$(cd "${WORKSPACES_ROOT}" && pwd)"
 
 SOURCE_WS="${WORKSPACES_ROOT}/${PROJECT_NAME}"
 
@@ -466,16 +484,6 @@ fi
 
 mkdir -p "${WS_DIR}"
 
-# Tell macOS Spotlight (mds) to never index this workspace directory.
-# Without this, Spotlight aggressively reads every file that npm writes into
-# node_modules (tens of thousands of files for storybook-scale packages) while
-# npm is still extracting them. The resulting I/O contention makes npm 10-100x
-# slower and freezes the IntelliJ Welcome Screen UI (which can no longer process
-# its event loop). The workspace root is a natural exclusion boundary: the source
-# repos upstream stay fully Spotlight-searchable; only the per-story worktrees
-# (typically build artifacts, node_modules, Maven output) are excluded.
-touch "${WS_DIR}/.metadata_never_index"
-
 # Resolve a base ref against the *current* repo: prefer origin/<ref>, fall back to <ref>.
 resolve_base() {
     local ref="$1"
@@ -491,7 +499,13 @@ resolve_base() {
 create_worktree() {
     local repo="$1"
     local base_ref="$2"
-    local src="${SOURCE_WS}/${repo}"
+    # Mono-repo: the source workspace IS the git repo; no sub-directory.
+    local src
+    if (( MONO_REPO == 1 )); then
+        src="${SOURCE_WS}"
+    else
+        src="${SOURCE_WS}/${repo}"
+    fi
     local dst="${WS_DIR}/${repo}"
 
     if [[ ! -d "${src}/.git" ]]; then
@@ -501,6 +515,11 @@ create_worktree() {
 
     echo "worktree: ${repo} (base ${base_ref:-<origin/HEAD>})"
     pushd "${src}" >/dev/null
+
+    # Prune stale worktree entries before adding. Without this, a failed or
+    # mis-pathed previous spawn leaves git metadata pointing at a deleted
+    # directory, causing "already used by worktree" on the next attempt.
+    git worktree prune
 
     git fetch --quiet origin 2>/dev/null || true
 
@@ -586,7 +605,12 @@ done
 # these repos now also see core.filemode=false / autocrlf=input -- both
 # correct for macOS-mounted worktrees.
 for repo in "${REPO_NAMES[@]}"; do
-    src_repo="${SOURCE_WS}/${repo}"
+    # Mono-repo: git config lives at SOURCE_WS itself, not in a sub-directory.
+    if (( MONO_REPO == 1 )); then
+        src_repo="${SOURCE_WS}"
+    else
+        src_repo="${SOURCE_WS}/${repo}"
+    fi
     [[ -d "${src_repo}/.git" ]] || continue
     git -C "${src_repo}" config core.fileMode false
     git -C "${src_repo}" config core.autocrlf input
@@ -738,15 +762,18 @@ echo "${PROJECT_SHORT} ${LEAF}" > "${WS_DIR}/.idea/.name"
 # IntelliJ then rewrites misc.xml itself.
 # Build the MavenProjectsManager originalFiles list at spawn time so it
 # only contains the poms whose source repos actually got checked out.
+# Length-guard: bash 3.2 + set -u fail on empty array expansion.
 MAVEN_POMS_LIST=""
 MAVEN_BUILD_COMMANDS=""
-for entry in "${MAVEN_REPOS[@]}"; do
-    r="${entry%%:*}"
-    cmd="${entry#*:}"
-    [[ -f "${WS_DIR}/${r}/pom.xml" ]] && \
-        MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
-    MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
-done
+if (( ${#MAVEN_REPOS[@]} > 0 )); then
+    for entry in "${MAVEN_REPOS[@]}"; do
+        r="${entry%%:*}"
+        cmd="${entry#*:}"
+        [[ -f "${WS_DIR}/${r}/pom.xml" ]] && \
+            MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
+        MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
+    done
+fi
 MAVEN_BUILD_COMMANDS="${MAVEN_BUILD_COMMANDS%$'\n'}"
 
 cat > "${WS_DIR}/.idea/misc.xml" <<XML
@@ -1086,7 +1113,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
     // glab-cli's source dir is resolved by spawn-workspace.sh (macOS uses
     // ~/Library/Application Support/glab-cli, Linux uses ~/.config/glab-cli)
     // and pre-created there, so no mkdir needed here.
-    "initializeCommand": "mkdir -p ~/.m2 ~/.npm ~/.ssh ~/.claude ~/.claude/projects/__MEMORY_KEY__/memory && touch ~/.claude.json",
+    "initializeCommand": "mkdir -p ~/.m2 ~/.ssh ~/.claude ~/.claude/projects/__MEMORY_KEY__/memory && touch ~/.claude.json",
 
     // Mount order matters: deeper paths must come AFTER their parents so they take
     // precedence. The layering is:
@@ -1108,7 +1135,6 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
 
         "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.m2,target=/home/vscode/.m2,type=bind",
-        "source=${localEnv:HOME}/.npm,target=/home/vscode/.npm,type=bind",
         // __GLAB_BLOCK_START__
         // glab CLI config (token for the configured GitLab host). Bind-mounted
         // rw so the login is shared between host and container -- 'glab auth
@@ -1391,23 +1417,6 @@ fi
 
 cd __WORKSPACE_PATH__
 
-# Docker named volumes are created with root:root ownership, but all build
-# tools in this container run as 'vscode'. Every node_modules directory that
-# is backed by a named volume (see devcontainer.json mounts) starts life as
-# a root-owned mount point and must be chowned before npm can write to it.
-# We do this once here, before any Maven/npm invocation, using sudo (which
-# the vscode user has password-free via the base image's sudoers config).
-# `find -name node_modules` discovers ALL such directories including ones
-# for modules that don't exist yet; they still appear as empty root-owned
-# directories because Docker creates the mount point when the volume is mounted.
-sudo find __WORKSPACE_PATH__ \
-    -maxdepth 10 \
-    -name node_modules \
-    -type d \
-    -not -path '*/node_modules/*/node_modules' \
-    2>/dev/null \
-    -exec chown vscode:vscode {} \; || true
-
 # Copy the resolved npmrc that spawn-workspace.sh produced. It already has
 # macOS paths stripped and any forwarded token placeholders substituted with
 # values from the spawn shell, so npm in the container can auth against
@@ -1419,25 +1428,6 @@ if [[ -f "${RESOLVED_NPMRC}" ]]; then
 else
     echo "WARN: ${RESOLVED_NPMRC} not found -- npm install of private packages will 401" >&2
 fi
-
-# Prevent npm audit and fund network requests from hanging the build.
-#
-# npm v10 runs `npm audit` automatically after every install-like operation,
-# including `npm link`. The audit makes an HTTP POST to the npmjs.org security
-# endpoint. When IntelliJ is simultaneously doing its initial Maven sync
-# (on first container start from the Welcome Screen), the competing I/O
-# saturates the connection, and the audit request stalls indefinitely.
-# The node process idles at 0% CPU waiting for a response that never comes.
-#
-# npm always reads ~/.npmrc, regardless of whether the npm binary is the
-# system-installed one or frontend-maven-plugin's own copy in /tmp/. Setting
-# audit=false here therefore disables the problematic network call for ALL
-# npm invocations (install, update, link, publish) without touching the
-# project's pom.xml or package.json.
-cat >> /home/vscode/.npmrc <<'NPMRC'
-audit=false
-fund=false
-NPMRC
 
 # install Claude Code globally — via login shell so npm/node from the Node feature
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
@@ -1705,18 +1695,6 @@ cat > "${WS_DIR}/.devcontainer/post-start.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Step 0: raise inotify limits before any build or IDE watcher starts.
-# Docker Desktop's Linux VM ships conservative defaults (max_user_watches=8192,
-# max_queued_events=16384). Large npm installs (storybook-scale node_modules)
-# generate tens of thousands of filesystem events; if the inotify event queue
-# overflows while ijent's VFS watcher and npm are both active, the kernel drops
-# events and sends IN_Q_OVERFLOW to all watchers. ijent reacts with a full
-# workspace rescan that competes with npm's concurrent file writes, causing npm
-# to stall indefinitely on a file operation that never completes.
-# These are per-user limits, not system-wide, so no security concern.
-sudo sysctl -w fs.inotify.max_user_watches=524288  2>/dev/null || true
-sudo sysctl -w fs.inotify.max_queued_events=1048576 2>/dev/null || true
-
 # Step 1: make sure dockerd is up (via docker-init.sh fallback to direct
 # invocation). The DinD feature relies on its entrypoint to start dockerd,
 # but JetBrains Gateway overrides the entrypoint, so we kick it ourselves.
@@ -1875,24 +1853,6 @@ else
     else
         echo "WARN: sshd failed to start -- DB-tunnel data source won't work" >&2
     fi
-fi
-
-# Step 6: restart docker compose services if an initialize.sh hook exists.
-# postCreateCommand runs initialize.sh once (on first container creation), but
-# docker compose services that use restart: "no" (e.g. Verdaccio, MongoDB) are
-# NOT restarted when the container restarts -- only dockerd comes back via this
-# post-start hook. Without this step, those services stay dead after any
-# container restart (IntelliJ restart, Docker Desktop restart, manual
-# 'docker restart'), and any process that tries to reach them (npm → Verdaccio
-# on localhost:4873) gets a silent hang: Docker's internal port proxy still
-# accepts the TCP connection but no upstream process is listening.
-#
-# "docker compose up -d" is idempotent -- already-running services are left
-# alone, so running this on first start (right after postCreate) is harmless.
-INIT_HOOK="$(dirname "${BASH_SOURCE[0]}")/initialize.sh"
-if [[ -f "${INIT_HOOK}" ]]; then
-    echo "restarting compose services via initialize.sh..."
-    bash "${INIT_HOOK}"
 fi
 
 exit 0

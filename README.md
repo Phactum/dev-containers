@@ -35,6 +35,50 @@ Both scripts source `.env.sh` at startup. To adapt to a new project, fork
 this directory into the project's source workspace and edit `.env.sh`.
 See the file itself for the full list of variables and what they do.
 
+### Mono-repo support
+
+Use the scripts from the parent directory of your repository:
+
+```shell
+my-mono-repo $ cd ..
+parent $ git clone https://github.com/Phactum/dev-containers.git my-mono-repo-dev-containers
+# configure .end.sh, initialize.sh and README.md.tpl in my-mono-repo-dev-containers
+parent $ ./my-mono-repo-dev-containers/spawn-workspace.sh --workspaces-root . feature/my-awesome-feature
+```
+
+and disposing:
+
+```shell
+parent $ ./my-mono-repo-dev-containers/dispose-workspace.sh --workspaces-root . feature/my-awesome-feature
+```
+
+Set `REPOS=()` in `.env.sh`. The spawn script then operates in
+**mono-repo mode**:
+
+- It creates a single worktree at `<workspace>/<PROJECT_NAME>/` directly from
+  `SOURCE_WS` (the project directory itself), with no sub-directory lookup.
+- If `MAVEN_REPOS` is also empty **and** a `pom.xml` exists at the project
+  root, the script auto-populates `MAVEN_REPOS=("<PROJECT_NAME>:install")` so
+  the warmup build runs without manual configuration.
+- IntelliJ imports `$PROJECT_DIR$/<PROJECT_NAME>/pom.xml` as a single Maven
+  project — equivalent to opening a classic single-module or multi-module Maven
+  project.
+
+Minimal `.env.sh` for a mono-repo (fill in the project-specific values):
+
+```bash
+PROJECT_NAME="my-awesome-repo"
+PROJECT_SHORT="mar"
+REPOS=()          # mono-repo: source workspace IS the git repo
+MAVEN_REPOS=()    # auto-detected from pom.xml; or set explicitly, e.g. ("my-project:install")
+HOST_PORTS=(8080 2222)
+PORT_LABELS=("8080:app" "2222:ssh-tunnel")
+BASE_IMAGE="mcr.microsoft.com/devcontainers/java:1-21-bookworm"
+NODE_FEATURE_VERSION="24"
+RUN_CONFIGS=()
+FORWARDED_ENV_VARS=()
+```
+
 ### GitLab integration is optional
 
 GitLab integration kicks in only when **both** `GLAB_HOSTNAME` **and**
