@@ -70,7 +70,11 @@ Minimal `.env.sh` for a mono-repo (fill in the project-specific values):
 PROJECT_NAME="my-awesome-repo"
 PROJECT_SHORT="mar"
 REPOS=()          # mono-repo: source workspace IS the git repo
-MAVEN_REPOS=()    # auto-detected from pom.xml; or set explicitly, e.g. ("my-project:install")
+MAVEN_REPOS=()    # auto-detected from pom.xml; or set explicitly, e.g. ("my-project:install").
+                  # Entries are "<repo>:<mvn-goal>"; a value starting with "$"
+                  # runs the rest as a raw bash command inside <repo> instead of
+                  # `mvn <goal>` (for repos without a parent pom, e.g.
+                  # "wf:$ cd a; mvn install; cd ../b; mvn install").
 HOST_PORTS=(8080 2222)
 PORT_LABELS=("8080:app" "2222:ssh-tunnel")
 BASE_IMAGE="mcr.microsoft.com/devcontainers/java:1-21-bookworm"

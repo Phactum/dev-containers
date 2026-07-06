@@ -790,7 +790,20 @@ if (( ${#MAVEN_REPOS[@]} > 0 )); then
         cmd="${entry#*:}"
         [[ -f "${WS_DIR}/${r}/pom.xml" ]] && \
             MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
-        MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
+        if [[ "${cmd}" == '$'* ]]; then
+            # Raw-command form: a value starting with '$' is not a Maven goal but
+            # an arbitrary bash command run verbatim inside the repo dir. This
+            # covers repos that have no parent pom but several sub-directories
+            # each with their own pom.xml, e.g. "repo:$ cd a; mvn install; cd
+            # ../b; mvn install". Everything after the leading '$' (whitespace
+            # trimmed) runs as-is -- MVN_FLAGS is NOT injected, the value spells
+            # out its own mvn invocations.
+            raw="${cmd#\$}"
+            raw="${raw#"${raw%%[![:space:]]*}"}"   # trim leading whitespace
+            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${raw})"$'\n'
+        else
+            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
+        fi
     done
 fi
 MAVEN_BUILD_COMMANDS="${MAVEN_BUILD_COMMANDS%$'\n'}"
