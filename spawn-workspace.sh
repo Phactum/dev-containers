@@ -78,6 +78,21 @@
 #    as a fallback to the unix socket, mirroring the GitLab CI dind setup).
 #    JetBrains backend is preselected via customizations.jetbrains.backend.
 #
+# 6a. Per-module node_modules on Docker named volumes
+#    Every npm module (each package.json outside node_modules/.git) gets its
+#    node_modules mounted as a Docker named volume instead of living in the
+#    bind-mounted workspace (NPM_NM_VOLUME_MOUNTS, injected into
+#    devcontainer.json). Rationale: on macOS Docker Desktop the
+#    Virtualization.framework bridges every file of a bind mount between the
+#    Linux VM and the host; for node_modules with tens of thousands of files
+#    npm becomes 10-100x slower. Named volumes live on the VM's own ext4 fs,
+#    so npm writes at Linux-native speed. dispose-workspace.sh removes these
+#    volumes automatically via `docker inspect` on the container. Caveat: a
+#    freshly created named volume is owned by root:root, but the warmup build
+#    (and the IDE) run as vscode -- so post-create.sh (feature 12) chowns each
+#    node_modules mount-point to vscode before any npm/Maven step touches it,
+#    otherwise npm dies with "EACCES: permission denied, mkdir .../@types".
+#
 # 7. Constant in-container workspace path: /workspaces/<PROJECT_NAME>
 #    Every story container mounts the workspace at the same path. Claude Code
 #    encodes the project key from the cwd, so this gives every container the
@@ -147,8 +162,12 @@
 #     Installs Claude Code globally, fixes ownership on the per-story Claude
 #     project volume, exposes 'mvn' and 'claude' as symlinks under
 #     /usr/local/bin so non-login IDE terminals find them, drops a 'branches'
-#     helper script that prints each worktree's current branch, then resolves
-#     tests (unit/integration/E2E)
+#     helper script that prints each worktree's current branch, chowns the
+#     per-module node_modules named volumes to vscode (fresh named volumes are
+#     root:root, so npm running as vscode would otherwise die with EACCES on
+#     'mkdir node_modules/@types' -- see the node_modules volume mounts in
+#     feature 6a / NPM_NM_VOLUME_MOUNTS), then resolves the Maven reactor in
+#     dependency order (MAVEN_REPOS). Tests (unit/integration/E2E)
 #       are not part of the warmup -- run them on demand from the IDE.
 #     "waitFor": "postCreateCommand" makes IntelliJ block on this completing
 #     before opening the project window, so the IDE's first index pass sees
@@ -1645,6 +1664,26 @@ for dir in */; do
 done
 BRANCHES
 sudo chmod +x /usr/local/bin/branches
+
+# Fix ownership of the per-module node_modules Docker named volumes.
+# Each npm module's node_modules is mounted as a named volume (see
+# devcontainer.json / NPM_NM_VOLUME_MOUNTS) so npm writes at Linux-native speed
+# instead of through the slow macOS bind-mount. A freshly created named volume
+# is owned by root:root, though, so npm running as vscode during the Maven
+# warmup below can't write into it and dies with
+#   EACCES: permission denied, mkdir '.../node_modules/@types'
+# chown each mount-point to vscode up front. The find mirrors the module
+# discovery in spawn-workspace.sh (package.json outside node_modules/.git), so
+# it stays in sync with the volumes actually mounted -- no extra placeholder
+# needed. Non-recursive is enough: npm creates everything below once it owns
+# the mount root.
+echo "--- fixing node_modules volume ownership ---"
+find __WORKSPACE_PATH__ -name package.json \
+    -not -path '*/node_modules/*' -not -path '*/.git/*' -print0 2>/dev/null \
+| while IFS= read -r -d '' pj; do
+    nm="$(dirname "${pj}")/node_modules"
+    [[ -d "${nm}" ]] && sudo chown vscode:vscode "${nm}"
+done
 
 # Optional project-specific initialization hook. Place initialize.sh next to
 # spawn-workspace.sh in dev-containers/; spawn-workspace.sh copies it here.

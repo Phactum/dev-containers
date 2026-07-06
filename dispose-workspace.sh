@@ -210,7 +210,47 @@ if [[ ${#DIRTY[@]} -gt 0 ]]; then
     fi
 fi
 
-# 2. Remove worktrees from each source repo.
+# 2. Remove the Docker container, its named volumes, and (by default) its
+# devcontainer image FIRST -- before any filesystem removal below.
+#
+# The per-module node_modules are Docker named volumes mounted INTO the
+# bind-mounted workspace (see spawn-workspace.sh, NPM_NM_VOLUME_MOUNTS). While
+# the container runs, those mount-points are live and the host cannot delete
+# them: `rm -rf` fails with "Permission denied" / "Directory not empty" on
+# every .../node_modules, and under `set -e` that aborts the whole dispose
+# before the container is ever removed -- leaving a running container AND a
+# half-deleted workspace. Removing the container releases the mounts, turning
+# those node_modules back into ordinary empty dirs the rm below can clear.
+#
+# spawn-workspace.sh names the container '<PROJECT_SHORT>-<leaf>' via runArgs.
+# Named volumes (including the per-story Claude project volume whose name embeds
+# a JetBrains devcontainerId hash) are discovered from the container at runtime.
+if [[ ${KEEP_CONTAINER} -eq 0 ]]; then
+    CONTAINER="${PROJECT_SHORT}-${LEAF}"
+    if command -v docker >/dev/null 2>&1; then
+        if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+            echo
+            echo "removing docker container '${CONTAINER}'"
+            # Collect the image ID and all attached named volumes before removal.
+            image_id="$(docker inspect --format '{{.Image}}' "${CONTAINER}" 2>/dev/null || true)"
+            volumes="$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "${CONTAINER}" 2>/dev/null || true)"
+            docker rm -f "${CONTAINER}" >/dev/null
+            for v in ${volumes}; do
+                echo "removing docker volume '${v}'"
+                docker volume rm "${v}" >/dev/null 2>&1 || echo "  (volume ${v}: already gone or in use)"
+            done
+            if [[ ${KEEP_IMAGE} -eq 0 && -n "${image_id}" ]]; then
+                echo "removing devcontainer image ${image_id}"
+                docker rmi "${image_id}" >/dev/null 2>&1 \
+                    || echo "  (image not removed: still referenced by another container)"
+            fi
+        fi
+    else
+        echo "docker not on PATH, skipping container cleanup" >&2
+    fi
+fi
+
+# 3. Remove worktrees from each source repo.
 #
 # We look up the *actual* registered path via `git worktree list` rather than
 # only checking the expected path $wt. A previous mis-pathed spawn (e.g. with
@@ -252,16 +292,38 @@ for repo in "${REPO_NAMES[@]}"; do
     [[ -e "${wt}" ]] && rm -rf "${wt}"
 done
 
-# 3. Remove the workspace directory itself (devcontainer config, .idea, claude copy, …)
-# macOS sometimes sets a 'deny delete' ACL on directories created through Docker
-# Desktop or IntelliJ. Strip ACLs first so rm -rf is not blocked.
+# 4. Remove the workspace directory itself (devcontainer config, .idea, claude copy, …)
+#
+# Guard: if the container still exists, its per-module node_modules named volumes
+# are still mounted into WS_DIR (see step 2). The host cannot delete a live
+# mount-point, so rm -rf would fail with a confusing "Permission denied" /
+# "Directory not empty" on every .../node_modules. This happens when
+# --keep-container was passed, or when step 2 couldn't reach Docker. Detect it
+# and print an actionable message instead of letting rm spew per-path errors.
 if [[ -d "${WS_DIR}" ]]; then
-    chmod -RN "${WS_DIR}" 2>/dev/null || true
-    rm -rf "${WS_DIR}"
-    echo "removed: ${WS_DIR}"
+    CONTAINER="${PROJECT_SHORT}-${LEAF}"
+    if command -v docker >/dev/null 2>&1 && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+        echo >&2
+        echo "Container '${CONTAINER}' still exists and holds node_modules volume mounts" >&2
+        echo "inside ${WS_DIR}; the workspace directory cannot be removed while those" >&2
+        echo "mounts are live." >&2
+        if [[ ${KEEP_CONTAINER} -eq 1 ]]; then
+            echo "You passed --keep-container. Close it in IntelliJ/Gateway, then rerun" >&2
+            echo "without --keep-container to also remove the workspace directory." >&2
+        else
+            echo "Remove it manually with 'docker rm -f ${CONTAINER}' and rerun dispose." >&2
+        fi
+        echo "Left ${WS_DIR} in place." >&2
+    else
+        # macOS sometimes sets a 'deny delete' ACL on directories created through
+        # Docker Desktop or IntelliJ. Strip ACLs first so rm -rf is not blocked.
+        chmod -RN "${WS_DIR}" 2>/dev/null || true
+        rm -rf "${WS_DIR}"
+        echo "removed: ${WS_DIR}"
+    fi
 fi
 
-# 4. Optional: delete the local branch in each source repo.
+# 5. Optional: delete the local branch in each source repo.
 if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
     echo
     echo "deleting local branch '${BRANCH}' in source repos:"
@@ -282,36 +344,6 @@ if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
             fi
         fi
     done
-fi
-
-# 5. remove the Docker container, all its named volumes, and (by default) its
-# devcontainer image to reclaim disk space.
-# spawn-workspace.sh names the container '<PROJECT_SHORT>-<leaf>' via runArgs.
-# Named volumes (including the per-story Claude project volume whose name embeds
-# a JetBrains devcontainerId hash) are discovered from the container at runtime.
-if [[ ${KEEP_CONTAINER} -eq 0 ]]; then
-    CONTAINER="${PROJECT_SHORT}-${LEAF}"
-    if command -v docker >/dev/null 2>&1; then
-        if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
-            echo
-            echo "removing docker container '${CONTAINER}'"
-            # Collect the image ID and all attached named volumes before removal.
-            image_id="$(docker inspect --format '{{.Image}}' "${CONTAINER}" 2>/dev/null || true)"
-            volumes="$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "${CONTAINER}" 2>/dev/null || true)"
-            docker rm -f "${CONTAINER}" >/dev/null
-            for v in ${volumes}; do
-                echo "removing docker volume '${v}'"
-                docker volume rm "${v}" >/dev/null 2>&1 || echo "  (volume ${v}: already gone or in use)"
-            done
-            if [[ ${KEEP_IMAGE} -eq 0 && -n "${image_id}" ]]; then
-                echo "removing devcontainer image ${image_id}"
-                docker rmi "${image_id}" >/dev/null 2>&1 \
-                    || echo "  (image not removed: still referenced by another container)"
-            fi
-        fi
-    else
-        echo "docker not on PATH, skipping container cleanup" >&2
-    fi
 fi
 
 echo
