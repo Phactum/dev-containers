@@ -104,6 +104,13 @@ is present.
   falsely picked up as a Maven parent). Each subproject pom is registered
   individually in `.idea/misc.xml`; `post-create.sh` builds them in the
   dependency order given by `MAVEN_REPOS`.
+- **`MAVEN_REPOS` value forms.** Each entry is `"<repo>:<value>"`. Normally
+  `<value>` is an `mvn` goal run as `cd <repo> && mvn ${MVN_FLAGS} <value>`. If
+  `<value>` starts with `$`, the remainder (leading whitespace trimmed) runs
+  verbatim inside `<repo>` with no `mvn`/`MVN_FLAGS` wrapping — for repos with no
+  parent pom but multiple sub-dir poms. Handled in the `MAVEN_BUILD_COMMANDS`
+  loop (`spawn-workspace.sh:~788`). Such repos have no root `pom.xml`, so they
+  contribute nothing to `MAVEN_POMS_LIST` / IntelliJ's import list.
 - **node_modules on named volumes.** Each npm module's `node_modules` is
   mounted as a Docker named volume (`NPM_NM_VOLUME_MOUNTS`) for speed on macOS.
   Fresh named volumes are `root:root`, so `post-create.sh` must `chown` each
