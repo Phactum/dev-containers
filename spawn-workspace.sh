@@ -23,6 +23,13 @@
 #      - branch is new            -> fork from --base, otherwise origin/HEAD
 #    Worktrees keep the source repo as the single source of truth and avoid
 #    duplicating the .git history on disk.
+#    Exception -- host-mount entries: a REPOS entry with an EMPTY value (e.g.
+#    "hal-npm-packages:") is not a git repo; no worktree is created. Instead the
+#    host directory is bind-mounted into the workspace at the same path (mount
+#    JSON built alongside NPM_NM_VOLUME_MOUNTS, injected into devcontainer.json).
+#    For pre-built artifacts / non-versioned folders. Mono-repo's synthetic
+#    "${PROJECT_NAME}:" entry also has an empty value but is a real git repo, so
+#    it is excluded via MONO_REPO.
 #
 # 3. Per-repo base ref for new branches
 #    Each entry in REPOS (.env.sh) is "<repo>:<base-ref>". When the branch
@@ -38,7 +45,8 @@
 #    by Maven, producing "parent.relativePath ... points at <agg>" errors on
 #    every sync. We list each subproject's pom in MavenProjectsManager.original
 #    Files (.idea/misc.xml) so IntelliJ imports each as a top-level project.
-#    post-create.sh builds each repo in dependency order (MAVEN_REPOS in .env.sh).
+#    post-create.sh builds each repo in dependency order (BUILDS / MAVEN_BUILDS
+#    in .env.sh).
 #
 # 4a. Optional initialization hook (initialize.sh)
 #    If dev-containers/initialize.sh exists, spawn-workspace.sh copies it to
@@ -167,7 +175,7 @@
 #     root:root, so npm running as vscode would otherwise die with EACCES on
 #     'mkdir node_modules/@types' -- see the node_modules volume mounts in
 #     feature 6a / NPM_NM_VOLUME_MOUNTS), then resolves the Maven reactor in
-#     dependency order (MAVEN_REPOS). Tests (unit/integration/E2E)
+#     dependency order (BUILDS / MAVEN_BUILDS). Tests (unit/integration/E2E)
 #       are not part of the warmup -- run them on demand from the IDE.
 #     "waitFor": "postCreateCommand" makes IntelliJ block on this completing
 #     before opening the project window, so the IDE's first index pass sees
@@ -308,10 +316,41 @@ if (( ${#REPOS[@]} == 0 )); then
     REPO_NAMES=("${PROJECT_NAME}")
 fi
 
-# Mono-repo default: when MAVEN_REPOS is also empty and a pom.xml exists at
+# Build-command config -- two mutually exclusive styles are accepted; the first
+# one that is *defined* wins (checked with `declare -p`, so an explicit empty
+# array still selects its style):
+#   MAVEN_BUILDS (legacy) : "<repo>:<mvn-goal>" -- value is an mvn goal, run as
+#                           `mvn ${MVN_FLAGS} <goal>`. A value starting with '$'
+#                           is instead a raw bash command (everything after '$').
+#                           This is the original MAVEN_REPOS behaviour; the old
+#                           MAVEN_REPOS name is still honoured as an alias.
+#   BUILDS       (raw)    : "<repo>:<command>" -- value is ALWAYS a raw bash
+#                           command run verbatim inside <repo>. No mvn/MVN_FLAGS
+#                           injection and no '$' prefix; Maven users spell out
+#                           "mvn ..." themselves.
+# Everything downstream iterates the normalised BUILD_ENTRIES using BUILD_MODE
+# ("maven" or "raw") to pick the per-entry interpretation. Length-guard every
+# array read: bash 3.2 + set -u choke on empty-array expansion.
+BUILD_ENTRIES=()
+BUILD_MODE=""
+if declare -p MAVEN_BUILDS >/dev/null 2>&1; then
+    BUILD_MODE="maven"
+    (( ${#MAVEN_BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${MAVEN_BUILDS[@]}")
+elif declare -p MAVEN_REPOS >/dev/null 2>&1; then
+    BUILD_MODE="maven"
+    (( ${#MAVEN_REPOS[@]} > 0 )) && BUILD_ENTRIES=("${MAVEN_REPOS[@]}")
+elif declare -p BUILDS >/dev/null 2>&1; then
+    BUILD_MODE="raw"
+    (( ${#BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${BUILDS[@]}")
+fi
+
+# Mono-repo default: when no build list is configured and a pom.xml exists at
 # the repo root, build the project as a single Maven reactor.
-if (( MONO_REPO == 1 )) && (( ${#MAVEN_REPOS[@]} == 0 )); then
-    [[ -f "${SOURCE_WS}/pom.xml" ]] && MAVEN_REPOS=("${PROJECT_NAME}:install")
+if (( MONO_REPO == 1 )) && (( ${#BUILD_ENTRIES[@]} == 0 )); then
+    if [[ -f "${SOURCE_WS}/pom.xml" ]]; then
+        BUILD_ENTRIES=("${PROJECT_NAME}:install")
+        BUILD_MODE="maven"
+    fi
 fi
 
 # Resolve the workspaces root directory in priority order:
@@ -608,9 +647,23 @@ create_worktree() {
     popd >/dev/null
 }
 
+# Host-mount repos: a REPOS entry with an EMPTY value (e.g. "hal-npm-packages:")
+# is not a git repo -- no worktree is created. Instead the host directory
+# ${SOURCE_WS}/<repo> is bind-mounted straight into the workspace at the same
+# path a worktree would occupy (mount JSON built below, injected into
+# devcontainer.json). Use this for pre-built artifacts / non-versioned dirs that
+# should still be visible and buildable inside the container.
+# (Mono-repo's synthetic "${PROJECT_NAME}:" entry also has an empty value but is
+# a real git repo, so it is excluded via MONO_REPO.)
+HOST_MOUNT_REPOS=()
 for entry in "${REPOS[@]}"; do
     repo="${entry%%:*}"
     base_ref="${entry#*:}"
+    if (( MONO_REPO == 0 )) && [[ -z "${base_ref}" ]]; then
+        echo "host-mount: ${repo} (bind ${SOURCE_WS}/${repo}, no worktree)"
+        HOST_MOUNT_REPOS+=("${repo}")
+        continue
+    fi
     create_worktree "${repo}" "${base_ref}"
 done
 
@@ -683,6 +736,29 @@ if (( ${#NPM_MODULE_DIRS[@]} > 0 )); then
         vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
         NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
     done
+fi
+
+# Build the JSON fragment for the host-mount repos collected above: one bind
+# mount each, from the host source dir to its workspace path in the container.
+# Same leading-comma style as NPM_NM_VOLUME_MOUNTS so it appends cleanly after
+# the fixed mounts. An empty placeholder dir is created inside the story
+# workspace so the bind has a mountpoint within the workspaceMount; it stays
+# empty on the host (the bind overlays the real source at container runtime),
+# so disposing the workspace never touches the host source directory.
+HOST_MOUNT_BINDS=""
+# find(1) prune expression (injected into post-create.sh's node_modules chown)
+# that keeps that scan out of the bind-mounted host dirs. Empty when there are
+# no host-mount repos.
+HOST_MOUNT_PRUNE=""
+if (( ${#HOST_MOUNT_REPOS[@]} > 0 )); then
+    _prune_paths=""
+    for repo in "${HOST_MOUNT_REPOS[@]}"; do
+        mkdir -p "${WS_DIR}/${repo}"
+        HOST_MOUNT_BINDS+="        ,\"source=${SOURCE_WS}/${repo},target=${WORKSPACE_PATH}/${repo},type=bind,consistency=cached\"\n"
+        [[ -n "${_prune_paths}" ]] && _prune_paths+=" -o "
+        _prune_paths+="-path ${WORKSPACE_PATH}/${repo}"
+    done
+    HOST_MOUNT_PRUNE="\\( ${_prune_paths} \\) -prune -o "
 fi
 
 # NO aggregator pom.xml at the workspace root.
@@ -784,24 +860,29 @@ echo "${PROJECT_SHORT} ${LEAF}" > "${WS_DIR}/.idea/.name"
 # Length-guard: bash 3.2 + set -u fail on empty array expansion.
 MAVEN_POMS_LIST=""
 MAVEN_BUILD_COMMANDS=""
-if (( ${#MAVEN_REPOS[@]} > 0 )); then
-    for entry in "${MAVEN_REPOS[@]}"; do
+if (( ${#BUILD_ENTRIES[@]} > 0 )); then
+    for entry in "${BUILD_ENTRIES[@]}"; do
         r="${entry%%:*}"
         cmd="${entry#*:}"
         [[ -f "${WS_DIR}/${r}/pom.xml" ]] && \
             MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
-        if [[ "${cmd}" == '$'* ]]; then
-            # Raw-command form: a value starting with '$' is not a Maven goal but
-            # an arbitrary bash command run verbatim inside the repo dir. This
-            # covers repos that have no parent pom but several sub-directories
-            # each with their own pom.xml, e.g. "repo:$ cd a; mvn install; cd
-            # ../b; mvn install". Everything after the leading '$' (whitespace
-            # trimmed) runs as-is -- MVN_FLAGS is NOT injected, the value spells
-            # out its own mvn invocations.
+        if [[ "${BUILD_MODE}" == "raw" ]]; then
+            # BUILDS style: the value is always a raw bash command, run verbatim
+            # inside the repo dir. No mvn/MVN_FLAGS wrapping -- Maven users write
+            # "mvn ..." themselves.
+            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${cmd})"$'\n'
+        elif [[ "${cmd}" == '$'* ]]; then
+            # MAVEN_BUILDS style, raw-command form: a value starting with '$' is
+            # not a Maven goal but an arbitrary bash command run verbatim inside
+            # the repo dir (for repos with no parent pom but several sub-dir
+            # poms, e.g. "repo:$ cd a; mvn install; cd ../b; mvn install").
+            # Everything after the leading '$' (whitespace trimmed) runs as-is --
+            # MVN_FLAGS is NOT injected, the value spells out its own mvn calls.
             raw="${cmd#\$}"
             raw="${raw#"${raw%%[![:space:]]*}"}"   # trim leading whitespace
             MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${raw})"$'\n'
         else
+            # MAVEN_BUILDS style, mvn-goal form: inject `mvn ${MVN_FLAGS}`.
             MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
         fi
     done
@@ -1188,6 +1269,10 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
         "source=__PROJECT_SHORT__-claude-project-${devcontainerId},target=/home/vscode/.claude/projects/__MEMORY_KEY__,type=volume",
         "source=${localEnv:HOME}/.claude/projects/__MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind"
+        // host-mounted repos: REPOS entries with an empty base-ref are plain
+        // host directories (not git worktrees), bind-mounted straight in at
+        // their workspace path. Generated by spawn-workspace.sh from REPOS.
+__HOST_MOUNT_BINDS__
         // node_modules volumes: one Docker named volume per npm module. These are
         // generated by spawn-workspace.sh from the package.json files found in
         // the workspace. Named volumes bypass the Virtualization.framework XPC
@@ -1415,9 +1500,35 @@ done
     rm "${_nm_tmp}"
 }
 
+# Substitute __HOST_MOUNT_BINDS__ with the host-mount bind lines (same multi-line
+# awk approach as the node_modules volumes above; empty -> placeholder removed).
+{
+    _hm_tmp="$(mktemp)"
+    printf '%b' "${HOST_MOUNT_BINDS}" > "${_hm_tmp}"
+    awk -v mf="${_hm_tmp}" '
+        /__HOST_MOUNT_BINDS__/ {
+            while ((getline line < mf) > 0) print line
+            next
+        }
+        { print }
+    ' "${WS_DIR}/.devcontainer/devcontainer.json" \
+      > "${WS_DIR}/.devcontainer/devcontainer.json.hm_tmp"
+    mv "${WS_DIR}/.devcontainer/devcontainer.json.hm_tmp" \
+       "${WS_DIR}/.devcontainer/devcontainer.json"
+    rm "${_hm_tmp}"
+}
+
 cat > "${WS_DIR}/.devcontainer/post-create.sh" <<'SH'
 #!/usr/bin/env bash
-set -euo pipefail
+# -E (errtrace): make the ERR trap fire inside functions, command
+# substitutions and pipeline elements too, not just at the top level.
+set -Eeuo pipefail
+
+# The devcontainer lifecycle runner only reports "failed with exit code: 1" and
+# swallows the failing command. This trap surfaces the real culprit -- the line
+# number, the exact command, and the exit code -- so a failed warmup step is
+# actually diagnosable from the build log.
+trap 'rc=$?; echo "" >&2; echo "ERROR: post-create.sh failed (exit ${rc})" >&2; echo "  at line ${LINENO}: ${BASH_COMMAND}" >&2; exit ${rc}' ERR
 
 # Discover a working JAVA_HOME and re-export it before any Maven invocation.
 # The base image, the java:1 feature, and SDKMAN may each have their own idea
@@ -1690,12 +1801,20 @@ sudo chmod +x /usr/local/bin/branches
 # it stays in sync with the volumes actually mounted -- no extra placeholder
 # needed. Non-recursive is enough: npm creates everything below once it owns
 # the mount root.
+# The prune expression spliced in below (may be empty) skips any host-mounted
+# repo dirs (REPOS entries with an empty base-ref): they carry no named-volume
+# node_modules, and chowning anything inside them would rewrite ownership of the
+# bind-mounted HOST files. The `if` (not `&&`) keeps a module without a
+# node_modules dir from making the loop -- and thus the whole pipeline under
+# `set -e`/`pipefail` -- exit non-zero.
 echo "--- fixing node_modules volume ownership ---"
-find __WORKSPACE_PATH__ -name package.json \
+find __WORKSPACE_PATH__ __HOST_MOUNT_PRUNE__-name package.json \
     -not -path '*/node_modules/*' -not -path '*/.git/*' -print0 2>/dev/null \
 | while IFS= read -r -d '' pj; do
     nm="$(dirname "${pj}")/node_modules"
-    [[ -d "${nm}" ]] && sudo chown vscode:vscode "${nm}"
+    if [[ -d "${nm}" ]]; then
+        sudo chown vscode:vscode "${nm}"
+    fi
 done
 
 # Optional project-specific initialization hook. Place initialize.sh next to
@@ -1706,7 +1825,7 @@ if [[ -f .devcontainer/initialize.sh ]]; then
     bash .devcontainer/initialize.sh
 fi
 
-# Resolve Maven dependencies in dependency order (MAVEN_REPOS in .env.sh).
+# Resolve build dependencies in order (BUILDS / MAVEN_BUILDS in .env.sh).
 # Tests are skipped across the board so post-create stays fast -- the IDE just
 # needs the reactor resolved; run tests on demand.
 #
@@ -1727,8 +1846,10 @@ echo "post-create done."
 SH
 chmod +x "${WS_DIR}/.devcontainer/post-create.sh"
 # MAVEN_BUILD_COMMANDS is multi-line; substitute via bash before sed takes over.
+# __HOST_MOUNT_PRUNE__ is substituted the same way (it may be empty).
 _pc=$(<"${WS_DIR}/.devcontainer/post-create.sh")
 _pc="${_pc/__MAVEN_BUILD_COMMANDS__/${MAVEN_BUILD_COMMANDS}}"
+_pc="${_pc/__HOST_MOUNT_PRUNE__/${HOST_MOUNT_PRUNE}}"
 printf '%s\n' "${_pc}" > "${WS_DIR}/.devcontainer/post-create.sh"
 
 # Copy optional initialization hook into the workspace's .devcontainer/.

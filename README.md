@@ -57,9 +57,10 @@ Set `REPOS=()` in `.env.sh`. The spawn script then operates in
 
 - It creates a single worktree at `<workspace>/<PROJECT_NAME>/` directly from
   `SOURCE_WS` (the project directory itself), with no sub-directory lookup.
-- If `MAVEN_REPOS` is also empty **and** a `pom.xml` exists at the project
-  root, the script auto-populates `MAVEN_REPOS=("<PROJECT_NAME>:install")` so
-  the warmup build runs without manual configuration.
+- If no build list (`BUILDS` / `MAVEN_BUILDS`) is configured **and** a `pom.xml`
+  exists at the project root, the script auto-populates a single
+  `<PROJECT_NAME>:install` Maven build so the warmup runs without manual
+  configuration.
 - IntelliJ imports `$PROJECT_DIR$/<PROJECT_NAME>/pom.xml` as a single Maven
   project — equivalent to opening a classic single-module or multi-module Maven
   project.
@@ -70,11 +71,12 @@ Minimal `.env.sh` for a mono-repo (fill in the project-specific values):
 PROJECT_NAME="my-awesome-repo"
 PROJECT_SHORT="mar"
 REPOS=()          # mono-repo: source workspace IS the git repo
-MAVEN_REPOS=()    # auto-detected from pom.xml; or set explicitly, e.g. ("my-project:install").
-                  # Entries are "<repo>:<mvn-goal>"; a value starting with "$"
-                  # runs the rest as a raw bash command inside <repo> instead of
-                  # `mvn <goal>` (for repos without a parent pom, e.g.
-                  # "wf:$ cd a; mvn install; cd ../b; mvn install").
+BUILDS=()         # build steps "<repo>:<command>"; each value is a raw bash
+                  # command run inside <repo> (write "mvn ..." yourself). Empty +
+                  # a root pom.xml => auto "<PROJECT_NAME>:install". The legacy
+                  # MAVEN_BUILDS (aka MAVEN_REPOS) variable instead treats each
+                  # value as an mvn goal ("$"-prefix = raw command); if both are
+                  # set, MAVEN_BUILDS wins.
 HOST_PORTS=(8080 2222)
 PORT_LABELS=("8080:app" "2222:ssh-tunnel")
 BASE_IMAGE="mcr.microsoft.com/devcontainers/java:1-21-bookworm"
@@ -206,6 +208,12 @@ dev-containers/spawn-workspace.sh [--workspaces-root <path>] [--yes] <branch-nam
 
 Base refs for new branches are not on the CLI — each repo brings its own
 in the `REPOS` map (`<repo>:<base-ref>`) in `.env.sh`.
+
+A `REPOS` entry with an **empty base-ref** (e.g. `"hal-npm-packages:"`) is not a
+git repo: no worktree is created — the host directory is bind-mounted into the
+workspace at the same path instead. Use it for pre-built artifacts or other
+non-versioned folders that must be visible/buildable in the container. Disposing
+the workspace leaves the host source untouched.
 
 Examples:
 
