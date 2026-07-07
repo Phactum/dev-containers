@@ -44,9 +44,12 @@ project's repo and edit `.env.sh` — nothing else.
   changing behavior, and update it when you change the behavior it describes.
 
 - **Bash 3.2 compatibility.** macOS ships bash 3.2, which the spawn script must
-  run under. No associative arrays: `REPOS` and `MAVEN_REPOS` are plain arrays
-  of `"<key>:<value>"` strings, split on `:` at use sites. Keep that style for
-  any new map-like config.
+  run under. No associative arrays: `REPOS`, `BUILDS` and `MAVEN_BUILDS` are
+  plain arrays of `"<key>:<value>"` strings, split on `:` at use sites. Keep that
+  style for any new map-like config. Guard every array read with a length check
+  before expanding (`(( ${#arr[@]} > 0 ))`) — bash 3.2 + `set -u` error on empty
+  `"${arr[@]}"`. To detect whether a config var is defined at all, use
+  `declare -p NAME >/dev/null 2>&1` (as the `BUILDS`/`MAVEN_BUILDS` selection does).
 
 - **`set -euo pipefail`** is active in both scripts. Guard optional vars with
   `${VAR:-}` and unset-array reads accordingly.
@@ -103,23 +106,39 @@ is present.
 - **No aggregator `pom.xml`** is written at the workspace root (it would be
   falsely picked up as a Maven parent). Each subproject pom is registered
   individually in `.idea/misc.xml`; `post-create.sh` builds them in the
-  dependency order given by `MAVEN_REPOS`.
-- **`MAVEN_REPOS` value forms.** Each entry is `"<repo>:<value>"`. Normally
-  `<value>` is an `mvn` goal run as `cd <repo> && mvn ${MVN_FLAGS} <value>`. If
-  `<value>` starts with `$`, the remainder (leading whitespace trimmed) runs
-  verbatim inside `<repo>` with no `mvn`/`MVN_FLAGS` wrapping — for repos with no
-  parent pom but multiple sub-dir poms. Handled in the `MAVEN_BUILD_COMMANDS`
-  loop (`spawn-workspace.sh:~788`). Such repos have no root `pom.xml`, so they
-  contribute nothing to `MAVEN_POMS_LIST` / IntelliJ's import list.
+  dependency order given by the build list (`BUILDS` / `MAVEN_BUILDS`).
+- **Build-list config: `BUILDS` vs `MAVEN_BUILDS`.** Both are `"<repo>:<value>"`
+  arrays; whichever is *defined* first wins (`MAVEN_BUILDS` > legacy alias
+  `MAVEN_REPOS` > `BUILDS`). Near `spawn-workspace.sh:~305` they are normalised
+  into `BUILD_ENTRIES` + a `BUILD_MODE` flag that the generation loop
+  (`~800`) reads:
+  - `BUILD_MODE=raw` (`BUILDS`): `<value>` is ALWAYS a raw bash command run
+    verbatim as `cd <repo> && <value>` — no `mvn`/`MVN_FLAGS` injection, no `$`.
+  - `BUILD_MODE=maven` (`MAVEN_BUILDS`/`MAVEN_REPOS`): `<value>` is an `mvn`
+    goal run as `cd <repo> && mvn ${MVN_FLAGS} <value>`; a `$`-prefixed value is
+    instead a raw command (remainder after `$`, whitespace trimmed).
+  Repos with no root `pom.xml` contribute nothing to `MAVEN_POMS_LIST` /
+  IntelliJ's import list regardless of mode.
 - **node_modules on named volumes.** Each npm module's `node_modules` is
   mounted as a Docker named volume (`NPM_NM_VOLUME_MOUNTS`) for speed on macOS.
   Fresh named volumes are `root:root`, so `post-create.sh` must `chown` each
   mount-point to `vscode` before any npm/Maven step — otherwise npm dies with
   `EACCES … mkdir node_modules/@types`. Keep that chown in sync with the
   module-discovery `find` if you touch either.
-- **Mono-repo mode:** `REPOS=()` switches spawn to single-worktree mode; if
-  `MAVEN_REPOS=()` too and a root `pom.xml` exists it auto-populates
-  `MAVEN_REPOS=("<PROJECT_NAME>:install")`.
+- **Mono-repo mode:** `REPOS=()` switches spawn to single-worktree mode; if no
+  build list is configured too and a root `pom.xml` exists it auto-populates a
+  single `<PROJECT_NAME>:install` Maven build (`BUILD_MODE=maven`).
+- **Host-mount repos (empty base-ref).** A `REPOS` entry with an empty value
+  (e.g. `"hal-npm-packages:"`) is not a git repo: the worktree loop
+  (`spawn-workspace.sh:~660`) skips `create_worktree`, collects it into
+  `HOST_MOUNT_REPOS`, and emits a bind mount (`HOST_MOUNT_BINDS`, injected into
+  `devcontainer.json` via the same awk pattern as `NPM_NM_VOLUME_MOUNTS`) from
+  `${SOURCE_WS}/<repo>` to its workspace path. An empty placeholder dir is
+  created in `WS_DIR` as the mountpoint; it stays empty on the host, so dispose's
+  `rm -rf` never touches the source. `dispose-workspace.sh` needs no special
+  case — its worktree/branch loops are already `.git`-guarded and skip non-git
+  dirs. Guarded by `MONO_REPO == 0` so mono-repo's synthetic empty-value entry
+  still builds a worktree.
 
 ## Running / testing changes
 
