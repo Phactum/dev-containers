@@ -114,10 +114,26 @@ ENOENT). Route it through the sshd this container runs instead:
    `business-cockpit`, Database `business-cockpit`. The host/port here are
    resolved **from the container's side of the tunnel**, so `127.0.0.1`
    means the dev container.
-5. `Test Connection` while a run with the DB is active.
+5. **MongoDB replica set: force a direct connection.** The dev MongoDB is a
+   single-node replica set that advertises its members as `localhost:27017`.
+   Over the tunnel that address points at *your Mac*, not the container, so
+   normal replica-set discovery makes the driver chase an unreachable primary
+   and the connection **times out**. Fix: leave the **Replica set** field
+   empty and set the **URL** (it overrides the fields above) to
+   ```
+   mongodb://127.0.0.1:27017/business-cockpit?directConnection=true
+   ```
+   `directConnection=true` treats the node as a standalone: no topology
+   discovery, no set-name check, everything stays inside the tunnel. Do **not**
+   add a `replicaSet=` parameter. If you then get an *auth* error instead of a
+   timeout, connectivity is fine -- append `&authSource=admin` as a fallback.
+6. `Test Connection` while a run with the DB is active.
 
 Auth uses your existing host SSH keys (the container's `authorized_keys` is
-rebuilt from `~/.ssh/*.pub` on every start), so no new credentials.
+rebuilt from `~/.ssh/*.pub` on every start), so no new credentials. The
+`vscode` account is auto-unlocked on start (its shadow password is `!`, which
+`sshd`'s `UsePAM no` config would otherwise reject as an invalid user), so
+pubkey auth just works.
 
 ## Browser access
 
