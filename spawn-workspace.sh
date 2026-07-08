@@ -2001,6 +2001,15 @@ fi
 sudo ssh-keygen -A >/dev/null 2>&1 || true
 sudo mkdir -p /run/sshd
 
+# The devcontainer 'vscode' account ships with a locked password (shadow field
+# '!', login is via sudo NOPASSWD). With 'UsePAM no' below, sshd's locked-account
+# check (platform_locked_account) treats a '!'-prefixed shadow entry as an
+# invalid user and refuses EVERY auth method -- including pubkey -- so the DB
+# tunnel login fails with "Permission denied (publickey)". Clearing the lock to
+# '*' leaves the account without a usable login password (sudo still governs
+# access) but no longer flagged locked, so pubkey auth proceeds. Idempotent.
+sudo usermod -p '*' vscode 2>/dev/null || true
+
 # Minimal tunnel-only sshd config. No PAM, no password, pubkey only.
 cat > "${SSHD_CONFIG}" <<SSHDCONF
 Port ${SSHD_PORT}
