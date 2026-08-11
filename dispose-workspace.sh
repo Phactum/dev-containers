@@ -268,7 +268,8 @@ for repo in "${REPO_NAMES[@]}"; do
         src="${SOURCE_WS}/${repo}"
     fi
     wt="${WS_DIR}/${repo}"
-    [[ -d "${src}/.git" ]] || continue
+    # -e (not -d): submodules carry a .git *file* pointer, not a directory.
+    [[ -e "${src}/.git" ]] || continue
 
     # Capture the branch name from the expected worktree path (for optional
     # branch deletion later). Falls back gracefully if wt doesn't exist.
@@ -334,7 +335,8 @@ if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
         else
             src="${SOURCE_WS}/${repo}"
         fi
-        [[ -d "${src}/.git" ]] || continue
+        # -e (not -d): submodules carry a .git *file* pointer, not a directory.
+        [[ -e "${src}/.git" ]] || continue
         if git -C "${src}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
             if [[ ${FORCE} -eq 1 ]]; then
                 git -C "${src}" branch -D "${BRANCH}" || true
