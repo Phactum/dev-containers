@@ -60,7 +60,12 @@
 #
 # 5. CLAUDE.md, .claude/ and README.md placed at the workspace root
 #    Claude Code in the new workspace inherits the same project-level
-#    instructions, agents, and skills as the source workspace. A README.md is
+#    instructions, agents, and skills as the source workspace. .claude/ is
+#    seeded by a one-time cp -R, EXCEPT .claude/skills which is additionally
+#    bind-mounted back onto ${SOURCE_WS}/.claude/skills (see the mounts array in
+#    devcontainer.json). So skills an agent creates or edits inside one story
+#    container are shared live with every other container and the base workspace
+#    instead of staying trapped in the container copy. A README.md is
 #    written at the workspace root (with story-specific port info, first-time
 #    setup steps, and the run-config order); IntelliJ's auto-README opener
 #    finds it before descending into Maven modules and surfaces it as the
@@ -777,6 +782,18 @@ fi
 [[ -f "${SOURCE_WS}/CLAUDE.md" ]] && cp "${SOURCE_WS}/CLAUDE.md" "${WS_DIR}/"
 [[ -d "${SOURCE_WS}/.claude"   ]] && cp -R "${SOURCE_WS}/.claude" "${WS_DIR}/"
 
+# Share the project-level Claude skills directory back to the SOURCE workspace
+# instead of leaving it as the one-time copy above. The cp -R seeds .claude/ so
+# settings/agents/skills are inherited on first start, but a devcontainer bind
+# mount then overlays .claude/skills onto ${SOURCE_WS}/.claude/skills at runtime
+# (see the mounts array in the generated devcontainer.json). That way skills an
+# agent creates or edits in one story container are immediately visible to every
+# other container and to the base workspace. Pre-create both the bind source (on
+# the base workspace) and the mountpoint (in this story workspace) so Docker
+# doesn't materialise them as root-owned dirs on first mount.
+mkdir -p "${SOURCE_WS}/.claude/skills"
+mkdir -p "${WS_DIR}/.claude/skills"
+
 # Project-local Claude Code overrides that ONLY apply inside this devcontainer.
 # - permissions.defaultMode=bypassPermissions: skip approval prompts. Container
 #   is a sandbox, all tool calls go through it; loosening permissions here
@@ -1245,6 +1262,15 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         // confused about module structure.
         "source=__SOURCE_WS__,target=__SOURCE_WS__,type=bind",
         "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+
+        // Project-level Claude skills are shared back to the SOURCE workspace so
+        // that skills created or edited by an agent inside one story container
+        // are immediately available to every other container and to the base
+        // workspace. Without this the workspace .claude/ is only a one-time copy
+        // (see the cp -R in spawn-workspace.sh), so skill changes would stay
+        // trapped in the container. This deeper bind overlays ONLY the skills/
+        // subfolder on top of the workspaceMount above (deeper path wins).
+        "source=__SOURCE_WS__/.claude/skills,target=__WORKSPACE_PATH__/.claude/skills,type=bind",
 
         "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.m2,target=/home/vscode/.m2,type=bind",
