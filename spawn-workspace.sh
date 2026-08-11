@@ -133,7 +133,11 @@
 #    writable onto the container's ~/.config/glab-cli; spawn-workspace.sh
 #    resolves the host path per OS (macOS: ~/Library/Application Support/
 #    glab-cli, Linux: ~/.config/glab-cli) so the GitLab CLI login flows
-#    between host and container regardless of platform. ~/.npmrc is NOT
+#    between host and container regardless of platform. Likewise the host's
+#    ~/.config/gh (same path on every OS) is mounted writable onto the
+#    container's ~/.config/gh so the GitHub CLI (gh) login is shared; gh is
+#    installed in the image (GH_VERSION in .env.sh) and wired as git's HTTPS
+#    credential helper for github.com via 'gh auth setup-git'. ~/.npmrc is NOT
 #    bind-mounted: spawn-workspace.sh
 #    resolves the host file at spawn time (strips /Users/... paths, substitutes
 #    ${TOKEN_NAME}-style placeholders for every var in FORWARDED_ENV_VARS with
@@ -253,6 +257,17 @@ if [[ -n "${GLAB_HOSTNAME:-}" && -n "${GLAB_VERSION:-}" ]]; then
     GLAB_ENABLED=1
 else
     GLAB_ENABLED=0
+fi
+
+# GitHub CLI (gh) is installed when GH_VERSION is set in .env.sh. gh always
+# targets github.com, so unlike glab it needs no hostname. The host's gh config
+# (~/.config/gh -- same path on macOS and Linux) is bind-mounted so the login
+# is shared. Conditional blocks in the generated files are stripped via
+# __GH_BLOCK_START__/__GH_BLOCK_END__ markers below.
+if [[ -n "${GH_VERSION:-}" ]]; then
+    GH_ENABLED=1
+else
+    GH_ENABLED=0
 fi
 
 BRANCH=""
@@ -1039,6 +1054,28 @@ else
     echo "glab integration: disabled (GLAB_HOSTNAME and/or GLAB_VERSION empty in .env.sh)"
 fi
 
+# Resolve the host's gh (GitHub CLI) config directory. Unlike glab, gh uses
+# ~/.config/gh on BOTH macOS and Linux (it honours GH_CONFIG_DIR / XDG, not
+# Go's os.UserConfigDir()), so there's no OS-specific source path. Bind-mounting
+# it onto the container's ~/.config/gh shares hosts.yml (the github.com auth
+# token) in both directions. Fallback: create the dir as a stub if the user
+# never ran gh, so the mount has a valid source; 'gh auth login' (host or
+# container) then populates it and the token flows back to the host.
+GH_CONFIG_SRC=""
+if [[ ${GH_ENABLED} -eq 1 ]]; then
+    if [[ -d "${HOME}/.config/gh" ]]; then
+        GH_CONFIG_SRC="${HOME}/.config/gh"
+    else
+        mkdir -p "${HOME}/.config/gh"
+        GH_CONFIG_SRC="${HOME}/.config/gh"
+        echo "note: no host gh config found, created stub at ${GH_CONFIG_SRC}"
+        echo "      run 'gh auth login' (host or container) to populate"
+    fi
+    echo "gh config source: ${GH_CONFIG_SRC}"
+else
+    echo "gh integration: disabled (GH_VERSION empty in .env.sh)"
+fi
+
 # SSH-agent forwarding so SSH-key-based remotes (git@<host>:...) don't prompt
 # for the key's passphrase on every operation. Two OS-specific paths:
 #  - macOS Docker Desktop: exposes the host's ssh-agent at a magic socket
@@ -1237,6 +1274,26 @@ RUN set -eux; \
     rm -rf /tmp/glab.tgz /tmp/bin; \
     /usr/local/bin/glab --version
 # __GLAB_BLOCK_END__
+
+# __GH_BLOCK_START__
+# gh (GitHub CLI). Pinned to a known-good version; bump GH_VERSION in .env.sh.
+# Release URL pattern: github.com/cli/cli/releases/download/v<v>/gh_<v>_linux_<arch>.tar.gz
+# The tarball extracts to gh_<v>_linux_<arch>/bin/gh.
+ARG GH_VERSION=__GH_VERSION__
+RUN set -eux; \
+    deb_arch="$(dpkg --print-architecture)"; \
+    case "$deb_arch" in \
+        amd64) gh_arch=amd64 ;; \
+        arm64) gh_arch=arm64 ;; \
+        *) echo "unsupported arch: $deb_arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
+        -o /tmp/gh.tgz; \
+    tar -xzf /tmp/gh.tgz -C /tmp; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gh_arch}"; \
+    /usr/local/bin/gh --version
+# __GH_BLOCK_END__
 DOCKERFILE
 
 cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
@@ -1316,6 +1373,13 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         // looks at inside the container.
         "source=__GLAB_CONFIG_SRC__,target=/home/vscode/.config/glab-cli,type=bind",
         // __GLAB_BLOCK_END__
+        // __GH_BLOCK_START__
+        // gh (GitHub CLI) config: hosts.yml holds the github.com auth token.
+        // Bind-mounted rw so 'gh auth login' run on the host or in the
+        // container persists to the same file. gh uses ~/.config/gh on every
+        // OS, so __GH_CONFIG_SRC__ needs no per-platform resolution.
+        "source=__GH_CONFIG_SRC__,target=/home/vscode/.config/gh,type=bind",
+        // __GH_BLOCK_END__
         // SSH-agent socket forwarding: host's ssh-agent (with cached passphrase-
         // protected keys) is reachable inside the container at /ssh-agent. The
         // source path is OS-specific and resolved by spawn-workspace.sh:
@@ -1502,9 +1566,11 @@ substitute_placeholders() {
         -e "s/__GLAB_VERSION__/${GLAB_VERSION:-}/g" \
         -e "s/__NODE_FEATURE_VERSION__/${NODE_FEATURE_VERSION}/g" \
         -e "s/__GLAB_HOSTNAME__/${GLAB_HOSTNAME:-}/g" \
+        -e "s/__GH_VERSION__/${GH_VERSION:-}/g" \
         -e "s|__REMOTE_ENV_FORWARDED__|${REMOTE_ENV_FORWARDED}|g" \
         -e "s|__PORTS_ATTRS__|${PORTS_ATTRS}|g" \
         -e "s|__GLAB_CONFIG_SRC__|${GLAB_CONFIG_SRC}|g" \
+        -e "s|__GH_CONFIG_SRC__|${GH_CONFIG_SRC}|g" \
         -e "s|__SSH_AGENT_SRC__|${SSH_AGENT_SRC}|g" \
         -e "s|__HOST_TZ__|${HOST_TZ}|g" \
         -e "s/__PORT_OFFSET__/${PORT_OFFSET}/g" \
@@ -1526,6 +1592,19 @@ substitute_placeholders() {
     else
         sed -i.bak \
             -e '/__GLAB_BLOCK_START__/,/__GLAB_BLOCK_END__/d' \
+            "${file}"
+    fi
+    rm "${file}.bak"
+
+    # Same conditional handling for the gh (GitHub CLI) blocks.
+    if [[ ${GH_ENABLED} -eq 1 ]]; then
+        sed -i.bak \
+            -e '/__GH_BLOCK_START__/d' \
+            -e '/__GH_BLOCK_END__/d' \
+            "${file}"
+    else
+        sed -i.bak \
+            -e '/__GH_BLOCK_START__/,/__GH_BLOCK_END__/d' \
             "${file}"
     fi
     rm "${file}.bak"
@@ -1719,6 +1798,18 @@ git config --global --unset-all "credential.https://__GLAB_HOSTNAME__.helper" 2>
 git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" ""
 git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" "!/home/vscode/glab-creds.sh"
 # __GLAB_BLOCK_END__
+
+# __GH_BLOCK_START__
+# Wire gh as git's credential helper for HTTPS operations on github.com, so
+# pushes/pulls to HTTPS github remotes (e.g. the *.wiki repos) reuse the token
+# from the bind-mounted gh config without prompting. SSH remotes are unaffected
+# -- they keep using the forwarded ssh-agent. Unlike glab, gh's own
+# 'gh auth git-credential' is well-behaved, so 'gh auth setup-git' wires it
+# directly (no wrapper needed). It's idempotent and only a no-op warning when
+# gh isn't logged in yet.
+gh auth setup-git 2>/dev/null \
+    || echo "note: 'gh auth setup-git' skipped -- run 'gh auth login' (host or container) to enable HTTPS github pushes"
+# __GH_BLOCK_END__
 
 # Align git's working-tree heuristics with the macOS host so the bind-mounted
 # worktree doesn't look "dirty" inside the container.
