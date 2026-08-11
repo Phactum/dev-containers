@@ -1187,6 +1187,38 @@ RUN set -eux; \
     git --version; \
     rm -rf /var/lib/apt/lists/*
 
+# Chromium for the 'bpmn-to-image' CLI (installed via npm in post-create.sh).
+# bpmn-to-image drives a headless Chrome through Puppeteer to render BPMN
+# diagrams to PNG/SVG/PDF. Puppeteer's own bundled Chrome-for-Testing has NO
+# linux-arm64 build: on Apple-silicon hosts it downloads the x86-64 binary,
+# which Docker Desktop's Rosetta can only run if the image ships the x86 ELF
+# loader (/lib64/ld-linux-x86-64.so.2). The MS arm64 base image doesn't, so a
+# render dies with "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2".
+# Fix: install the distro's native Chromium (arm64 on Apple silicon, amd64 on
+# Intel) and point Puppeteer at it, skipping its own download entirely.
+#   - PUPPETEER_SKIP_DOWNLOAD (Puppeteer >= 20) suppresses the postinstall
+#     browser fetch, so 'npm install -g bpmn-to-image' pulls no ~500 MB x86
+#     Chrome. PUPPETEER_SKIP_CHROMIUM_DOWNLOAD is the legacy name, kept for
+#     older Puppeteer transitive versions.
+#   - PUPPETEER_EXECUTABLE_PATH makes puppeteer.launch() use the system binary;
+#     bpmn-to-image needs no patch because it honours a plain launch().
+# These are Dockerfile ENV (not containerEnv/remoteEnv) so they also apply
+# during the post-create npm install, where the download must be skipped.
+# The 'chromium' package name is Debian's; the MS Java base is Debian bookworm.
+RUN set -eux; \
+    . /etc/os-release; \
+    if [ "$ID" = "debian" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends chromium; \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "note: expected Debian base for 'chromium' package; got $ID -- adapt Dockerfile if bpmn-to-image is needed" >&2; \
+    fi; \
+    chromium --version || true
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 # __GLAB_BLOCK_START__
 # glab (GitLab CLI). Pinned to a known-good version; bump GLAB_VERSION in .env.sh.
 # Release URL pattern: gitlab.com/gitlab-org/cli/-/releases/v<v>/downloads/glab_<v>_linux_<arch>.tar.gz
@@ -1602,13 +1634,21 @@ fi
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
 bash -lc "npm install -g @anthropic-ai/claude-code"
 
+# install bpmn-to-image (https://github.com/bpmn-io/bpmn-to-image) globally.
+# Must run here, not in the Dockerfile, because node/npm come from the Node
+# devcontainer feature, which installs AFTER the image build. The Dockerfile's
+# PUPPETEER_SKIP_DOWNLOAD=true ENV is in effect here, so Puppeteer skips its
+# (x86-only, Rosetta-breaking) Chrome download and the CLI uses the system
+# chromium via PUPPETEER_EXECUTABLE_PATH at render time.
+bash -lc "npm install -g bpmn-to-image"
+
 # named volume for per-story Claude project state is owned by root after first mount
 sudo chown -R vscode:vscode /home/vscode/.claude/projects/__MEMORY_KEY__ || true
 
 # Expose mvn and claude on /usr/local/bin so they work in IDE-spawned non-login
 # shells (IntelliJ terminal, Claude plugin) where shell init is sometimes skipped.
 # We resolve the real path through a login shell, which sources sdkman/nvm.
-for cmd in mvn claude; do
+for cmd in mvn claude bpmn-to-image; do
     real="$(bash -lc "command -v ${cmd}" 2>/dev/null || true)"
     if [[ -n "${real}" ]]; then
         sudo ln -sf "${real}" "/usr/local/bin/${cmd}"
