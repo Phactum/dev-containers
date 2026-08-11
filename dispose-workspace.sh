@@ -128,8 +128,8 @@ fi
 # Accept "feature/FLOW-1234_foo", "FLOW-1234_foo", "<PROJECT_NAME>-FLOW-1234_foo",
 # or "<PROJECT_SHORT>-FLOW-1234_foo" (Docker container name).
 LEAF="${ARG##*/}"                       # strip optional branch prefix like feature/
-LEAF="${LEAF#${PROJECT_NAME}-}"         # strip optional workspace-name prefix
-LEAF="${LEAF#${PROJECT_SHORT}-}"        # strip optional container-name prefix
+LEAF="${LEAF#"${PROJECT_NAME}"-}"       # strip optional workspace-name prefix
+LEAF="${LEAF#"${PROJECT_SHORT}"-}"      # strip optional container-name prefix
 WS_NAME="${PROJECT_NAME}-${LEAF}"
 WS_DIR="${WORKSPACES_ROOT}/${WS_NAME}"
 

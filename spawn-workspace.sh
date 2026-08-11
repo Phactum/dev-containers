@@ -439,7 +439,7 @@ fi
 # source=...,target=... and other JSON values don't have the colon-between-
 # digits pattern).
 RESERVED_HOST_PORTS=()
-for dc in "${WORKSPACES_ROOT}"/${PROJECT_NAME}-*/.devcontainer/devcontainer.json; do
+for dc in "${WORKSPACES_ROOT}"/"${PROJECT_NAME}"-*/.devcontainer/devcontainer.json; do
     [[ -f "${dc}" ]] || continue
     [[ "${dc}" == "${WS_DIR}/.devcontainer/devcontainer.json" ]] && continue
     while IFS= read -r host_port; do
@@ -742,7 +742,7 @@ done
 NPM_MODULE_DIRS=()
 while IFS= read -r pj; do
     pj_dir="$(dirname "${pj}")"
-    rel="${pj_dir#${WS_DIR}/}"
+    rel="${pj_dir#"${WS_DIR}"/}"
     # Guard: skip if WS_DIR was not a prefix (shouldn't happen)
     [[ "${rel}" == "${pj_dir}" ]] && continue
     NPM_MODULE_DIRS+=("${rel}")
