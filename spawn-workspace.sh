@@ -586,7 +586,11 @@ create_worktree() {
     fi
     local dst="${WS_DIR}/${repo}"
 
-    if [[ ! -d "${src}/.git" ]]; then
+    # Accept both a real .git directory and a .git *file*: git submodules store
+    # their metadata under the superproject's .git/modules/<name> and leave only
+    # a "gitdir: ..." pointer file in the working tree, so -d would wrongly skip
+    # every submodule (leaving empty worktrees -> no Maven warmup). -e matches both.
+    if [[ ! -e "${src}/.git" ]]; then
         echo "skip ${repo}: no git repo at ${src}"
         return
     fi
@@ -703,7 +707,8 @@ for repo in "${REPO_NAMES[@]}"; do
     else
         src_repo="${SOURCE_WS}/${repo}"
     fi
-    [[ -d "${src_repo}/.git" ]] || continue
+    # -e (not -d): submodules carry a .git *file* pointer, not a directory.
+    [[ -e "${src_repo}/.git" ]] || continue
     git -C "${src_repo}" config core.fileMode false
     git -C "${src_repo}" config core.autocrlf input
     # Belt-and-suspenders: same as the --global settings in post-create.sh,
