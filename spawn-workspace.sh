@@ -1185,6 +1185,10 @@ FROM __BASE_IMAGE__
 
 # socat       -- post-start.sh exposes the docker socket on TCP 127.0.0.1:2375
 #                so tools that prefer DOCKER_HOST=tcp://... have a backup endpoint.
+# jq          -- the shared Claude Code statusline (~/.claude/statusline.sh, bind-
+#                mounted in via the ~/.claude mount) parses the statusline JSON
+#                payload with jq to render the session/weekly usage limits.
+#                Without it the statusline silently drops the limit segment.
 # openssh-server -- lets IntelliJ's Database tool reach the in-container DB through
 #                an SSH tunnel. In ijent Dev Container mode the IDE runs on the host
 #                and its Database plugin cannot introspect a docker-in-docker DB
@@ -1195,7 +1199,7 @@ FROM __BASE_IMAGE__
 RUN rm -f /etc/apt/sources.list.d/yarn.list /etc/apt/keyrings/yarn.gpg \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        socat ca-certificates curl openssh-server \
+        socat ca-certificates curl jq openssh-server \
  && rm -rf /var/lib/apt/lists/*
 
 # Newer git than the base image ships. The MS devcontainer base images
