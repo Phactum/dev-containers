@@ -249,8 +249,12 @@ What it does:
 2. Computes the branch leaf (strips `feature/` etc.) → workspace name
    `<PROJECT_NAME>-<leaf>`.
 3. Probes host ports and picks the lowest free
-   multiple of 10000 as the **port offset** (so parallel stories never
-   collide on host ports).
+   multiple of `PORT_OFFSET_STEP` (default 10000, configurable in `.env.sh`,
+   range 500..10000) as the **port offset** (so parallel stories never
+   collide on host ports). The probe treats a host port as taken when a live
+   listener holds it, when another story workspace's `devcontainer.json`
+   statically maps it, or when any docker container binds it — including
+   stopped containers and containers of unrelated projects.
 4. Creates one git worktree per source repo with the requested branch
    (reused, tracked, or — for brand-new branches — forked from the
    per-repo base ref defined in `REPOS`).

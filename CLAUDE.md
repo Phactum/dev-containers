@@ -87,7 +87,7 @@ is present.
 ## Key locations in spawn-workspace.sh
 
 - Arg parsing / workspaces-root resolution (CLI flag → `<PROJECT_SHORT>_WORKSPACES_ROOT` env var → auto-detect two dirs up): near the top.
-- `is_port_in_use()` (line ~375), port-offset probing logic — checks live listeners **and** ports statically reserved by other workspaces' `devcontainer.json`.
+- `is_port_in_use()` (line ~375), port-offset probing logic — checks live listeners, ports statically reserved by other workspaces' `devcontainer.json`, **and** ports bound by any docker container (`docker inspect` over `docker ps -a`, catching stopped/other-project containers). Offset step is configurable via `PORT_OFFSET_STEP` in `.env.sh` (default 10000, valid range 500..10000; the script aborts outside it).
 - `resolve_base()` / `create_worktree()` (~488/499) — per-repo worktree strategy (reuse / track / fork from base ref).
 - Generated artifacts, in order: `.claude/settings.local.json`, `.idea/*` (workspace/misc/compiler xml), `.devcontainer/Dockerfile`, `devcontainer.json`, `post-create.sh`, `post-start.sh`, run-config XMLs, sshd config.
 - `substitute_placeholders()` (~1315), `detect_java_home()` (~1396).

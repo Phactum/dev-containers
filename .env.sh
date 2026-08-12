@@ -69,10 +69,21 @@ MAVEN_REPOS=(
 # --- Host ports + labels ----------------------------------------------------
 
 # Ports the container publishes on the host. spawn-workspace.sh picks an
-# offset (multiple of 10000) where ALL of these are free, so parallel
-# story containers don't collide. Inside the container, services still
-# bind to these literal numbers.
+# offset (multiple of PORT_OFFSET_STEP) where ALL of these are free, so
+# parallel story containers don't collide. Inside the container, services
+# still bind to these literal numbers.
 HOST_PORTS=(4200 3000 8079 8080 9080 2222)
+
+# Step size between candidate port offsets. spawn-workspace.sh tries
+# offsets 0, STEP, 2*STEP, ... until it finds a range where every HOST_PORT
+# is free. Must be between 500 and 10000 (the script aborts otherwise).
+# A large step (10000) is collision-proof by construction: it exceeds the
+# spread of HOST_PORTS, so two workspaces' offset ranges can never overlap
+# even if free-port detection were imperfect. Smaller steps pack more
+# parallel workspaces into lower port numbers but rely on detection
+# (docker bindings + live listeners + other workspaces' devcontainer.json)
+# to avoid overlaps -- which spawn-workspace.sh does check.
+PORT_OFFSET_STEP=10000
 
 # Labels shown in JetBrains' Services view per port. Format: "port:label".
 # A port without a matching entry gets a generic auto-label.
