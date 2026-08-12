@@ -157,12 +157,17 @@
 #    JetBrains' devcontainer-id label in its UI still shows a hash, but Docker
 #    tooling now identifies stories by their branch name.
 #
-#    Port offset (multiple of 10000): spawn-workspace.sh probes the host for
-#    free ports and picks the lowest offset where 4200/5173/8079/8080/9080 are
-#    all free. The probe checks BOTH currently-bound listeners AND host ports
-#    statically reserved by other story workspaces' devcontainer.json files,
-#    so a stopped (but not disposed) workspace can't be unstuck-into-conflict
-#    when its container is later restarted. Default offset is 0 (same numbers
+#    Port offset (multiple of PORT_OFFSET_STEP, default 10000, range 500..10000):
+#    spawn-workspace.sh probes the host for free ports and picks the lowest
+#    offset where all HOST_PORTS are free. The probe checks THREE sources:
+#    currently-bound listeners, host ports statically reserved by other story
+#    workspaces' devcontainer.json files (so a stopped-but-not-disposed
+#    workspace can't be unstuck-into-conflict when restarted), AND host ports
+#    bound by ANY docker container -- including stopped ones and containers of
+#    OTHER projects, which the other two sources miss (closes the cross-project
+#    collision gap). A larger step is collision-proof by construction (exceeds
+#    the HOST_PORTS spread); a smaller step packs workspaces tighter but leans
+#    on the detection above. Default offset is 0 (same numbers
 #    on host and container). forwardPorts uses host:container syntax so the
 #    container itself stays on its native ports (no Spring server.port
 #    override needed). OAuth callback / issuer URIs that *do* depend on the
@@ -450,6 +455,31 @@ if (( ${#RESERVED_HOST_PORTS[@]} > 0 )); then
     echo "ports reserved by other workspaces: ${RESERVED_HOST_PORTS[*]}"
 fi
 
+# Also collect host ports bound by ANY docker container on this host --
+# including STOPPED ones and containers of OTHER projects, which the
+# devcontainer.json scan above (scoped to this project's workspaces) and
+# the live-listener check below (stopped containers have no listener) both
+# miss. This closes the cross-project collision gap: a stopped DevContainer
+# from an unrelated project can no longer have its offset silently reused.
+# HostConfig.PortBindings holds the statically-mapped host ports regardless
+# of run state. Best-effort: skipped when docker is absent or the daemon is
+# unreachable.
+if command -v docker >/dev/null 2>&1; then
+    DOCKER_RESERVED=()
+    while IFS= read -r host_port; do
+        [[ -n "${host_port}" ]] && DOCKER_RESERVED+=("${host_port}")
+    done < <(
+        docker ps -a --format '{{.ID}}' 2>/dev/null \
+            | xargs -r docker inspect \
+                --format '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}
+{{end}}{{end}}' 2>/dev/null
+    )
+    if (( ${#DOCKER_RESERVED[@]} > 0 )); then
+        RESERVED_HOST_PORTS+=("${DOCKER_RESERVED[@]}")
+        echo "ports reserved by docker containers: ${DOCKER_RESERVED[*]}"
+    fi
+fi
+
 is_port_in_use() {
     local p=$1
     # reserved by another workspace's static port mapping. Length guard
@@ -469,8 +499,26 @@ is_port_in_use() {
     fi
 }
 
+# Step size between candidate offsets comes from .env.sh (default 10000).
+# Constrained to [500, 10000]: below 500 the offset ranges of two workspaces
+# could overlap by less than the HOST_PORTS spread AND leave too little room
+# between adjacent ports; above 10000 offers no benefit and quickly runs host
+# ports past the 65535 ceiling. Abort loudly on a misconfigured value.
+PORT_OFFSET_STEP="${PORT_OFFSET_STEP:-10000}"
+if ! [[ "${PORT_OFFSET_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PORT_OFFSET_STEP must be an integer, got '${PORT_OFFSET_STEP}'" >&2
+    exit 1
+fi
+if (( PORT_OFFSET_STEP < 500 || PORT_OFFSET_STEP > 10000 )); then
+    echo "ERROR: PORT_OFFSET_STEP must be between 500 and 10000, got ${PORT_OFFSET_STEP}" >&2
+    exit 1
+fi
+
+# Upper bound keeps the highest host port (max HOST_PORT + offset) safely
+# below the 65535 ceiling regardless of the configured step.
+PORT_OFFSET_MAX=50000
 PORT_OFFSET=0
-while (( PORT_OFFSET <= 90000 )); do
+while (( PORT_OFFSET <= PORT_OFFSET_MAX )); do
     free_range=1
     # Length-guard avoids bash 3.2's "${arr[@]}: unbound variable" under set -u
     # when HOST_PORTS is empty (project has no forwarded ports).
@@ -483,10 +531,10 @@ while (( PORT_OFFSET <= 90000 )); do
         done
     fi
     (( free_range == 1 )) && break
-    PORT_OFFSET=$((PORT_OFFSET + 10000))
+    PORT_OFFSET=$((PORT_OFFSET + PORT_OFFSET_STEP))
 done
-if (( PORT_OFFSET > 90000 )); then
-    echo "ERROR: no free port range found (tried offset 0..90000 in 10000 steps)" >&2
+if (( PORT_OFFSET > PORT_OFFSET_MAX )); then
+    echo "ERROR: no free port range found (tried offset 0..${PORT_OFFSET_MAX} in ${PORT_OFFSET_STEP} steps)" >&2
     exit 1
 fi
 echo "port offset: ${PORT_OFFSET}"
