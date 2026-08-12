@@ -30,6 +30,7 @@ Watch videos showing:
 | `README.md.tpl`           | Template for the welcome README placed at each new workspace root |
 | `initialize.sh`           | Optional hook run before Maven warmup builds (create if needed)  |
 | `runConfigurations/*.xml` | IntelliJ run configs copied verbatim into each new workspace     |
+| `claude/statusline.sh`    | Optional Claude Code statusline (usage limits + Caveman badge); copy to `~/.claude/` — see below |
 
 Both scripts source `.env.sh` at startup. To adapt to a new project, fork
 this directory into the project's source workspace and edit `.env.sh`.
@@ -316,6 +317,63 @@ What it does:
 
 *Hint:* Read the head of the script for a detailed list of features and
 their documentation.
+
+## Claude Code usage statusline
+
+An optional host-side statusline that shows your Claude Code usage limits and
+keeps the Caveman badge. It renders, left to right:
+
+```
+[CAVEMAN]  Opus 4.8 (1M) | Sitzung 24% | Woche 41%
+```
+
+- **Sitzung** — the rolling **5-hour** window (`rate_limits.five_hour`).
+- **Woche** — the **7-day / weekly** window across all models
+  (`rate_limits.seven_day`).
+
+The limit fields are only present for Claude.ai Pro/Max subscribers, and only
+**after the first API response** of a session — until then only the badge and
+model name show, which is expected.
+
+**Why it also works inside every story container:** `spawn-workspace.sh`
+bind-mounts the host `~/.claude` into each container
+(`~/.claude` → `/home/vscode/.claude`), so `settings.json` and the statusline
+script are shared automatically — set it up once on the host and every story
+container inherits it. The one runtime dependency is `jq`, which the
+DevContainer image installs (see the `apt-get` line in the generated
+`Dockerfile`). Rebuild an existing container to pick up `jq`; new spawns have
+it out of the box.
+
+### Setup
+
+1. Copy the ready-made [`claude/statusline.sh`](claude/statusline.sh) from this
+   repo to `~/.claude/statusline.sh` and make it executable:
+
+   ```sh
+   cp claude/statusline.sh ~/.claude/statusline.sh
+   chmod +x ~/.claude/statusline.sh
+   ```
+
+2. Point the statusline at it in `~/.claude/settings.json` (the `$HOME` path is
+   portable across host and container, unlike a hard-coded `/home/vscode/…`):
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "bash \"$HOME/.claude/statusline.sh\""
+     }
+   }
+   ```
+
+The statusline refreshes on the next render. On the host it works immediately;
+existing containers need a rebuild for `jq`.
+
+**Limitation — no per-model / Fable weekly limit.** Claude Code exposes only
+`rate_limits.five_hour` and `rate_limits.seven_day` (all models) to the
+statusline — there is no per-model field, so a separate weekly Fable limit
+**cannot** be shown here. Use the `/usage` command inside Claude Code to see the
+model-specific weekly limits.
 
 ## Troubleshooting
 
