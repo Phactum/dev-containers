@@ -13,7 +13,7 @@
 #
 # 2. Git worktrees instead of fresh clones
 #    For each source repo under <workspaces-root>/<PROJECT_NAME>/<repo> (REPOS
-#    array in .env.sh) a worktree is created in the new workspace. The script
+#    array in devcontainers-config.json) a worktree is created in the new workspace. The script
 #    picks one of three strategies per repo:
 #      - local branch exists      -> reuse it (and fast-forward to --base if
 #                                    the branch has no story-specific commits,
@@ -24,7 +24,7 @@
 #    Worktrees keep the source repo as the single source of truth and avoid
 #    duplicating the .git history on disk.
 #    Exception -- host-mount entries: a REPOS entry with an EMPTY value (e.g.
-#    "hal-npm-packages:") is not a git repo; no worktree is created. Instead the
+#    "backlog.md:") is not a git repo; no worktree is created. Instead the
 #    host directory is bind-mounted into the workspace at the same path (mount
 #    JSON built alongside NPM_NM_VOLUME_MOUNTS, injected into devcontainer.json).
 #    For pre-built artifacts / non-versioned folders. Mono-repo's synthetic
@@ -32,7 +32,7 @@
 #    it is excluded via MONO_REPO.
 #
 # 3. Per-repo base ref for new branches
-#    Each entry in REPOS (.env.sh) is "<repo>:<base-ref>". When the branch
+#    Each entry in REPOS (devcontainers-config.json) is "<repo>:<base-ref>". When the branch
 #    passed to spawn is brand new, that repo's base ref decides where to
 #    fork from: origin/<ref> preferred, falls back to local <ref>; if the
 #    repo doesn't know the requested ref at all, falls back to origin/HEAD
@@ -46,7 +46,7 @@
 #    every sync. We list each subproject's pom in MavenProjectsManager.original
 #    Files (.idea/misc.xml) so IntelliJ imports each as a top-level project.
 #    post-create.sh builds each repo in dependency order (BUILDS / MAVEN_BUILDS
-#    in .env.sh).
+#    in devcontainers-config.json).
 #
 # 4a. Optional initialization hook (initialize.sh)
 #    If dev-containers/initialize.sh exists, spawn-workspace.sh copies it to
@@ -106,6 +106,19 @@
 #    node_modules mount-point to vscode before any npm/Maven step touches it,
 #    otherwise npm dies with "EACCES: permission denied, mkdir .../@types".
 #
+# 6b. Distro support ("distro" in devcontainers-config.json)
+#    The container can also be built on a RHEL-family base ("distro": "rocky";
+#    covers Rocky, Alma, CentOS Stream and RHEL/UBI). The generated Dockerfile
+#    then replaces every devcontainer feature -- they are Debian/Ubuntu-only,
+#    their install.sh shells out to apt-get -- with dnf installs (vscode user,
+#    JDK from javaVersion, Maven from mavenVersion, Node from NodeSource,
+#    docker-ce), and devcontainer.json adds the --privileged/--init flags plus
+#    the /var/lib/docker volume that the docker-in-docker feature would
+#    otherwise contribute. Everything distro-specific lives in
+#    __DEB_BLOCK_*__ / __RPM_BLOCK_*__ markers in the templates below; exactly
+#    one side survives substitute_placeholders. Default is "debian", which
+#    produces exactly the previous output.
+#
 # 7. Constant in-container workspace path: /workspaces/<PROJECT_NAME>
 #    Every story container mounts the workspace at the same path. Claude Code
 #    encodes the project key from the cwd, so this gives every container the
@@ -136,7 +149,7 @@
 #    between host and container regardless of platform. Likewise the host's
 #    ~/.config/gh (same path on every OS) is mounted writable onto the
 #    container's ~/.config/gh so the GitHub CLI (gh) login is shared; gh is
-#    installed in the image (GH_VERSION in .env.sh) and wired as git's HTTPS
+#    installed in the image (GH_VERSION in devcontainers-config.json) and wired as git's HTTPS
 #    credential helper for github.com via 'gh auth setup-git'. ~/.npmrc is NOT
 #    bind-mounted: spawn-workspace.sh
 #    resolves the host file at spawn time (strips /Users/... paths, substitutes
@@ -195,7 +208,7 @@
 #     before opening the project window, so the IDE's first index pass sees
 #     a fully resolved reactor instead of an empty workspace.
 #
-# Companion script: bin/dispose-workspace.sh removes a workspace and prunes
+# Companion script: dispose-workspace.sh removes a workspace and prunes
 # its worktrees.
 #
 # ============================================================================
@@ -204,83 +217,88 @@
 #   <workspaces-root>/<PROJECT_NAME>/                   (source workspace, read by this script)
 #   <workspaces-root>/<PROJECT_NAME>-<branch-leaf>/     (created by this script)
 #
+# INSTALLATION
+#   Clone this directory ONCE and put it on your PATH, e.g.
+#       git clone <url> ~/tools/dev-containers
+#       ln -s ~/tools/dev-containers/spawn-workspace.sh   /usr/local/bin/
+#       ln -s ~/tools/dev-containers/dispose-workspace.sh /usr/local/bin/
+#   (symlinks are resolved, so the sibling loader env-config.sh is still found).
+#   Per-project settings then live in that project's own devcontainers-config.json; the
+#   scripts themselves stay untouched and are shared by every project.
+#
+# The devcontainers-config.json is located in this order:
+#   1. --config <path>   file, or a directory containing devcontainers-config.json
+#   2. ./dev-containers/devcontainers-config.json, relative to the CURRENT WORKING DIRECTORY
+#   3. ./devcontainers-config.json,                relative to the CURRENT WORKING DIRECTORY
+# Its directory (CONFIG_DIR) is the base directory for the other project
+# assets: README.md.tpl, initialize.sh and runConfigurations/ are read from
+# there, falling back to the copies shipped next to the scripts. Because of
+# that fallback, a lone devcontainers-config.json in the project directory is a complete
+# setup -- no subdirectory required.
+#
 # The <workspaces-root> directory is resolved in this order:
 #   1. --workspaces-root <path>            CLI flag (highest priority)
 #   2. $<PROJECT_SHORT>_WORKSPACES_ROOT    environment variable (e.g. VANILLABP_WORKSPACES_ROOT)
-#   3. auto-detect: parent of the directory holding this script, i.e. the
-#                   source workspace's parent
+#   3. "workspacesRoot" in devcontainers-config.json     (relative to the config's directory)
+#   4. auto-detect: walk up from CONFIG_DIR to the directory named
+#      <PROJECT_NAME> (the source workspace) and take its parent; falling back
+#      to two directories above CONFIG_DIR
 # Regardless of source, the script prints the resolved target workspace
 # directory and asks for confirmation before creating anything; pass --yes
 # to skip the prompt for scripted use.
 #
 # Usage:
-#   dev-containers/spawn-workspace.sh [--workspaces-root <path>] [--yes] <branch-name>
+#   spawn-workspace.sh [--config <path>] [--workspaces-root <path>] [--yes] <branch-name>
 #
 # Examples:
-#   dev-containers/spawn-workspace.sh feature/FLOW-4711_example-story
-#   dev-containers/spawn-workspace.sh --workspaces-root /opt/dev feature/FLOW-4711_example
-#   VANILLABP_WORKSPACES_ROOT=/opt/dev dev-containers/spawn-workspace.sh feature/FLOW-4711_example
+#   # from the project directory (finds ./dev-containers/devcontainers-config.json)
+#   spawn-workspace.sh feature/FLOW-4711_example-story
+#   # explicit config, runnable from anywhere
+#   spawn-workspace.sh --config ~/work/myproject/dev-containers/devcontainers-config.json feature/FLOW-4711_example
+#   spawn-workspace.sh --workspaces-root /opt/dev feature/FLOW-4711_example
+#   VANILLABP_WORKSPACES_ROOT=/opt/dev spawn-workspace.sh feature/FLOW-4711_example
 #
-# Base refs for new branches are configured per repo in REPOS (.env.sh).
+# Base refs for new branches are configured per repo in "repos" (devcontainers-config.json).
 # If the branch already exists locally or on origin, the existing tip is
 # reused and the base ref is ignored.
 #
 set -euo pipefail
 
-# Resolve the script's own directory first; everything else hangs off it
-# (the project config, the workspaces-root auto-detect).
-SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
+# Resolve the script's own directory, following symlinks. The scripts are meant
+# to be cloned ONCE and put on the PATH, which usually means a symlink from
+# /usr/local/bin -- so a plain dirname "$0" would point at the symlink's
+# directory and the sibling loader (env-config.sh) would not be found.
+SCRIPT_SOURCE="$0"
+while [[ -L "${SCRIPT_SOURCE}" ]]; do
+    _link_dir="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "${SCRIPT_SOURCE}")"
+    # A relative link target resolves against the directory holding the link.
+    [[ "${SCRIPT_SOURCE}" != /* ]] && SCRIPT_SOURCE="${_link_dir}/${SCRIPT_SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
 
-# Source project-specific config (PROJECT_NAME, PROJECT_SHORT, REPOS, ports,
-# base image, glab hostname, ...). Forking this script tree to a new project
-# means editing .env.sh; the script body is project-agnostic for the bits
-# .env.sh covers ("Mittel" scope).
-ENV_FILE="${SCRIPT_DIR}/.env.sh"
-if [[ ! -f "${ENV_FILE}" ]]; then
-    echo "Project config not found: ${ENV_FILE}" >&2
-    exit 1
-fi
-# shellcheck source=/dev/null
-source "${ENV_FILE}"
-
-# Derived from PROJECT_NAME for use in both shell logic and as sed-substituted
-# placeholders in the heredoc'd templates below.
-WORKSPACE_PATH="/workspaces/${PROJECT_NAME}"
-MEMORY_KEY="-workspaces-${PROJECT_NAME}"
-# Env var name for the workspaces-root override. Derived from PROJECT_SHORT
-# (uppercased) so different projects don't fight for the same name.
-ENV_VAR_WORKSPACES_ROOT="$(echo "${PROJECT_SHORT}" | tr '[:lower:]' '[:upper:]')_WORKSPACES_ROOT"
-
-# GitLab integration is optional. It only kicks in when BOTH GLAB_HOSTNAME
-# (the GitLab host the project lives on) and GLAB_VERSION (the glab CLI
-# release to install in the container) are set in .env.sh. Empty either
-# one and the project gets a container without glab installed, without
-# the bind-mounted glab config, and without the git credential helper
-# for that host. The conditional blocks in the generated files are
-# stripped via __GLAB_BLOCK_START__/__GLAB_BLOCK_END__ markers below.
-if [[ -n "${GLAB_HOSTNAME:-}" && -n "${GLAB_VERSION:-}" ]]; then
-    GLAB_ENABLED=1
-else
-    GLAB_ENABLED=0
-fi
-
-# GitHub CLI (gh) is installed when GH_VERSION is set in .env.sh. gh always
-# targets github.com, so unlike glab it needs no hostname. The host's gh config
-# (~/.config/gh -- same path on macOS and Linux) is bind-mounted so the login
-# is shared. Conditional blocks in the generated files are stripped via
-# __GH_BLOCK_START__/__GH_BLOCK_END__ markers below.
-if [[ -n "${GH_VERSION:-}" ]]; then
-    GH_ENABLED=1
-else
-    GH_ENABLED=0
-fi
+# ---------------------------------------------------------------------------
+# Argument parsing. Runs BEFORE the project config is loaded, because --config
+# decides which config to load in the first place.
+# ---------------------------------------------------------------------------
 
 BRANCH=""
 WORKSPACES_ROOT_CLI=""
+CONFIG_CLI=""
 ASSUME_YES=0
+REBUILD_BASE_IMAGE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -c|--config)
+            [[ $# -lt 2 ]] && { echo "--config needs an argument" >&2; exit 2; }
+            CONFIG_CLI="${2-}"
+            shift 2
+            ;;
+        --config=*)
+            CONFIG_CLI="${1#--config=}"
+            shift
+            ;;
         --workspaces-root)
             WORKSPACES_ROOT_CLI="${2-}"
             [[ $# -lt 2 ]] && { echo "--workspaces-root needs an argument" >&2; exit 2; }
@@ -294,8 +312,12 @@ while [[ $# -gt 0 ]]; do
             ASSUME_YES=1
             shift
             ;;
+        --rebuild-base-image)
+            REBUILD_BASE_IMAGE=1
+            shift
+            ;;
         -h|--help)
-            sed -n '2,180p' "$0"
+            sed -n '2,190p' "$0"
             exit 0
             ;;
         --)
@@ -316,8 +338,197 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${BRANCH}" ]]; then
-    echo "usage: $0 [--workspaces-root <path>] [--yes] <branch-name>" >&2
+    echo "usage: $0 [--config <path>] [--workspaces-root <path>] [--yes] <branch-name>" >&2
     exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Locate the project config.
+#
+# --config accepts either the config file itself or the directory holding it.
+# Without the flag we look, relative to the CURRENT WORKING DIRECTORY, for
+#   1. ./dev-containers/devcontainers-config.json
+#   2. ./devcontainers-config.json
+# Resolving against the working directory (not the script location) is what
+# makes a single PATH-installed clone usable from any project: cd into the
+# project and run the command. Because every other project asset falls back to
+# the copies shipped with the scripts, a lone devcontainers-config.json in the project root is
+# a complete setup -- no subdirectory required.
+#
+# The config file's directory becomes CONFIG_DIR, the base directory for every
+# other project asset the script reads (README.md.tpl, initialize.sh,
+# runConfigurations/). Assets are looked up there first and fall back to the
+# script directory, so a project only has to override what it actually
+# customises.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG_RELS=("dev-containers/devcontainers-config.json" "devcontainers-config.json")
+if [[ -n "${CONFIG_CLI}" ]]; then
+    if [[ -d "${CONFIG_CLI}" ]]; then
+        CONFIG_JSON="${CONFIG_CLI%/}/devcontainers-config.json"
+    else
+        CONFIG_JSON="${CONFIG_CLI}"
+    fi
+    if [[ ! -f "${CONFIG_JSON}" ]]; then
+        echo "Project config not found: ${CONFIG_JSON}" >&2
+        exit 1
+    fi
+else
+    CONFIG_JSON=""
+    for _rel in "${DEFAULT_CONFIG_RELS[@]}"; do
+        if [[ -f "${PWD}/${_rel}" ]]; then
+            CONFIG_JSON="${PWD}/${_rel}"
+            break
+        fi
+    done
+    if [[ -z "${CONFIG_JSON}" ]]; then
+        echo "Project config not found. Looked for:" >&2
+        for _rel in "${DEFAULT_CONFIG_RELS[@]}"; do
+            echo "  ${PWD}/${_rel}" >&2
+        done
+        echo "Run the command from the project directory, or point at a config" >&2
+        echo "with --config <path-to-devcontainers-config.json|dir>." >&2
+        exit 1
+    fi
+fi
+CONFIG_DIR="$(cd -P "$(dirname "${CONFIG_JSON}")" && pwd)"
+CONFIG_JSON="${CONFIG_DIR}/$(basename "${CONFIG_JSON}")"
+
+# Echo the --config flag back in the generated hints, but only when the user
+# actually passed one -- without it the default lookup finds the same config
+# anyway, so the shorter command is the correct advice.
+DISPOSE_CONFIG_HINT=""
+[[ -n "${CONFIG_CLI}" ]] && DISPOSE_CONFIG_HINT="--config ${CONFIG_JSON} "
+# Trailing-space-free variant for templates that append their own argument.
+DISPOSE_CMD="dispose-workspace.sh ${DISPOSE_CONFIG_HINT}"
+DISPOSE_CMD="${DISPOSE_CMD% }"
+
+# Resolve a project asset: prefer the copy next to devcontainers-config.json, fall back to the
+# one shipped next to the scripts. Prints nothing and returns 1 when neither
+# exists, so callers can treat the asset as optional.
+config_asset() {
+    local name="$1"
+    if [[ -e "${CONFIG_DIR}/${name}" ]]; then
+        echo "${CONFIG_DIR}/${name}"
+    elif [[ -e "${SCRIPT_DIR}/${name}" ]]; then
+        echo "${SCRIPT_DIR}/${name}"
+    else
+        return 1
+    fi
+}
+
+# Source project-specific config (PROJECT_NAME, PROJECT_SHORT, REPOS, ports,
+# base image, glab hostname, ...). Pointing the scripts at another project means
+# writing another devcontainers-config.json; the script body is project-agnostic for the bits
+# devcontainers-config.json covers ("Mittel" scope). env-config.sh reads the JSON (via jq) and
+# exposes it as the shell variables used below; the same devcontainers-config.json is consumed
+# by the PowerShell ports through EnvConfig.ps1.
+ENV_CONFIG="${SCRIPT_DIR}/env-config.sh"
+if [[ ! -f "${ENV_CONFIG}" ]]; then
+    echo "Config loader not found: ${ENV_CONFIG}" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "${ENV_CONFIG}"
+
+# Derived from PROJECT_NAME for use in both shell logic and as sed-substituted
+# placeholders in the heredoc'd templates below.
+WORKSPACE_PATH="/workspaces/${PROJECT_NAME}"
+MEMORY_KEY="-workspaces-${PROJECT_NAME}"
+# Env var name for the workspaces-root override. Derived from PROJECT_SHORT
+# (uppercased) so different projects don't fight for the same name.
+ENV_VAR_WORKSPACES_ROOT="$(echo "${PROJECT_SHORT}" | tr '[:lower:]' '[:upper:]')_WORKSPACES_ROOT"
+
+# GitLab integration is optional. It only kicks in when BOTH GLAB_HOSTNAME
+# (the GitLab host the project lives on) and GLAB_VERSION (the glab CLI
+# release to install in the container) are set in devcontainers-config.json. Empty either
+# one and the project gets a container without glab installed, without
+# the bind-mounted glab config, and without the git credential helper
+# for that host. The conditional blocks in the generated files are
+# stripped via __GLAB_BLOCK_START__/__GLAB_BLOCK_END__ markers below.
+if [[ -n "${GLAB_HOSTNAME:-}" && -n "${GLAB_VERSION:-}" ]]; then
+    GLAB_ENABLED=1
+else
+    GLAB_ENABLED=0
+fi
+
+# GitHub CLI (gh) is installed when GH_VERSION is set in devcontainers-config.json. gh always
+# targets github.com, so unlike glab it needs no hostname. The host's gh config
+# (~/.config/gh -- same path on macOS and Linux) is bind-mounted so the login
+# is shared. Conditional blocks in the generated files are stripped via
+# __GH_BLOCK_START__/__GH_BLOCK_END__ markers below.
+if [[ -n "${GH_VERSION:-}" ]]; then
+    GH_ENABLED=1
+else
+    GH_ENABLED=0
+fi
+
+# Corporate proxy / TLS interception. Three independent switches, each driving
+# a conditional block in the generated Dockerfile / devcontainer.json:
+#   PROXY_ENABLED  -- proxy URLs are passed to the build (build args) and to the
+#                     running container (containerEnv)
+#   CA_ENABLED     -- CA certificates are copied into the build context and
+#                     installed into the OS, JVM and Node trust stores
+#   PROXY_DEBIAN_HTTPS_ENABLED -- apt sources are rewritten from http to https
+# All default to off, so a project without a "proxy" block gets exactly the
+# same container as before.
+if [[ -n "${PROXY_HTTP:-}" || -n "${PROXY_HTTPS:-}" ]]; then
+    PROXY_ENABLED=1
+else
+    PROXY_ENABLED=0
+fi
+if (( ${#PROXY_CA_CERTS[@]} > 0 )); then
+    CA_ENABLED=1
+else
+    CA_ENABLED=0
+fi
+if [[ "${PROXY_DEBIAN_HTTPS:-false}" == "true" ]]; then
+    PROXY_DEBIAN_HTTPS_ENABLED=1
+else
+    PROXY_DEBIAN_HTTPS_ENABLED=0
+fi
+
+# Optional image build steps. Each defaults to on; turning one off drops the
+# corresponding block from the generated Dockerfile (and, for chromium, the
+# matching npm install from post-create.sh). Meant for builds that cannot reach
+# a Debian package mirror -- see "imageBuild" in devcontainers-config.json for what each one
+# costs.
+_bool_enabled() { [[ "${1}" != "false" ]] && echo 1 || echo 0; }
+APT_PKGS_ENABLED="$(_bool_enabled "${IMAGE_APT_PACKAGES:-true}")"
+RECENT_GIT_ENABLED="$(_bool_enabled "${IMAGE_RECENT_GIT:-true}")"
+CHROMIUM_ENABLED="$(_bool_enabled "${IMAGE_CHROMIUM:-true}")"
+if (( APT_PKGS_ENABLED == 0 || RECENT_GIT_ENABLED == 0 || CHROMIUM_ENABLED == 0 )); then
+    echo "image build steps: apt-packages=${APT_PKGS_ENABLED} recent-git=${RECENT_GIT_ENABLED} chromium=${CHROMIUM_ENABLED}"
+fi
+[[ "${FEATURE_REGISTRY}" != "ghcr.io" ]] && echo "feature registry:  ${FEATURE_REGISTRY}"
+
+# Package-manager family of the base image ("debian" | "rocky"). Everything
+# distro-specific in the generated files sits in __DEB_BLOCK_*__ / __RPM_BLOCK_*__
+# markers; exactly one of the two survives the substitution pass.
+#
+# Why Rocky needs its own path at all: the devcontainer FEATURES (java, node,
+# git, docker-in-docker) are Debian/Ubuntu-only -- their install.sh calls
+# apt-get and aborts on a RHEL-family base. So on Rocky the generated
+# devcontainer.json declares no features and the Dockerfile installs the same
+# toolchain from dnf / upstream tarballs instead.
+IS_ROCKY=0
+[[ "${DISTRO:-debian}" == "rocky" ]] && IS_ROCKY=1
+DEBIAN_ENABLED=$(( 1 - IS_ROCKY ))
+
+# Where the JDK ends up, which the generated files hard-code in a dozen places
+# (containerEnv, remoteEnv, profile.d, bashrc, post-create's probe).
+#   Debian: the MS base image's own JDK.
+#   Rocky : a stable symlink the Dockerfile creates next to the versioned
+#           java-<n>-openjdk directory dnf installs, so the value stays
+#           independent of the exact package release and the architecture.
+JAVA_HOME_PATH="/usr/lib/jvm/msopenjdk-current"
+# System-wide rc file for interactive non-login bashes: Debian reads
+# /etc/bash.bashrc, RHEL-family /etc/bashrc.
+SYSTEM_BASHRC="/etc/bash.bashrc"
+if (( IS_ROCKY )); then
+    JAVA_HOME_PATH="/usr/lib/jvm/devcontainer-java"
+    SYSTEM_BASHRC="/etc/bashrc"
+    echo "distro:           rocky (jdk ${JAVA_VERSION}, maven ${MAVEN_VERSION}, node ${NODE_FEATURE_VERSION}, no devcontainer features)"
 fi
 
 # Derive name-only list from REPOS (which is a "<name>:<base-ref>" map).
@@ -331,7 +542,7 @@ if (( ${#REPOS[@]} > 0 )); then
     done
 fi
 
-# Mono-repo mode: REPOS=() in .env.sh signals that the source workspace IS
+# Mono-repo mode: REPOS=() in devcontainers-config.json signals that the source workspace IS
 # the git repo (project directory == repo directory). We synthesise a single
 # virtual entry so all downstream loops work without special-casing each one.
 MONO_REPO=0
@@ -378,23 +589,12 @@ if (( MONO_REPO == 1 )) && (( ${#BUILD_ENTRIES[@]} == 0 )); then
     fi
 fi
 
-# Resolve the workspaces root directory in priority order:
-#   1. --workspaces-root CLI flag
-#   2. ${ENV_VAR_WORKSPACES_ROOT} env var (e.g. VANILLABP_WORKSPACES_ROOT)
-#   3. auto-detect via the script's own location: the script lives at
-#      <root>/<PROJECT_NAME>/dev-containers/spawn-workspace.sh, so two dirs
-#      up from SCRIPT_DIR is the root.
-DEFAULT_WORKSPACES_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-WORKSPACES_ROOT="${WORKSPACES_ROOT_CLI:-${!ENV_VAR_WORKSPACES_ROOT:-${DEFAULT_WORKSPACES_ROOT}}}"
-
-if [[ ! -d "${WORKSPACES_ROOT}" ]]; then
-    echo "Workspaces root does not exist: ${WORKSPACES_ROOT}" >&2
-    echo "Override with --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}." >&2
-    exit 1
-fi
-# Canonicalise to an absolute path so bind-mount paths in devcontainer.json
-# are never relative (Docker requires absolute paths in mount source/target).
-WORKSPACES_ROOT="$(cd "${WORKSPACES_ROOT}" && pwd)"
+# Resolve the workspaces root. Priority (see resolve_workspaces_root in
+# env-config.sh): --workspaces-root flag, ${ENV_VAR_WORKSPACES_ROOT} env var,
+# "workspacesRoot" in devcontainers-config.json, then auto-detect from the config location.
+# Deliberately derived from the config and NOT from the script, which may sit
+# anywhere on the PATH.
+WORKSPACES_ROOT="$(resolve_workspaces_root "${WORKSPACES_ROOT_CLI}")" || exit 1
 
 SOURCE_WS="${WORKSPACES_ROOT}/${PROJECT_NAME}"
 
@@ -407,9 +607,61 @@ WS_DIR="${WORKSPACES_ROOT}/${WS_NAME}"
 # it out of the way.
 if [[ -e "${WS_DIR}" ]]; then
     echo "Workspace already exists: ${WS_DIR}" >&2
-    echo "Dispose it first: dev-containers/dispose-workspace.sh ${BRANCH}" >&2
+    echo "Dispose it first: dispose-workspace.sh ${BRANCH}" >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Preflight: validate EVERY config-driven file asset before touching anything.
+#
+# All the generation below mutates the host (WS_DIR, worktrees, branches,
+# generated files) and only THEN starts the DevContainer image build. An asset
+# that resolves to a missing file -- a run-config XML, a CA certificate, the
+# README template -- must therefore be caught here, before the first mutation
+# and before the confirmation prompt. Otherwise a late failure leaves a
+# half-built workspace with orphaned branches behind (exactly the ".devcontainer
+# never created" symptom). Each source path is resolved once and reused by the
+# copy site far below, so there is a single source of truth per asset.
+#
+# Assets that degrade gracefully are deliberately NOT hard-checked here:
+# initialize.sh is optional (skipped when absent), a missing per-repo base ref
+# falls back to origin/HEAD, and a repo with no .git is skipped -- none of them
+# abort, so none can leave a half-built workspace.
+
+# Run-config XMLs (RUN_CONFIGS -> runConfigurations/).
+RUN_CONFIG_SRC_DIR="$(config_asset runConfigurations || echo "${CONFIG_DIR}/runConfigurations")"
+if (( ${#RUN_CONFIGS[@]} > 0 )); then
+    for rc_file in "${RUN_CONFIGS[@]}"; do
+        if [[ ! -f "${RUN_CONFIG_SRC_DIR}/${rc_file}" ]]; then
+            echo "Run-config source missing: ${RUN_CONFIG_SRC_DIR}/${rc_file}" >&2
+            echo "Check runConfigs in devcontainers-config.json." >&2
+            exit 1
+        fi
+    done
+fi
+
+# Corporate-proxy CA certificates (proxy.caCertificates). Copied into the build
+# context by the CA_ENABLED block far below; CA_ENABLED implies PROXY_CA_CERTS
+# is non-empty, so the expansion is safe.
+if (( CA_ENABLED == 1 )); then
+    for _ca in "${PROXY_CA_CERTS[@]}"; do
+        _ca_src="${_ca}"
+        [[ "${_ca_src}" != /* ]] && _ca_src="${CONFIG_DIR}/${_ca_src}"
+        if [[ ! -f "${_ca_src}" ]]; then
+            echo "CA certificate not found: ${_ca_src}" >&2
+            echo "Check \"proxy.caCertificates\" in ${CONFIG_JSON}." >&2
+            exit 1
+        fi
+    done
+fi
+
+# Welcome README template (README.md.tpl, project copy or the fallback next to
+# the scripts). README_TPL_SRC is reused by the copy site below.
+README_TPL_SRC="$(config_asset README.md.tpl)" || {
+    echo "README template not found: ${CONFIG_DIR}/README.md.tpl (nor next to the scripts)" >&2
+    exit 1
+}
+# ---------------------------------------------------------------------------
 
 # Confirmation prompt. Default is Yes (Enter accepts), so the prompt mostly
 # costs one keystroke per spawn. --yes / -y skips it for batch use.
@@ -433,7 +685,7 @@ fi
 # without colliding on the standard ports. Offset 0 means original ports.
 # OAuth callback / issuer URIs that hard-code a port get overridden via JVM
 # system properties in the run configs (built below).
-# HOST_PORTS comes from .env.sh.
+# HOST_PORTS comes from devcontainers-config.json.
 
 # Collect host ports already reserved by OTHER story workspaces' devcontainer.json
 # files. Even if their containers are stopped right now, starting them later
@@ -499,7 +751,7 @@ is_port_in_use() {
     fi
 }
 
-# Step size between candidate offsets comes from .env.sh (default 10000).
+# Step size between candidate offsets comes from devcontainers-config.json (default 10000).
 # Constrained to [500, 10000]: below 500 the offset ranges of two workspaces
 # could overlap by less than the HOST_PORTS spread AND leave too little room
 # between adjacent ports; above 10000 offers no benefit and quickly runs host
@@ -540,8 +792,8 @@ fi
 echo "port offset: ${PORT_OFFSET}"
 
 # Build everything that depends on the per-port host numbers from HOST_PORTS
-# (which lives in .env.sh) so adding a new forwarded port only takes editing
-# the .env.sh entry, never this file. Four derived artifacts:
+# (which lives in devcontainers-config.json) so adding a new forwarded port only takes editing
+# the devcontainers-config.json entry, never this file. Four derived artifacts:
 #   PORT_SED_ARGS    -e args list for substitute_placeholders: replaces every
 #                    __PORT_<container>__ token with the offset host port
 #   PORT_RUNARGS     JSON snippet injected into devcontainer.json runArgs as
@@ -586,7 +838,7 @@ PORT_OUTPUT_LINES="${PORT_OUTPUT_LINES%$'\n'}"
 # SSH_HOST_PORT: host-side port for the container's sshd (port 2222 + offset).
 # FIRST_REPO: first repo name, used as an example in the tab-completion docs.
 SSH_HOST_PORT=$((2222 + PORT_OFFSET))
-_repos_1="${REPOS[1]:-}"
+_repos_1="${REPOS[0]:-}"
 FIRST_REPO="${_repos_1%%:*}"
 FIRST_REPO="${FIRST_REPO:-some-repo}"
 
@@ -609,6 +861,43 @@ if [[ ${#FORWARDED_ENV_VARS[@]} -gt 0 ]]; then
 fi
 
 mkdir -p "${WS_DIR}"
+
+# Splice a (possibly multi-line) value into every occurrence of a placeholder
+# token in a file.
+#
+# Why not "${text/__TOKEN__/${value}}": bash 5.2 changed the pattern-substitution
+# replacement so that an unescaped '&' stands for the matched text. Any value
+# containing '&&' (every generated build command does) would therefore inject the
+# placeholder back into the output -- the script still works on macOS's bash 3.2
+# but produces a syntactically broken post-create.sh on modern Linux bash.
+# Why not sed: the values contain '/', '&', '\(' and newlines, all of which
+# would need escaping. awk reading the value from a FILE processes no escape
+# sequences at all, and index()/substr() do a literal replacement, so the value
+# is copied through byte for byte.
+splice_placeholder() {
+    local file="$1" token="$2" value="$3"
+    local vf tmp
+    vf="$(mktemp)"
+    tmp="$(mktemp)"
+    printf '%s' "${value}" > "${vf}"
+    awk -v tok="${token}" -v vf="${vf}" '
+        BEGIN {
+            val = ""; first = 1
+            while ((getline line < vf) > 0) {
+                val = first ? line : val "\n" line
+                first = 0
+            }
+        }
+        {
+            while ((i = index($0, tok)) > 0) {
+                $0 = substr($0, 1, i - 1) val substr($0, i + length(tok))
+            }
+            print
+        }
+    ' "${file}" > "${tmp}"
+    mv "${tmp}" "${file}"
+    rm -f "${vf}"
+}
 
 # Resolve a base ref against the *current* repo: prefer origin/<ref>, fall back to <ref>.
 resolve_base() {
@@ -719,7 +1008,7 @@ create_worktree() {
     popd >/dev/null
 }
 
-# Host-mount repos: a REPOS entry with an EMPTY value (e.g. "hal-npm-packages:")
+# Host-mount repos: a REPOS entry with an EMPTY value (e.g. "backlog.md:")
 # is not a git repo -- no worktree is created. Instead the host directory
 # ${SOURCE_WS}/<repo> is bind-mounted straight into the workspace at the same
 # path a worktree would occupy (mount JSON built below, injected into
@@ -890,10 +1179,9 @@ JSON
 # customise the welcome text without touching this script.
 # __PORT_TABLE_ROWS__ is multi-line so it is spliced in via bash first;
 # substitute_placeholders (sed) handles the remaining __*__ tokens.
-cp "${SCRIPT_DIR}/README.md.tpl" "${WS_DIR}/README.md"
-_readme_content=$(<"${WS_DIR}/README.md")
-_readme_content="${_readme_content/__PORT_TABLE_ROWS__/${PORT_TABLE_ROWS}}"
-printf '%s\n' "${_readme_content}" > "${WS_DIR}/README.md"
+# README_TPL_SRC was resolved and validated up-front (preflight), so just copy.
+cp "${README_TPL_SRC}" "${WS_DIR}/README.md"
+splice_placeholder "${WS_DIR}/README.md" "__PORT_TABLE_ROWS__" "${PORT_TABLE_ROWS}"
 
 # Pre-seed IntelliJ workspace state:
 #   - TerminalProjectOptionsProvider pins the Terminal's start directory to
@@ -1044,7 +1332,7 @@ mkdir -p "${WS_DIR}/.idea/runConfigurations"
 # Copy each run-config XML from dev-containers/runConfigurations/ into the
 # new workspace's .idea/runConfigurations/ directory. The substitute-
 # placeholders pass below fills in port numbers etc. Filenames are listed
-# in RUN_CONFIGS (.env.sh); add/remove/reorder entries there to change
+# in RUN_CONFIGS (devcontainers-config.json); add/remove/reorder entries there to change
 # which run configs the new workspace gets.
 #
 # Conventions in the XML files (so they all behave consistently inside the
@@ -1059,17 +1347,12 @@ mkdir -p "${WS_DIR}/.idea/runConfigurations"
 #   - __PORT_NNNN__ placeholders: substituted to the port-offsetted host port
 #     so OAuth callback / cockpit URIs resolve correctly when several stories
 #     run in parallel.
-RUN_CONFIG_SRC_DIR="${SCRIPT_DIR}/runConfigurations"
+# RUN_CONFIG_SRC_DIR and the existence of every entry were already resolved and
+# validated up-front (before any mutation), so here we only copy.
 # Length-guard: bash 3.2 + set -u fail on empty array expansion.
 if (( ${#RUN_CONFIGS[@]} > 0 )); then
 for rc_file in "${RUN_CONFIGS[@]}"; do
-    src="${RUN_CONFIG_SRC_DIR}/${rc_file}"
-    if [[ ! -f "${src}" ]]; then
-        echo "Run-config source missing: ${src}" >&2
-        echo "Check RUN_CONFIGS in .env.sh." >&2
-        exit 1
-    fi
-    cp "${src}" "${WS_DIR}/.idea/runConfigurations/${rc_file}"
+    cp "${RUN_CONFIG_SRC_DIR}/${rc_file}" "${WS_DIR}/.idea/runConfigurations/${rc_file}"
 done
 fi
 
@@ -1077,6 +1360,10 @@ fi
 # All story containers use ${WORKSPACE_PATH}, encoded by Claude Code as ${MEMORY_KEY}.
 SHARED_MEMORY_DIR="${HOME}/.claude/projects/${MEMORY_KEY}/memory"
 mkdir -p "${SHARED_MEMORY_DIR}"
+
+# Same idea for the GitHub Copilot CLI's ~/.copilot -- only skills/instructions/
+# prompts get shared (see the mounts block below for the full rationale).
+mkdir -p "${HOME}/.copilot/skills" "${HOME}/.copilot/instructions" "${HOME}/.copilot/prompts"
 
 # Resolve the host's glab config directory. glab is written in Go and uses
 # os.UserConfigDir(), which returns DIFFERENT paths per OS:
@@ -1104,7 +1391,7 @@ if [[ ${GLAB_ENABLED} -eq 1 ]]; then
     fi
     echo "glab config source: ${GLAB_CONFIG_SRC}"
 else
-    echo "glab integration: disabled (GLAB_HOSTNAME and/or GLAB_VERSION empty in .env.sh)"
+    echo "glab integration: disabled (GLAB_HOSTNAME and/or GLAB_VERSION empty in devcontainers-config.json)"
 fi
 
 # Resolve the host's gh (GitHub CLI) config directory. Unlike glab, gh uses
@@ -1126,7 +1413,7 @@ if [[ ${GH_ENABLED} -eq 1 ]]; then
     fi
     echo "gh config source: ${GH_CONFIG_SRC}"
 else
-    echo "gh integration: disabled (GH_VERSION empty in .env.sh)"
+    echo "gh integration: disabled (GH_VERSION empty in devcontainers-config.json)"
 fi
 
 # SSH-agent forwarding so SSH-key-based remotes (git@<host>:...) don't prompt
@@ -1172,6 +1459,91 @@ echo "host timezone:    ${HOST_TZ}"
 
 # .devcontainer
 mkdir -p "${WS_DIR}/.devcontainer"
+
+# Corporate proxy: copy the CA certificates into the build context so the
+# Dockerfile can COPY them (a build context cannot reach outside its directory).
+# Paths in devcontainers-config.json are relative to the config's own directory.
+#
+# Why the certificates are needed at all: a TLS-intercepting proxy re-signs every
+# HTTPS response with its own CA. Without that CA in the trust store, curl, apt,
+# npm, git and Maven all fail with "self-signed certificate in certificate
+# chain". Three separate trust stores have to be fed, which the Dockerfile does:
+# the OS bundle (curl/apt/git), the JVM truststore (Maven does NOT use the OS
+# bundle) and Node (via NODE_EXTRA_CA_CERTS).
+# Existence of every declared certificate was already validated up-front
+# (before any mutation), so here we only resolve the path and copy.
+if (( CA_ENABLED == 1 )); then
+    mkdir -p "${WS_DIR}/.devcontainer/certs"
+    for _ca in "${PROXY_CA_CERTS[@]}"; do
+        _ca_src="${_ca}"
+        [[ "${_ca_src}" != /* ]] && _ca_src="${CONFIG_DIR}/${_ca_src}"
+        cp "${_ca_src}" "${WS_DIR}/.devcontainer/certs/$(basename "${_ca_src}")"
+        echo "ca certificate: $(basename "${_ca_src}")"
+    done
+fi
+
+# Rocky only: yum repo files pointing at the internal repos.ads.dmz mirror
+# instead of dl.rockylinux.org / download.docker.com. Both are on the open
+# internet, and this network's web gateway answers every compressed download
+# from there with "403 MediaTypeBlocked" -- verified to be a blanket policy
+# (the same 403 hits Debian's and npm's compressed downloads too), not
+# something specific to Rocky's mirrors. repos.ads.dmz is in NO_PROXY and
+# reachable directly, so the Dockerfile drops the stock repo files and COPYs
+# these instead. No secrets in here -- it is an internal, unauthenticated
+# mirror -- so unlike certs/ above there is nothing to read from devcontainers-config.json;
+# the content is simply the file the network admin handed us.
+if (( IS_ROCKY == 1 )); then
+    mkdir -p "${WS_DIR}/.devcontainer/rocky-repos"
+    cat > "${WS_DIR}/.devcontainer/rocky-repos/rocky-9.repo" <<'ROCKYREPO'
+[rocky-9-appstream]
+name=rocky-9-appstream Repository
+baseurl=https://repos.ads.dmz/rocky/9/x86_64/appstream/rocky-9-appstream
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[rocky-9-baseos]
+name=rocky-9-baseos Repository
+baseurl=https://repos.ads.dmz/rocky/9/x86_64/baseos/rocky-9-baseos
+enabled=1
+gpgcheck=0
+sslverify=0
+
+[rocky-9-devel]
+name=rocky-9-devel Repository
+baseurl=https://repos.ads.dmz/rocky/9/x86_64/devel/rocky-9-devel
+enabled=1
+gpgcheck=0
+sslverify=0
+ROCKYREPO
+    cat > "${WS_DIR}/.devcontainer/rocky-repos/docker-ce-9.repo" <<'DOCKERREPO'
+[docker-ce-9-stable]
+name=docker-ce-9-stable Repository
+baseurl=https://repos.ads.dmz/docker-ce-9/docker-ce-9-stable
+enabled=1
+gpgcheck=0
+sslverify=0
+DOCKERREPO
+    echo "rocky repos:      baseos/appstream/devel/docker-ce via repos.ads.dmz (internal mirror)"
+fi
+
+# Proxy JSON fragments for devcontainer.json. Both build args (used while the
+# image is built) and containerEnv (used by post-create's npm/Maven runs and by
+# anything the developer runs later) are emitted, in upper- and lowercase
+# spelling because tools disagree about which they read.
+PROXY_BUILD_ARGS=""
+PROXY_CONTAINER_ENV=""
+if (( PROXY_ENABLED == 1 )); then
+    _p_http="${PROXY_HTTP:-${PROXY_HTTPS}}"
+    _p_https="${PROXY_HTTPS:-${PROXY_HTTP}}"
+    PROXY_BUILD_ARGS="\"HTTP_PROXY\": \"${_p_http}\", \"HTTPS_PROXY\": \"${_p_https}\", \"http_proxy\": \"${_p_http}\", \"https_proxy\": \"${_p_https}\""
+    PROXY_CONTAINER_ENV=", \"HTTP_PROXY\": \"${_p_http}\", \"HTTPS_PROXY\": \"${_p_https}\", \"http_proxy\": \"${_p_http}\", \"https_proxy\": \"${_p_https}\""
+    if [[ -n "${PROXY_NO}" ]]; then
+        PROXY_BUILD_ARGS="${PROXY_BUILD_ARGS}, \"NO_PROXY\": \"${PROXY_NO}\", \"no_proxy\": \"${PROXY_NO}\""
+        PROXY_CONTAINER_ENV="${PROXY_CONTAINER_ENV}, \"NO_PROXY\": \"${PROXY_NO}\", \"no_proxy\": \"${PROXY_NO}\""
+    fi
+    echo "proxy:            ${_p_https} (no_proxy: ${PROXY_NO:-<none>})"
+fi
 
 # Resolve the host's ~/.npmrc into the workspace so post-create.sh can copy it
 # into /home/vscode/.npmrc inside the container. We tried bind-mounting the host
@@ -1228,9 +1600,252 @@ fi
 # glab config directory is bind-mounted below; spawn-workspace.sh resolves the
 # right host path (macOS: ~/Library/Application Support/glab-cli, Linux:
 # ~/.config/glab-cli) so login state is shared bidirectionally.
+#
+# The template covers BOTH supported distro families. Everything that differs
+# sits in __DEB_BLOCK_*__ / __RPM_BLOCK_*__ markers, and substitute_placeholders
+# keeps exactly one side depending on "distro" in devcontainers-config.json. On the rocky side
+# the Dockerfile additionally has to do the whole job of the devcontainer
+# features (user, JDK, Maven, Node, docker-ce), which are Debian/Ubuntu-only.
 cat > "${WS_DIR}/.devcontainer/Dockerfile" <<'DOCKERFILE'
 FROM __BASE_IMAGE__
 
+# __PROXY_BLOCK_START__
+# Corporate proxy. Declaring the well-known names as ARG makes BuildKit expose
+# them as environment variables to every RUN below, so apt/dnf/curl/npm pick
+# them up without any further wiring. They are deliberately NOT turned into ENV:
+# that would bake the (host-specific) proxy into the image. The running container
+# gets the same values via containerEnv in devcontainer.json.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+# __RPM_BLOCK_START__
+# dnf/librepo do honour the *_proxy environment variables, but only for the
+# spellings they know and not for the `dnf` invocations that some RPM scriptlets
+# run with a scrubbed environment. Writing the proxy into /etc/dnf/dnf.conf makes
+# it unconditional for every dnf call in this build.
+RUN set -eux; \
+    p="${https_proxy:-${HTTPS_PROXY:-}}"; \
+    if [ -n "$p" ]; then \
+        printf 'proxy=%s\n' "$p" >> /etc/dnf/dnf.conf; \
+        echo "dnf proxy: $p"; \
+    fi
+# __RPM_BLOCK_END__
+# __PROXY_BLOCK_END__
+
+# __CA_BLOCK_START__
+# Corporate TLS interception: the proxy re-signs every HTTPS response with its
+# own CA, so that CA has to be trusted or every download fails with
+# "self-signed certificate in certificate chain". THREE trust stores need it:
+#   1. the OS bundle          -- curl, apt/dnf, git, wget
+#   2. the JVM truststore     -- Maven/Gradle ignore the OS bundle entirely
+#   3. Node                   -- via NODE_EXTRA_CA_CERTS (set below)
+# __DEB_BLOCK_START__
+# The JVM loop is best-effort (|| true): the base image may ship a different
+# JDK layout, and a missing truststore must not fail the whole build.
+COPY certs/ /usr/local/share/ca-certificates/
+RUN set -eux; \
+    if command -v update-ca-certificates >/dev/null 2>&1; then \
+        update-ca-certificates; \
+    else \
+        cat /usr/local/share/ca-certificates/*.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi; \
+    for jh in /usr/lib/jvm/msopenjdk-current /opt/java/openjdk /usr/lib/jvm/default-jvm; do \
+        [ -x "$jh/bin/keytool" ] || continue; \
+        for c in /usr/local/share/ca-certificates/*.crt; do \
+            "$jh/bin/keytool" -importcert -noprompt -trustcacerts \
+                -alias "devcontainer-$(basename "$c" .crt)" \
+                -file "$c" \
+                -keystore "$jh/lib/security/cacerts" \
+                -storepass changeit >/dev/null 2>&1 || true; \
+        done; \
+    done
+# Node ships its own CA bundle and ignores the OS one; this makes npm work.
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+# __DEB_BLOCK_END__
+# __RPM_BLOCK_START__
+# RHEL-family: anchors + `update-ca-trust extract`. No keytool loop needed --
+# update-ca-trust also regenerates /etc/pki/ca-trust/extracted/java/cacerts, and
+# the RHEL OpenJDK packages symlink their lib/security/cacerts at exactly that
+# file. That is why this step runs BEFORE the JDK is installed further down and
+# still covers Maven: the JDK picks up the already-patched extracted store.
+COPY certs/ /etc/pki/ca-trust/source/anchors/
+RUN set -eux; \
+    update-ca-trust extract; \
+    ls -1 /etc/pki/ca-trust/source/anchors/
+# Node ships its own CA bundle and ignores the OS one; this makes npm work.
+ENV NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt
+# __RPM_BLOCK_END__
+# __CA_BLOCK_END__
+
+# __APT_HTTPS_BLOCK_START__
+# __DEB_BLOCK_START__
+# Switch the Debian package sources from http:// to https://. Many corporate
+# proxies forward CONNECT (HTTPS) but refuse plain-HTTP relaying, which makes
+# "apt-get update" fail while every HTTPS download works. Handles both the
+# classic sources.list and the deb822 *.sources layout of bookworm images.
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] || continue; \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g; s|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' "$f"; \
+    done
+# __DEB_BLOCK_END__
+# __RPM_BLOCK_START__
+# The stock Rocky repo files point at dl.rockylinux.org / download.docker.com,
+# and this network's web gateway answers every compressed download from the
+# open internet with "403 MediaTypeBlocked" (verified: same 403 for Debian's
+# and npm's compressed downloads too, so it is a blanket policy, not something
+# specific to Rocky's mirrors). The only way in is the internal, gateway-exempt
+# mirror at repos.ads.dmz (it is in NO_PROXY, see the ARGs above) -- so the
+# stock repo files are dropped entirely and replaced with the ones the network
+# admin provided, which point there instead.
+RUN rm -f /etc/yum.repos.d/*.repo
+COPY rocky-repos/*.repo /etc/yum.repos.d/
+RUN set -eux; \
+    grep -h '^baseurl=' /etc/yum.repos.d/*.repo | sort -u; \
+    dnf -y makecache
+# __RPM_BLOCK_END__
+# __APT_HTTPS_BLOCK_END__
+
+# __RPM_BLOCK_START__
+# ===========================================================================
+# Rocky Linux (RHEL family) base setup
+# ===========================================================================
+# Everything below replaces what the Debian path gets for free from the MS
+# devcontainer base image plus the devcontainer features. The features are not
+# an option here: devcontainers/features/{java,node,git,docker-in-docker} call
+# apt-get in their install.sh and abort on a dnf distro, so the generated
+# devcontainer.json declares none of them when distro=rocky.
+
+# --- base tooling ----------------------------------------------------------
+# Deliberately NOT part of the optional package block below: without sudo, git
+# and tar the lifecycle scripts and the IDE backend cannot work at all.
+# curl is provided by curl-minimal in the base image -- asking for "curl" here
+# would force an --allowerasing swap for no benefit.
+RUN set -eux; \
+    dnf -y install --setopt=install_weak_deps=False \
+        sudo shadow-utils passwd procps-ng iproute hostname \
+        tar gzip bzip2 xz zip unzip which findutils diffutils file less \
+        gawk sed grep \
+        git openssh-clients rsync ca-certificates; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# Rocky's 'which' package ships /etc/profile.d/which2.sh, which wraps the
+# 'which' binary in a shell FUNCTION and exports it (export -f) so aliases are
+# visible to it. Every non-bash process that inherits the environment (JetBrains
+# Gateway's backend launcher, /bin/sh, etc.) tries to parse that exported
+# function definition and fails with "syntax error: unexpected end of file" /
+# "error importing function definition for `which'" -- on EVERY shell start.
+# The wrapper only adds alias-awareness we don't need in a devcontainer; the
+# real /usr/bin/which binary (installed by the same package) still works fine
+# without it, so we just drop the profile script.
+RUN rm -f /etc/profile.d/which2.sh
+
+# --- the 'vscode' user -----------------------------------------------------
+# Same name/uid/gid the MS devcontainer images use, because devcontainer.json's
+# remoteUser, every bind-mount target under /home/vscode and the lifecycle
+# scripts hard-code it. secure_path is widened so `sudo <tool>` also finds
+# things installed under /usr/local.
+ARG USERNAME=vscode
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN set -eux; \
+    groupadd --gid ${USER_GID} ${USERNAME}; \
+    useradd --uid ${USER_UID} --gid ${USER_GID} --create-home --shell /bin/bash ${USERNAME}; \
+    printf '%s ALL=(ALL) NOPASSWD:ALL\nDefaults:%s secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n' \
+        "${USERNAME}" "${USERNAME}" > /etc/sudoers.d/${USERNAME}; \
+    chmod 0440 /etc/sudoers.d/${USERNAME}; \
+    visudo -c
+
+# --- JDK -------------------------------------------------------------------
+# dnf installs into a versioned directory whose name carries the exact package
+# release and the architecture. The generated files need ONE stable value for
+# JAVA_HOME, so we resolve javac and pin a symlink at that path.
+ARG JAVA_VERSION=__JAVA_VERSION__
+RUN set -eux; \
+    dnf -y install --setopt=install_weak_deps=False java-${JAVA_VERSION}-openjdk-devel; \
+    dnf clean all; \
+    jdk="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"; \
+    ln -sfn "$jdk" __JAVA_HOME__; \
+    __JAVA_HOME__/bin/javac -version
+ENV JAVA_HOME=__JAVA_HOME__
+
+# --- Maven -----------------------------------------------------------------
+# Preferred: the Apache binary tarball, pinned to the exact configured version
+# (the AppStream maven package drags in its own, older JDK and a fixed version
+# it does not let us choose). dlcdn/archive.apache.org are both on the open
+# internet though, so on networks where the gateway blocks that (see the RPM
+# repo swap above) both attempts fail fast and dnf's AppStream package is the
+# fallback -- an older, but working, Maven beats no Maven at all. That fallback
+# package pulls in java-17-openjdk as its own dependency, and dnf's alternatives
+# system then silently repoints the bare `java`/`javac` on PATH at 17 instead of
+# the JAVA_VERSION installed above -- so both get pinned back to __JAVA_HOME__
+# unconditionally, regardless of which Maven branch ran.
+ARG MAVEN_VERSION=__MAVEN_VERSION__
+RUN set -eux; \
+    if curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
+       || curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; \
+    then \
+        mkdir -p /opt/maven; \
+        tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1; \
+        rm -f /tmp/maven.tgz; \
+        ln -sfn /opt/maven/bin/mvn /usr/local/bin/mvn; \
+    else \
+        echo "note: apache.org unreachable -- falling back to the AppStream maven package (older, fixed version)" >&2; \
+        dnf -y install --setopt=install_weak_deps=False maven; \
+        dnf clean all; \
+        rm -rf /var/cache/dnf; \
+    fi; \
+    ln -sfn __JAVA_HOME__/bin/java /usr/bin/java; \
+    ln -sfn __JAVA_HOME__/bin/javac /usr/bin/javac; \
+    java -version; \
+    mvn -v
+
+# --- Node ------------------------------------------------------------------
+# NodeSource carries the current major versions for RHEL 9; the AppStream module
+# stream is the fallback for networks that cannot reach rpm.nodesource.com (it
+# tops out at nodejs:22, so a newer nodeFeatureVersion silently lands on the
+# newest stream available).
+# The global prefix is moved to /usr/local and handed to the vscode user, so
+# `npm install -g` in post-create.sh works without sudo -- exactly like it does
+# on the Debian path where the node feature owns its nvm directory.
+ARG NODE_MAJOR=__NODE_FEATURE_VERSION__
+RUN set -eux; \
+    ( curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/nodesource.sh \
+      && bash /tmp/nodesource.sh \
+      && dnf -y install nodejs ) \
+    || ( echo "note: NodeSource unavailable -- falling back to the AppStream module" >&2; \
+         dnf -y module reset nodejs; \
+         dnf -y module enable "nodejs:${NODE_MAJOR}" || dnf -y module enable nodejs:22; \
+         dnf -y install nodejs npm ); \
+    rm -f /tmp/nodesource.sh; \
+    dnf clean all; \
+    npm config set prefix /usr/local --global; \
+    mkdir -p /usr/local/lib/node_modules; \
+    chown -R ${USER_UID}:${USER_GID} /usr/local/lib/node_modules /usr/local/bin /usr/local/share; \
+    node --version; npm --version
+
+# --- Docker (docker-in-docker) ---------------------------------------------
+# Stands in for the docker-in-docker feature: docker-ce from the internal
+# mirror's docker-ce-9 repo (already dropped into /etc/yum.repos.d/ by the RPM
+# repo swap above -- download.docker.com itself is unreachable, same story as
+# dl.rockylinux.org). The daemon is started by post-start.sh (JetBrains Gateway
+# overrides the entrypoint, so an entrypoint-based start would never run),
+# /var/lib/docker is a named volume declared in devcontainer.json, and the
+# container is launched with --privileged via runArgs.
+RUN set -eux; \
+    dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf; \
+    usermod -aG docker ${USERNAME}; \
+    mkdir -p /var/lib/docker; \
+    dockerd --version
+# __RPM_BLOCK_END__
+
+# __APT_PKGS_BLOCK_START__
 # socat       -- post-start.sh exposes the docker socket on TCP 127.0.0.1:2375
 #                so tools that prefer DOCKER_HOST=tcp://... have a backup endpoint.
 # jq          -- the shared Claude Code statusline (~/.claude/statusline.sh, bind-
@@ -1244,12 +1859,34 @@ FROM __BASE_IMAGE__
 #                An SSH-tunnel data source sidesteps that: the JDBC driver runs on the
 #                host, the TCP hop is tunnelled into the container where 127.0.0.1
 #                resolves to the DB. post-start.sh configures + starts sshd.
+# dbus/gnome-keyring/libsecret -- give CLI tools that use a Secret Service backend
+#                for credential storage (observed: the GitHub Copilot CLI's login,
+#                which otherwise has NO secure place to persist a token in a minimal
+#                container and would either fail or fall back to writing it in
+#                plaintext) something real to talk to. post-start.sh starts a
+#                per-container session bus + auto-unlocked keyring at a fixed
+#                address (see DBUS_SESSION_BUS_ADDRESS in containerEnv below).
+# __DEB_BLOCK_START__
 RUN rm -f /etc/apt/sources.list.d/yarn.list /etc/apt/keyrings/yarn.gpg \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
         socat ca-certificates curl jq openssh-server \
+        dbus gnome-keyring libsecret-tools \
  && rm -rf /var/lib/apt/lists/*
+# __DEB_BLOCK_END__
+# __RPM_BLOCK_START__
+RUN set -eux; \
+    dnf -y install --setopt=install_weak_deps=False \
+        socat jq openssh-server \
+        dbus-daemon dbus-tools gnome-keyring libsecret; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+# __RPM_BLOCK_END__
+# __APT_PKGS_BLOCK_END__
 
+
+# __RECENT_GIT_BLOCK_START__
+# __DEB_BLOCK_START__
 # Newer git than the base image ships. The MS devcontainer base images
 # typically carry git 2.39 (Debian bookworm) which predates the credential
 # helper "authtype" capability (added in 2.46). Without authtype support,
@@ -1280,7 +1917,27 @@ RUN set -eux; \
     fi; \
     git --version; \
     rm -rf /var/lib/apt/lists/*
+# __DEB_BLOCK_END__
+# __RPM_BLOCK_START__
+# git and the credential helper: Rocky has no backports-style channel --
+# AppStream ships a single git (2.43 on Rocky 9) and no supported repository
+# offers a newer one. So this step only makes sure git is current within the
+# enabled repos and warns when the result is older than the 2.46 the glab
+# credential helper needs. Everything else works fine with 2.43; build a newer
+# git from source here if you do need glab over HTTPS.
+RUN set -eux; \
+    dnf -y upgrade git; \
+    dnf clean all; \
+    git --version; \
+    v="$(git --version | awk '{print $3}')"; \
+    major="${v%%.*}"; rest="${v#*.}"; minor="${rest%%.*}"; \
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 46 ]; }; then \
+        echo "note: git ${v} < 2.46 -- the glab credential helper will fall back to a password prompt" >&2; \
+    fi
+# __RPM_BLOCK_END__
+# __RECENT_GIT_BLOCK_END__
 
+# __CHROMIUM_BLOCK_START__
 # Chromium for the 'bpmn-to-image' CLI (installed via npm in post-create.sh).
 # bpmn-to-image drives a headless Chrome through Puppeteer to render BPMN
 # diagrams to PNG/SVG/PDF. Puppeteer's own bundled Chrome-for-Testing has NO
@@ -1298,6 +1955,7 @@ RUN set -eux; \
 #     bpmn-to-image needs no patch because it honours a plain launch().
 # These are Dockerfile ENV (not containerEnv/remoteEnv) so they also apply
 # during the post-create npm install, where the download must be skipped.
+# __DEB_BLOCK_START__
 # The 'chromium' package name is Debian's; the MS Java base is Debian bookworm.
 RUN set -eux; \
     . /etc/os-release; \
@@ -1309,20 +1967,41 @@ RUN set -eux; \
         echo "note: expected Debian base for 'chromium' package; got $ID -- adapt Dockerfile if bpmn-to-image is needed" >&2; \
     fi; \
     chromium --version || true
+# __DEB_BLOCK_END__
+# __RPM_BLOCK_START__
+# RHEL 9 has no Chromium in BaseOS/AppStream -- it lives in EPEL, and the binary
+# is called chromium-browser there. The symlink keeps PUPPETEER_EXECUTABLE_PATH
+# identical across both distros.
+# The epel-release package writes its own repo file pointing at the public EPEL
+# mirrorlist -- open internet again, same 403 story as the other RPM repos (see
+# the RPM repo swap earlier in this file). It gets overwritten to point at the
+# internal mirror the same way.
+RUN set -eux; \
+    dnf -y install epel-release; \
+    rm -f /etc/yum.repos.d/epel*.repo; \
+    printf '[epel]\nname=epel Repository\nbaseurl=https://repos.ads.dmz/epel/9/x86_64\nenabled=1\ngpgcheck=0\nsslverify=0\n' > /etc/yum.repos.d/epel.repo; \
+    dnf -y install chromium; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf; \
+    if [ ! -e /usr/bin/chromium ] && [ -e /usr/bin/chromium-browser ]; then \
+        ln -sfn /usr/bin/chromium-browser /usr/bin/chromium; \
+    fi; \
+    chromium --version || true
+# __RPM_BLOCK_END__
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# __CHROMIUM_BLOCK_END__
 
 # __GLAB_BLOCK_START__
-# glab (GitLab CLI). Pinned to a known-good version; bump GLAB_VERSION in .env.sh.
+# glab (GitLab CLI). Pinned to a known-good version; bump GLAB_VERSION in devcontainers-config.json.
 # Release URL pattern: gitlab.com/gitlab-org/cli/-/releases/v<v>/downloads/glab_<v>_linux_<arch>.tar.gz
 ARG GLAB_VERSION=__GLAB_VERSION__
 RUN set -eux; \
-    deb_arch="$(dpkg --print-architecture)"; \
-    case "$deb_arch" in \
-        amd64) glab_arch=x86_64 ;; \
-        arm64) glab_arch=arm64  ;; \
-        *) echo "unsupported arch: $deb_arch" >&2; exit 1 ;; \
+    case "$(uname -m)" in \
+        x86_64)        glab_arch=x86_64 ;; \
+        aarch64|arm64) glab_arch=arm64  ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${glab_arch}.tar.gz" \
         -o /tmp/glab.tgz; \
@@ -1333,16 +2012,15 @@ RUN set -eux; \
 # __GLAB_BLOCK_END__
 
 # __GH_BLOCK_START__
-# gh (GitHub CLI). Pinned to a known-good version; bump GH_VERSION in .env.sh.
+# gh (GitHub CLI). Pinned to a known-good version; bump GH_VERSION in devcontainers-config.json.
 # Release URL pattern: github.com/cli/cli/releases/download/v<v>/gh_<v>_linux_<arch>.tar.gz
 # The tarball extracts to gh_<v>_linux_<arch>/bin/gh.
 ARG GH_VERSION=__GH_VERSION__
 RUN set -eux; \
-    deb_arch="$(dpkg --print-architecture)"; \
-    case "$deb_arch" in \
-        amd64) gh_arch=amd64 ;; \
-        arm64) gh_arch=arm64 ;; \
-        *) echo "unsupported arch: $deb_arch" >&2; exit 1 ;; \
+    case "$(uname -m)" in \
+        x86_64)        gh_arch=amd64 ;; \
+        aarch64|arm64) gh_arch=arm64 ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
         -o /tmp/gh.tgz; \
@@ -1356,7 +2034,15 @@ DOCKERFILE
 cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
 {
     "name": "__PROJECT_NAME__-${localWorkspaceFolderBasename}",
-    "build": { "dockerfile": "Dockerfile" },
+    "build": {
+        "dockerfile": "Dockerfile"
+        // __PROXY_BLOCK_START__
+        ,
+        // Corporate proxy, handed to the image build. Without these the
+        // Dockerfile's apt/curl steps cannot reach the internet.
+        "args": { __PROXY_BUILD_ARGS__ }
+        // __PROXY_BLOCK_END__
+    },
 
     // runArgs feed straight to `docker run`. We use this rather than
     // forwardPorts/appPort for port mappings because:
@@ -1369,15 +2055,31 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
     //    Postman, ...) can reach without going through the IDE.
     "runArgs": [
         "--name", "__PROJECT_SHORT__-__LEAF__",
+        // __RPM_BLOCK_START__
+        // Debian gets these from the docker-in-docker feature's metadata
+        // ("privileged": true, "init": true). With distro=rocky there is no
+        // feature, so the flags are declared here: dockerd needs full
+        // capabilities, and --init reaps the processes it leaves behind.
+        "--privileged", "--init",
+        // __RPM_BLOCK_END__
         __PORT_RUNARGS__
     ],
 
+    // __DEB_BLOCK_START__
     "features": {
-        "ghcr.io/devcontainers/features/git:1": {},
-        "ghcr.io/devcontainers/features/java:1": { "version": "none", "installMaven": "true" },
-        "ghcr.io/devcontainers/features/node:1": { "version": "__NODE_FEATURE_VERSION__" },
-        "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false }
+        "__FEATURE_REGISTRY__/devcontainers/features/git:1": {},
+        "__FEATURE_REGISTRY__/devcontainers/features/java:1": { "version": "none", "installMaven": "true" },
+        "__FEATURE_REGISTRY__/devcontainers/features/node:1": { "version": "__NODE_FEATURE_VERSION__" },
+        "__FEATURE_REGISTRY__/devcontainers/features/docker-in-docker:2": { "moby": false }
     },
+    // __DEB_BLOCK_END__
+    // __RPM_BLOCK_START__
+    // No features on a RHEL-family base: devcontainers/features/{git,java,node,
+    // docker-in-docker} all shell out to apt-get in their install.sh and fail on
+    // dnf. The Dockerfile installs the same toolchain from dnf / upstream
+    // tarballs instead.
+    "features": {},
+    // __RPM_BLOCK_END__
 
     // Workspace mounts at the same path in every story container -> Claude Code's
     // path-encoded project key is identical, which is what makes the shared-memory
@@ -1420,6 +2122,13 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
 
         "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.m2,target=/home/vscode/.m2,type=bind",
+        // __RPM_BLOCK_START__
+        // Docker's own storage tree on a named volume, one per container -- the
+        // same thing the docker-in-docker feature declares on the Debian path.
+        // Without it dockerd would write its overlay2 layers into the container
+        // filesystem, which is slow and lost on every rebuild.
+        "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume",
+        // __RPM_BLOCK_END__
         // __GLAB_BLOCK_START__
         // glab CLI config (token for the configured GitLab host). Bind-mounted
         // rw so the login is shared between host and container -- 'glab auth
@@ -1447,7 +2156,21 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind",
         "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
         "source=__PROJECT_SHORT__-claude-project-${devcontainerId},target=/home/vscode/.claude/projects/__MEMORY_KEY__,type=volume",
-        "source=${localEnv:HOME}/.claude/projects/__MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind"
+        "source=${localEnv:HOME}/.claude/projects/__MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind",
+        // GitHub Copilot CLI equivalent of the ~/.claude sharing above. Only the
+        // "content" subfolders are bind-mounted (skills, custom instructions,
+        // saved prompts) -- NOT ~/.copilot/session-store.db or ~/.copilot/session-
+        // state, which are live SQLite/session files; bind-mounting those across
+        // the container boundary while the host CLI might be running concurrently
+        // risks "database is locked" errors or, on some Docker Desktop VM backends,
+        // outright corruption. Skills/instructions/prompts are just files an agent
+        // reads, so sharing them the same way Claude's skills/ folder is shared is
+        // safe and gives every devcontainer the same Copilot skills/instructions
+        // without reinstalling them per container. Auth still needs one 'copilot
+        // /login' per container (a few seconds), same tradeoff, safer failure mode.
+        "source=${localEnv:HOME}/.copilot/skills,target=/home/vscode/.copilot/skills,type=bind",
+        "source=${localEnv:HOME}/.copilot/instructions,target=/home/vscode/.copilot/instructions,type=bind",
+        "source=${localEnv:HOME}/.copilot/prompts,target=/home/vscode/.copilot/prompts,type=bind"
         // host-mounted repos: REPOS entries with an empty base-ref are plain
         // host directories (not git worktrees), bind-mounted straight in at
         // their workspace path. Generated by spawn-workspace.sh from REPOS.
@@ -1463,7 +2186,7 @@ __NPM_NM_VOLUME_MOUNTS__
     "remoteUser": "vscode",
 
     "containerEnv": {
-        "JAVA_HOME": "/usr/lib/jvm/msopenjdk-current",
+        "JAVA_HOME": "__JAVA_HOME__",
         "MAVEN_OPTS": "-Xmx2g",
         // C.UTF-8 silences "manpath: can't set the locale" and similar
         // warnings on every shell start. The MS base image doesn't ship
@@ -1489,7 +2212,25 @@ __NPM_NM_VOLUME_MOUNTS__
         // Host IANA timezone (detected at spawn time). Java reads TZ first
         // in TimeZone.getDefault(), so Spring Boot logs land in local time
         // instead of the UTC default of the devcontainer base image.
-        "TZ": "__HOST_TZ__"
+        "TZ": "__HOST_TZ__",
+        // Fixed (not auto-negotiated) D-Bus session + keyring address so every
+        // process -- login shells, IDE-spawned non-login shells, exec sessions --
+        // finds the same Secret Service without needing to source a profile
+        // script first. post-start.sh starts the daemon + auto-unlocks the
+        // keyring at exactly this address (see Step 7 there). Without this, CLI
+        // tools that rely on a Secret Service backend for credential storage
+        // (observed: GitHub Copilot CLI's login) find none in this minimal
+        // container and either error out or fall back to storing the token in
+        // plaintext.
+        // Names of env vars on the host that get forwarded into the container.
+        // Baked into BOTH remoteEnv (below) and containerEnv (see
+        // __CONTAINER_ENV_FORWARDED__ above the closing brace) so any
+        // '${TOKEN}'-style placeholder in ~/.npmrc / ~/.m2/settings.xml OR in a
+        // project-local .npmrc (e.g. checked-in webapp/.npmrc referencing
+        // '${NEXUS_TOKEN_BASE64}') resolves inside the container regardless of
+        // how the process that runs npm/mvn was launched.
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"__CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
     },
 
     // remoteEnv has higher precedence than containerEnv (and any feature's
@@ -1499,7 +2240,7 @@ __NPM_NM_VOLUME_MOUNTS__
     // - JAVA_HOME: restated here because the java:1 feature (needed only for
     //   Maven via SDKMAN) can leave its own JAVA_HOME pointing at an empty
     //   SDKMAN candidate directory when version=none.
-    // - FORWARDED_ENV_VARS from .env.sh: forwarded from host so that any
+    // - FORWARDED_ENV_VARS from devcontainers-config.json: forwarded from host so that any
     //   '${TOKEN}'-style placeholder in the user's ~/.npmrc / ~/.m2/settings.xml
     //   resolves inside the container. Otherwise npm install of private
     //   packages and Maven resolution from private repos fail with 401.
@@ -1507,13 +2248,13 @@ __NPM_NM_VOLUME_MOUNTS__
     //   workspace.sh). If empty, run with .envrc loaded ('direnv allow' in
     //   the source workspace, then start IntelliJ from that shell).
     "remoteEnv": {
-        "JAVA_HOME": "/usr/lib/jvm/msopenjdk-current"__REMOTE_ENV_FORWARDED__
+        "JAVA_HOME": "__JAVA_HOME__"__REMOTE_ENV_FORWARDED__
     },
 
     // Port labels for the JetBrains Services view. Keys are the container-side
     // port numbers; the host-side port comes from runArgs -p above. Suppress
     // the auto-forward notification that pops up every time a service starts.
-    // Labels come from PORT_LABELS in .env.sh.
+    // Labels come from PORT_LABELS in devcontainers-config.json.
     "portsAttributes": {
         __PORTS_ATTRS__
     },
@@ -1576,7 +2317,7 @@ __NPM_NM_VOLUME_MOUNTS__
 }
 JSON
 
-# Build dynamic JSON fragments from .env.sh arrays. These are injected via the
+# Build dynamic JSON fragments from devcontainers-config.json arrays. These are injected via the
 # same sed-substitution pass below; we keep them as single-line strings so
 # we don't have to wrestle with multi-line sed replacements on macOS.
 
@@ -1587,6 +2328,22 @@ REMOTE_ENV_FORWARDED=""
 if [[ ${#FORWARDED_ENV_VARS[@]} -gt 0 ]]; then
     for var in "${FORWARDED_ENV_VARS[@]}"; do
         REMOTE_ENV_FORWARDED="${REMOTE_ENV_FORWARDED}, \"${var}\": \"\${localEnv:${var}}\""
+    done
+fi
+
+# Same vars, ALSO baked into containerEnv (not just remoteEnv). remoteEnv is
+# resolved per remote-launched process and, per the DOCKER_API_VERSION comment
+# in the devcontainer.json template, some IntelliJ launch paths (run configs,
+# background tasks) bypass it entirely. containerEnv is set once at
+# container-create time and reaches every process unconditionally, so
+# private-registry tokens referenced by in-repo '${TOKEN}'-style
+# .npmrc/settings.xml files (not just the HOME ~/.npmrc that spawn-workspace
+# resolves itself) still work when npm/Maven is invoked from a context
+# remoteEnv doesn't cover.
+CONTAINER_ENV_FORWARDED=""
+if [[ ${#FORWARDED_ENV_VARS[@]} -gt 0 ]]; then
+    for var in "${FORWARDED_ENV_VARS[@]}"; do
+        CONTAINER_ENV_FORWARDED="${CONTAINER_ENV_FORWARDED}, \"${var}\": \"\${localEnv:${var}}\""
     done
 fi
 
@@ -1625,6 +2382,7 @@ substitute_placeholders() {
         -e "s/__GLAB_HOSTNAME__/${GLAB_HOSTNAME:-}/g" \
         -e "s/__GH_VERSION__/${GH_VERSION:-}/g" \
         -e "s|__REMOTE_ENV_FORWARDED__|${REMOTE_ENV_FORWARDED}|g" \
+        -e "s|__CONTAINER_ENV_FORWARDED__|${CONTAINER_ENV_FORWARDED}|g" \
         -e "s|__PORTS_ATTRS__|${PORTS_ATTRS}|g" \
         -e "s|__GLAB_CONFIG_SRC__|${GLAB_CONFIG_SRC}|g" \
         -e "s|__GH_CONFIG_SRC__|${GH_CONFIG_SRC}|g" \
@@ -1633,6 +2391,15 @@ substitute_placeholders() {
         -e "s/__PORT_OFFSET__/${PORT_OFFSET}/g" \
         -e "s/__SSH_HOST_PORT__/${SSH_HOST_PORT}/g" \
         -e "s/__FIRST_REPO__/${FIRST_REPO}/g" \
+        -e "s|__SPAWN_CMD__|spawn-workspace.sh|g" \
+        -e "s|__DISPOSE_CMD__|${DISPOSE_CMD}|g" \
+        -e "s|__PROXY_BUILD_ARGS__|${PROXY_BUILD_ARGS}|g" \
+        -e "s|__PROXY_CONTAINER_ENV__|${PROXY_CONTAINER_ENV}|g" \
+        -e "s|__FEATURE_REGISTRY__|${FEATURE_REGISTRY}|g" \
+        -e "s|__JAVA_HOME__|${JAVA_HOME_PATH}|g" \
+        -e "s|__SYSTEM_BASHRC__|${SYSTEM_BASHRC}|g" \
+        -e "s/__JAVA_VERSION__/${JAVA_VERSION}/g" \
+        -e "s/__MAVEN_VERSION__/${MAVEN_VERSION}/g" \
         "${file}"
     rm "${file}.bak"
 
@@ -1665,6 +2432,32 @@ substitute_placeholders() {
             "${file}"
     fi
     rm "${file}.bak"
+
+    # ... and for the three corporate-proxy blocks. Each is independent: a
+    # project may need only the CA certificates (proxy configured globally in
+    # Docker Desktop), only the proxy URLs, or all three.
+    strip_block() {
+        local marker="$1" enabled="$2"
+        if [[ ${enabled} -eq 1 ]]; then
+            sed -i.bak -e "/__${marker}_BLOCK_START__/d" -e "/__${marker}_BLOCK_END__/d" "${file}"
+        else
+            sed -i.bak -e "/__${marker}_BLOCK_START__/,/__${marker}_BLOCK_END__/d" "${file}"
+        fi
+        rm "${file}.bak"
+    }
+    strip_block PROXY "${PROXY_ENABLED}"
+    strip_block CA "${CA_ENABLED}"
+    strip_block APT_HTTPS "${PROXY_DEBIAN_HTTPS_ENABLED}"
+    strip_block APT_PKGS "${APT_PKGS_ENABLED}"
+    strip_block RECENT_GIT "${RECENT_GIT_ENABLED}"
+    strip_block CHROMIUM "${CHROMIUM_ENABLED}"
+
+    # Distro split LAST. The DEB/RPM markers are NESTED inside several of the
+    # blocks above (PROXY, CA, APT_HTTPS, APT_PKGS, RECENT_GIT, CHROMIUM), and
+    # sed's range delete stops at the first END marker it sees -- so the outer
+    # pairs have to be resolved before these.
+    strip_block DEB "${DEBIAN_ENABLED}"
+    strip_block RPM "${IS_ROCKY}"
 }
 substitute_placeholders "${WS_DIR}/.devcontainer/devcontainer.json"
 for rc in "${WS_DIR}"/.idea/runConfigurations/*.xml; do
@@ -1733,6 +2526,7 @@ trap 'rc=$?; echo "" >&2; echo "ERROR: post-create.sh failed (exit ${rc})" >&2; 
 detect_java_home() {
     local candidate
     for candidate in \
+        __JAVA_HOME__ \
         /usr/lib/jvm/msopenjdk-current \
         /usr/local/sdkman/candidates/java/current \
         /opt/java/openjdk; do
@@ -1748,7 +2542,7 @@ if JH="$(detect_java_home)"; then
     export JAVA_HOME="${JH}"
     echo "JAVA_HOME=${JAVA_HOME}"
 else
-    echo "ERROR: no JDK found at known locations (/usr/lib/jvm/msopenjdk-current, SDKMAN, /opt/java/openjdk)" >&2
+    echo "ERROR: no JDK found at known locations (__JAVA_HOME__, /usr/lib/jvm/msopenjdk-current, SDKMAN, /opt/java/openjdk)" >&2
     exit 1
 fi
 
@@ -1768,18 +2562,58 @@ fi
 
 # install Claude Code globally — via login shell so npm/node from the Node feature
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
-bash -lc "npm install -g @anthropic-ai/claude-code"
+#
+# Non-fatal: this is an optional AI-assistant convenience tool, not something the
+# devcontainer itself depends on, so a registry hiccup here shouldn't block the
+# whole setup. The most common cause is the HOST's ~/.npmrc having no top-level
+# "registry=" line, so npm defaults to registry.npmjs.org, which a corporate
+# proxy commonly blocks outright (403 MediaTypeBlocked) -- point it at your
+# internal npm mirror/group repo instead (e.g. "registry=https://<nexus-host>/
+# repository/<npm-group-repo>/") in ~/.npmrc on the HOST; spawn-workspace re-reads
+# and copies it into every new workspace automatically.
+if ! bash -lc "npm install -g @anthropic-ai/claude-code"; then
+    echo "WARN: Claude Code install failed -- see the npm error above." >&2
+    echo "      If it says '403 MediaTypeBlocked' from registry.npmjs.org, add a" >&2
+    echo "      'registry=' line to ~/.npmrc on the HOST (pointing at your internal" >&2
+    echo "      npm mirror) and re-spawn the workspace." >&2
+fi
 
+# install the GitHub Copilot CLI globally, same rationale and same non-fatal
+# handling as Claude Code above. Unlike the JetBrains Copilot plugin (which
+# hardcodes a local proxy port and doesn't understand Gateway's remote-dev
+# workspace URIs), the CLI is a plain terminal process that reads HTTP_PROXY/
+# HTTPS_PROXY from the environment -- already wired into the container via
+# containerEnv, so no 8888 forward needed.
+if ! bash -lc "npm install -g @github/copilot"; then
+    echo "WARN: GitHub Copilot CLI install failed -- see the npm error above (same" >&2
+    echo "      registry= hint as the Claude Code warning applies here too)." >&2
+fi
+
+# __CHROMIUM_BLOCK_START__
 # install bpmn-to-image (https://github.com/bpmn-io/bpmn-to-image) globally.
 # Must run here, not in the Dockerfile, because node/npm come from the Node
 # devcontainer feature, which installs AFTER the image build. The Dockerfile's
 # PUPPETEER_SKIP_DOWNLOAD=true ENV is in effect here, so Puppeteer skips its
 # (x86-only, Rosetta-breaking) Chrome download and the CLI uses the system
 # chromium via PUPPETEER_EXECUTABLE_PATH at render time.
+#
+# Left fatal (unlike Claude Code/Copilot CLI above): this one IS a functional
+# dependency of the project's own tooling. If it 403s with MediaTypeBlocked,
+# see the registry= hint two blocks up -- same root cause, same fix.
 bash -lc "npm install -g bpmn-to-image"
+# __CHROMIUM_BLOCK_END__
 
 # named volume for per-story Claude project state is owned by root after first mount
 sudo chown -R vscode:vscode /home/vscode/.claude/projects/__MEMORY_KEY__ || true
+
+# Docker auto-creates missing bind-mount parent directories as root:root before
+# the mount happens. ~/.copilot/{skills,instructions,prompts} are bind-mounted
+# (see the mounts block above), but ~/.copilot ITSELF does not exist in the base
+# image, so Docker creates it as root, leaving the vscode user unable to write
+# ~/.copilot/config.json, session-store.db, logs/, etc. Without this, the
+# GitHub Copilot CLI fails to initialize and exits silently (no output at all,
+# not even the "no authentication" message) -- looks like a hang, not an error.
+sudo chown vscode:vscode /home/vscode/.copilot || true
 
 # Expose mvn and claude on /usr/local/bin so they work in IDE-spawned non-login
 # shells (IntelliJ terminal, Claude plugin) where shell init is sometimes skipped.
@@ -1803,7 +2637,7 @@ sudo git config --system --add safe.directory '*'
 
 # __GLAB_BLOCK_START__
 # Use glab as git's credential helper for HTTPS pushes to the configured
-# GitLab host (GLAB_HOSTNAME from .env.sh). glab is installed in the image
+# GitLab host (GLAB_HOSTNAME from devcontainers-config.json). glab is installed in the image
 # and its config (with the auth token) is bind-mounted from the host, so
 # the helper returns the stored token without prompting. Result: 'git push'
 # over HTTPS to that host works silently.
@@ -1919,11 +2753,11 @@ fi
 # set the locale") AFTER PID-1 env is applied, shadowing our LC_ALL. So we
 # also write to two shell-rc layers:
 #   - /etc/profile.d/zz-<PROJECT_SHORT>-env.sh : sourced by login shells via /etc/profile
-#   - /etc/bash.bashrc append      : sourced by interactive non-login bashes
+#   - __SYSTEM_BASHRC__ append     : sourced by interactive non-login bashes
 #                                    (which JetBrains' terminal usually is)
-# The bash.bashrc layer runs AFTER SSH forwarding and reliably overrides.
+# The bashrc layer runs AFTER SSH forwarding and reliably overrides.
 sudo tee /etc/profile.d/zz-__PROJECT_SHORT__-env.sh >/dev/null <<'PROF'
-export JAVA_HOME=/usr/lib/jvm/msopenjdk-current
+export JAVA_HOME=__JAVA_HOME__
 export DOCKER_API_VERSION=1.44
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -1937,8 +2771,8 @@ export CDPATH=".:__WORKSPACE_PATH__"
 PROF
 sudo chmod 644 /etc/profile.d/zz-__PROJECT_SHORT__-env.sh
 
-if ! grep -q '# __PROJECT_SHORT__ container locale + docker overrides' /etc/bash.bashrc 2>/dev/null; then
-    sudo tee -a /etc/bash.bashrc >/dev/null <<'BASHRC'
+if ! grep -q '# __PROJECT_SHORT__ container locale + docker overrides' __SYSTEM_BASHRC__ 2>/dev/null; then
+    sudo tee -a __SYSTEM_BASHRC__ >/dev/null <<'BASHRC'
 
 # __PROJECT_SHORT__ container locale + docker + java overrides. Sourced AFTER
 # SDKMAN's init (which the java:1 feature with version=none drops onto
@@ -1947,7 +2781,7 @@ if ! grep -q '# __PROJECT_SHORT__ container locale + docker overrides' /etc/bash
 # isn't installed via SDKMAN. Also blocks macOS-Terminal SSH forwarding of
 # LC_CTYPE=UTF-8 which glibc can't parse, and ensures DOCKER_API_VERSION is
 # set even for IDE-spawned shells that don't go through /etc/profile.
-export JAVA_HOME=/usr/lib/jvm/msopenjdk-current
+export JAVA_HOME=__JAVA_HOME__
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 unset LC_CTYPE
@@ -2039,7 +2873,7 @@ if [[ -f .devcontainer/initialize.sh ]]; then
     bash .devcontainer/initialize.sh
 fi
 
-# Resolve build dependencies in order (BUILDS / MAVEN_BUILDS in .env.sh).
+# Resolve build dependencies in order (BUILDS / MAVEN_BUILDS in devcontainers-config.json).
 # Tests are skipped across the board so post-create stays fast -- the IDE just
 # needs the reactor resolved; run tests on demand.
 #
@@ -2059,17 +2893,18 @@ echo
 echo "post-create done."
 SH
 chmod +x "${WS_DIR}/.devcontainer/post-create.sh"
-# MAVEN_BUILD_COMMANDS is multi-line; substitute via bash before sed takes over.
-# __HOST_MOUNT_PRUNE__ is substituted the same way (it may be empty).
-_pc=$(<"${WS_DIR}/.devcontainer/post-create.sh")
-_pc="${_pc/__MAVEN_BUILD_COMMANDS__/${MAVEN_BUILD_COMMANDS}}"
-_pc="${_pc/__HOST_MOUNT_PRUNE__/${HOST_MOUNT_PRUNE}}"
-printf '%s\n' "${_pc}" > "${WS_DIR}/.devcontainer/post-create.sh"
+# MAVEN_BUILD_COMMANDS is multi-line and __HOST_MOUNT_PRUNE__ sits inline inside
+# a find(1) expression (and may be empty); splice both literally before sed takes
+# over -- see the splice_placeholder comment for why bash's own ${var/pat/repl}
+# must not be used here.
+splice_placeholder "${WS_DIR}/.devcontainer/post-create.sh" "__MAVEN_BUILD_COMMANDS__" "${MAVEN_BUILD_COMMANDS}"
+splice_placeholder "${WS_DIR}/.devcontainer/post-create.sh" "__HOST_MOUNT_PRUNE__" "${HOST_MOUNT_PRUNE}"
 
 # Copy optional initialization hook into the workspace's .devcontainer/.
-# post-create.sh runs it before the Maven warmup builds if present.
-if [[ -f "${SCRIPT_DIR}/initialize.sh" ]]; then
-    cp "${SCRIPT_DIR}/initialize.sh" "${WS_DIR}/.devcontainer/initialize.sh"
+# post-create.sh runs it before the Maven warmup builds if present. Looked up
+# next to devcontainers-config.json first, so each project can ship its own hook.
+if _init_hook="$(config_asset initialize.sh)"; then
+    cp "${_init_hook}" "${WS_DIR}/.devcontainer/initialize.sh"
     chmod +x "${WS_DIR}/.devcontainer/initialize.sh"
 fi
 
@@ -2189,9 +3024,14 @@ shopt -u nullglob
 # key (or the host ssh-agent), so the tunnel just works without new secrets.
 #
 # Publishing: spawn-workspace.sh only maps the ports listed in HOST_PORTS
-# (.env.sh) via 'docker run -p'. Add 2222 to HOST_PORTS so this sshd is
+# (devcontainers-config.json) via 'docker run -p'. Add 2222 to HOST_PORTS so this sshd is
 # reachable from the host at 2222+offset. Without that entry sshd still runs
 # but is only reachable from inside the container.
+if ! [ -x /usr/sbin/sshd ]; then
+    echo "note: openssh-server not installed -- skipping the DB-tunnel sshd"
+    exit 0
+fi
+
 SSHD_PORT=2222
 SSHD_CONFIG=/tmp/sshd-devcontainer.conf
 SSHD_PID=/tmp/sshd-devcontainer.pid
@@ -2251,6 +3091,88 @@ else
     fi
 fi
 
+# Step 6: forward container-local 127.0.0.1:8888 to the real corporate proxy.
+# Some IDE plugins (observed: GitHub Copilot) don't honour HTTP_PROXY/http_proxy
+# and instead hardcode a local proxy port (8888 = the usual Fiddler port on the
+# HOST). Inside the container 127.0.0.1:8888 is just empty loopback, so those
+# plugins fail silently. We already know the *real* proxy address works (it's
+# wired into HTTP_PROXY/http_proxy above), so just relay 8888 to it -- same
+# socat pattern as the docker-socket forward in step 3.
+_proxy_target="${HTTP_PROXY:-${http_proxy:-}}"
+if [[ -n "${_proxy_target}" ]]; then
+    _proxy_hostport="${_proxy_target#*://}"
+    _proxy_hostport="${_proxy_hostport%%/*}"
+    if [[ "${_proxy_hostport}" == *:8888 ]]; then
+        echo "note: proxy already lives on port 8888 -- skipping self-forward (would loop)"
+    elif (exec 3<>"/dev/tcp/127.0.0.1/8888") 2>/dev/null; then
+        exec 3>&- 3<&- 2>/dev/null || true
+        echo "127.0.0.1:8888 already has a listener -- leaving it alone"
+    elif command -v socat >/dev/null 2>&1; then
+        # -d -d makes socat log every accepted connection and its outcome to
+        # /tmp/socat-proxy8888.log -- without it the log only ever shows the
+        # startup line, which makes it impossible to tell whether a silently
+        # failing tool (e.g. the Copilot plugin) even attempted to connect.
+        nohup socat -d -d TCP-LISTEN:8888,bind=127.0.0.1,reuseaddr,fork \
+                    TCP:"${_proxy_hostport}" \
+                    >/tmp/socat-proxy8888.log 2>&1 &
+        echo "socat forwarding 127.0.0.1:8888 -> ${_proxy_hostport} (for tools that hardcode a local proxy port)"
+        echo "  connection attempts logged to /tmp/socat-proxy8888.log"
+    else
+        echo "note: socat not installed -- 8888 proxy forward unavailable"
+    fi
+else
+    echo "note: no HTTP_PROXY configured -- skipping 8888 proxy forward"
+fi
+
+# Step 7: start a per-container D-Bus session bus + an auto-unlocked gnome-keyring
+# at the FIXED address from containerEnv (XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS
+# above), so CLI tools that rely on a real Secret Service backend for credential
+# storage (observed: GitHub Copilot CLI's login -- it warned there was no secure
+# place to store the token) have one. Without this, such a container is "just" a
+# minimal Linux userland with no session bus at all, so libsecret-based storage
+# fails outright or silently degrades to a plaintext fallback.
+#
+# A FIXED (not randomly-generated, as dbus-daemon --print-address would produce)
+# socket path is what makes this work from every shell/exec session without any
+# extra sourcing step: it's the same value containerEnv already put in every
+# process's environment at PID 1, so any new terminal/exec just finds the socket
+# that's already there.
+_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/1000}"
+sudo mkdir -p "${_runtime_dir}"
+sudo chown "$(id -u):$(id -g)" "${_runtime_dir}"
+chmod 700 "${_runtime_dir}"
+if [[ -S "${_runtime_dir}/bus" ]]; then
+    echo "D-Bus session bus already listening at ${_runtime_dir}/bus"
+else
+    if command -v dbus-daemon >/dev/null 2>&1; then
+        nohup dbus-daemon --session --address="unix:path=${_runtime_dir}/bus" --nofork \
+                    >/tmp/dbus-session.log 2>&1 &
+        # give the daemon a moment to create the socket before anything tries to use it
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [[ -S "${_runtime_dir}/bus" ]] && break
+            sleep 0.2
+        done
+        echo "D-Bus session bus started at ${_runtime_dir}/bus"
+    else
+        echo "note: dbus-daemon not installed -- Secret Service backend unavailable"
+    fi
+fi
+if [[ -S "${_runtime_dir}/bus" ]] && command -v gnome-keyring-daemon >/dev/null 2>&1; then
+    if pgrep -u "$(id -u)" -f 'gnome-keyring-daemon' >/dev/null 2>&1; then
+        echo "gnome-keyring-daemon already running"
+    else
+        # Empty password unlocks (or, on first run, creates) the "login" keyring
+        # non-interactively -- there's no desktop session here to prompt for one,
+        # and an unlocked-but-still-encrypted-at-rest keyring is the point: it
+        # protects the token from casual reading (e.g. `docker cp`ing the volume
+        # out and grepping it) without needing any secret of its own to unlock.
+        printf '\n' | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+        nohup gnome-keyring-daemon --start --components=secrets --foreground \
+                    >/tmp/gnome-keyring.log 2>&1 &
+        echo "gnome-keyring-daemon started (Secret Service backend for credential storage)"
+    fi
+fi
+
 exit 0
 SH
 chmod +x "${WS_DIR}/.devcontainer/post-start.sh"
@@ -2263,6 +3185,88 @@ chmod +x "${WS_DIR}/.devcontainer/post-start.sh"
 substitute_placeholders "${WS_DIR}/.devcontainer/Dockerfile"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-create.sh"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-start.sh"
+
+# ============================================================================
+# Base-image caching
+# ============================================================================
+# Everything the Dockerfile does up to this point (repo setup, base tooling,
+# JDK/Maven/Node, docker-ce, socat/jq/sshd, git upgrade, chromium, glab, gh) is
+# fully determined by devcontainers-config.json plus the certs/rocky-repos files written
+# above -- nothing in it depends on the story/branch name. Left alone, the
+# IDE's own `docker build` redoes all of that (5-10 min) for every single new
+# workspace. Instead we pre-build it ONCE here into a locally tagged image
+# (tag keyed by a hash of exactly those inputs) and collapse this workspace's
+# own Dockerfile down to a single `FROM <tag>`. Any later workspace whose
+# devcontainers-config.json/certs/repo files are unchanged hits the same tag and skips
+# straight past "FROM" -- seconds instead of minutes.
+DOCKERFILE_PATH="${WS_DIR}/.devcontainer/Dockerfile"
+CERTS_DIR="${WS_DIR}/.devcontainer/certs"
+ROCKY_REPO_DIR="${WS_DIR}/.devcontainer/rocky-repos"
+
+_hash_input="$(cat "${DOCKERFILE_PATH}")"
+for _d in "${CERTS_DIR}" "${ROCKY_REPO_DIR}"; do
+    [[ -d "${_d}" ]] || continue
+    for _f in "${_d}"/*; do
+        [[ -f "${_f}" ]] || continue
+        _hash_input="${_hash_input}|file:$(basename "${_f}")|$(cat "${_f}")"
+    done
+done
+BASE_IMAGE_HASH="$(printf '%s' "${_hash_input}" | sha256sum | cut -c1-12)"
+BASE_IMAGE_TAG="devcontainer-base:${DISTRO}-${BASE_IMAGE_HASH}"
+
+BASE_EXISTS=0
+docker image inspect "${BASE_IMAGE_TAG}" >/dev/null 2>&1 && BASE_EXISTS=1
+
+if (( REBUILD_BASE_IMAGE == 1 || BASE_EXISTS == 0 )); then
+    echo ""
+    if (( REBUILD_BASE_IMAGE == 1 && BASE_EXISTS == 1 )); then
+        echo "rebuilding base image (--rebuild-base-image): ${BASE_IMAGE_TAG}"
+    else
+        echo "base image cache miss -- building ${BASE_IMAGE_TAG} once (subsequent workspaces reuse it)..."
+    fi
+    _docker_build_args=(build -t "${BASE_IMAGE_TAG}")
+    if (( PROXY_ENABLED == 1 )); then
+        _docker_build_args+=(--build-arg "HTTP_PROXY=${_p_http}" --build-arg "HTTPS_PROXY=${_p_https}" \
+                              --build-arg "http_proxy=${_p_http}" --build-arg "https_proxy=${_p_https}")
+        if [[ -n "${PROXY_NO}" ]]; then
+            _docker_build_args+=(--build-arg "NO_PROXY=${PROXY_NO}" --build-arg "no_proxy=${PROXY_NO}")
+        fi
+    fi
+    _docker_build_args+=("${WS_DIR}/.devcontainer")
+    if ! docker "${_docker_build_args[@]}"; then
+        echo "ERROR: base image build failed (${BASE_IMAGE_TAG}) -- see docker output above" >&2
+        exit 1
+    fi
+    echo "base image ready: ${BASE_IMAGE_TAG}"
+else
+    echo "base image cache hit: ${BASE_IMAGE_TAG} (skipping the dnf/JDK/Maven/Node/Docker-CE install)"
+fi
+
+cat > "${DOCKERFILE_PATH}" <<DOCKERFILEBASE
+# Cached base image -- collapsed from the full Rocky/Debian setup Dockerfile
+# by spawn-workspace.sh's base-image caching step (see there for the "why").
+# The tag below was pre-built and is already local, so this \`docker build\`
+# just resolves FROM and finishes in seconds.
+#
+# Config changed (version bump, new proxy, different certs/repo mirror)? The
+# tag's hash covers all of that automatically, so a real change gets a new
+# tag and a fresh build on the next spawn. To force a rebuild WITHOUT a
+# config change (e.g. the internal mirror's package set moved forward), run:
+#   spawn-workspace.sh --rebuild-base-image <branch-name>
+# or manually: docker rmi ${BASE_IMAGE_TAG}
+FROM ${BASE_IMAGE_TAG}
+
+# Unused now that FROM points at a prebuilt tag (no RUN below consumes them),
+# but kept declared so devcontainer.json's build.args don't trigger a
+# "build arg not consumed" warning.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+DOCKERFILEBASE
+
 # The workspace README uses the same __PLACEHOLDER__ / __GLAB_BLOCK__ mechanism
 # as the other templates. PORT_TABLE_ROWS was already spliced in above via bash;
 # substitute_placeholders handles the remaining tokens and GLAB blocks.
@@ -2286,5 +3290,5 @@ Inside the container, list each worktree's current branch with:
   branches
 
 Dispose later with:
-  bin/dispose-workspace.sh ${BRANCH}
+  dispose-workspace.sh ${DISPOSE_CONFIG_HINT}${BRANCH}
 EOF

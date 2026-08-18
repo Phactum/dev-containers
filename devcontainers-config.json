@@ -1,0 +1,318 @@
+{
+    // ==========================================================================
+    // devcontainers-config.json -- project-specific configuration, read by all four scripts
+    // (spawn-workspace.sh / .ps1 and dispose-workspace.sh / .ps1).
+    //
+    // Copy this file into YOUR project as <project>/dev-containers/devcontainers-config.json
+    // and change the values below. The scripts themselves are cloned once and
+    // put on the PATH; they are generic and never need to be edited per project.
+    //
+    // The scripts locate this file in this order:
+    //   1. --config <path>   the file, or a directory containing devcontainers-config.json
+    //   2. ./dev-containers/devcontainers-config.json, relative to the current directory
+    //
+    // This file's DIRECTORY is the base directory for the other project assets:
+    // README.md.tpl, initialize.sh and runConfigurations/ are read from here
+    // first, falling back to the copies shipped next to the scripts. It is also
+    // the anchor for the workspaces-root auto-detect (two directories up).
+    //
+    // FORMAT: JSON with full-line "//" comments (JSONC). Both loaders
+    // (env-config.sh via jq, EnvConfig.ps1 via ConvertFrom-Json) strip lines
+    // whose first non-whitespace characters are "//" before parsing. Trailing
+    // comments after a value are NOT supported -- put comments on their own line.
+    //
+    // An optional setting is disabled by omitting its key entirely (or setting
+    // it to null / ""). Do NOT "comment out" a key by adding "//" in front of
+    // it and leaving the value on the same line as other JSON.
+    // ==========================================================================
+
+    // --- Project identity ---------------------------------------------------
+
+    // Source workspace directory name AND the prefix of every story workspace
+    // (story workspace = "<projectName>-<branch-leaf>"). Also used for the
+    // in-container workspace path.
+    "projectName": "DevContainers",
+
+    // Short project label. Used for:
+    //   - Docker container name:                 "<projectShort>-<leaf>"
+    //   - IntelliJ project name in .idea/.name:  "<projectShort> <leaf>"
+    //   - per-story Claude named volume prefix:  "<projectShort>-claude-project-*"
+    //   - env var for the workspaces root:       "<PROJECTSHORT>_WORKSPACES_ROOT"
+    // Keep it short and shell-safe (letters + digits + dashes).
+    "projectShort": "DC",
+
+    // --- Workspaces root ----------------------------------------------------
+
+    // Directory that holds the source workspace <projectName>/ and, next to it,
+    // every story workspace <projectName>-<branch-leaf>/.
+    //
+    // OPTIONAL. Omit it and the scripts auto-detect: they walk up from this
+    // file's directory looking for the directory named <projectName> (the source
+    // workspace) and take its parent. That covers both supported layouts with no
+    // configuration at all:
+    //     <root>/<projectName>/dev-containers/devcontainers-config.json
+    //     <root>/<projectName>/devcontainers-config.json
+    // If no directory named <projectName> is found on the way up, the fallback
+    // is two levels above this file.
+    //
+    // A relative value is resolved against THIS file's directory, so a project
+    // can commit e.g. "workspacesRoot": "../.." and stay portable across
+    // machines. An absolute value is used as-is.
+    //
+    // Precedence: --workspaces-root flag > $<PROJECTSHORT>_WORKSPACES_ROOT env
+    // var > this setting > auto-detect.
+    //
+    // "workspacesRoot": "..",
+
+    // --- Repos to mount as worktrees ----------------------------------------
+
+    // Source repos under <workspaces-root>/<projectName>/<name>/ that get a
+    // worktree in every story workspace, plus the per-repo base ref used when
+    // the spawn branch is brand new (existing branches are reused regardless).
+    //
+    // Each baseRef resolves as origin/<baseRef> first, then local <baseRef>;
+    // missing on this repo? -> falls back to origin/HEAD (with a console note).
+    // Different repos can have different base refs -- e.g. a docs repo that
+    // uses 'main' while everything else forks from 'development'.
+    // Missing source repos are silently skipped.
+    //
+    // MONO-REPO MODE: set "repos" to [] when the source workspace IS the git
+    // repo (no sub-directories per repo).
+    //
+    // HOST-MOUNT ENTRIES: an entry with an EMPTY baseRef ("") is not treated as
+    // a git repo -- no worktree is created. Instead the host directory
+    // <workspaces-root>/<projectName>/<name> is bind-mounted into the container
+    // at the same workspace-relative path. Use it for pre-built artifacts or
+    // non-versioned folders.
+    "repos": [
+        { "name": "cluster-test-process", "baseRef": "development" }
+    ],
+
+    // --- Warmup builds ------------------------------------------------------
+
+    // Build steps run by post-create.sh, in dependency order. Two mutually
+    // exclusive styles; define AT MOST ONE of "mavenBuilds" / "builds":
+    //
+    //   "mavenBuilds": [{ "repo": "<repo>", "goal": "<mvn-goal>" }]
+    //        <goal> runs as `mvn ${MVN_FLAGS} <goal>` inside <repo>.
+    //        A goal starting with "$" is instead a raw bash command
+    //        (everything after the "$"), run verbatim inside <repo>.
+    //        Common goals: "install" (produces a jar into ~/.m2 for downstream
+    //                                 modules),
+    //                      "compile" (resolves deps + compiles, no jar needed).
+    //
+    //   "builds":      [{ "repo": "<repo>", "command": "<raw bash command>" }]
+    //        <command> is ALWAYS run verbatim inside <repo>. No mvn/MVN_FLAGS
+    //        injection -- Maven users spell out "mvn ..." themselves.
+    //
+    // Mono-repo default: if neither is defined and a pom.xml exists at the repo
+    // root, the project is built as a single Maven reactor ("install").
+    "mavenBuilds": [
+        { "repo": "cluster-test-process", "goal": "compile" }
+    ],
+
+    // --- Host ports + labels ------------------------------------------------
+
+    // Ports the container publishes on the host. The spawn scripts pick an
+    // offset (multiple of portOffsetStep) where ALL of these are free, so
+    // parallel story containers don't collide. Inside the container, services
+    // still bind to these literal numbers.
+    //
+    // "label" shows up in JetBrains' Services view and in the workspace README.
+    // It is optional; a port without one gets a generic auto-label.
+    "hostPorts": [
+        { "port": 8080, "label": "application" },
+        { "port": 8079, "label": "bc-simulator" },
+        { "port": 2222, "label": "ssh-tunnel" }
+    ],
+
+    // Step size between candidate port offsets. The spawn scripts try offsets
+    // 0, STEP, 2*STEP, ... until they find a range where every host port is
+    // free. Must be between 500 and 10000 (the scripts abort otherwise).
+    // A large step (10000) is collision-proof by construction: it exceeds the
+    // spread of hostPorts, so two workspaces' offset ranges can never overlap
+    // even if free-port detection were imperfect. Smaller steps pack more
+    // parallel workspaces into lower port numbers but rely on detection
+    // (docker bindings + live listeners + other workspaces' devcontainer.json).
+    "portOffsetStep": 10000,
+
+    // --- DevContainer image & tooling versions ------------------------------
+
+    // Package-manager family of the base image. Everything distro-specific in
+    // the generated Dockerfile / devcontainer.json is switched by this key.
+    //
+    //   "debian" (default)
+    //        Debian/Ubuntu base + the devcontainer features (git, java, node,
+    //        docker-in-docker). Uses apt-get.
+    //   "rocky"
+    //        Rocky Linux / RHEL-family base (Alma, CentOS Stream, UBI). The
+    //        devcontainer features CANNOT be used there -- every one of them
+    //        shells out to apt-get in its install.sh -- so the Dockerfile
+    //        installs the equivalent toolchain itself: the 'vscode' user,
+    //        java-<javaVersion>-openjdk-devel from dnf, Apache Maven from the
+    //        binary tarball, Node from NodeSource (AppStream module as
+    //        fallback) and docker-ce from Docker's RHEL repo. devcontainer.json
+    //        then adds "--privileged"/"--init" and the /var/lib/docker volume
+    //        that the docker-in-docker feature would otherwise contribute.
+    //
+    "distro": "debian",
+
+    // Base image for the container. On "debian" it must include a JDK (we layer
+    // Maven on top); on "rocky" a plain distro image is enough -- the Dockerfile
+    // installs the JDK.
+    "baseImage": "mcr.microsoft.com/devcontainers/java:1-21-bookworm",
+
+    // Rocky only: JDK major version (dnf package java-<n>-openjdk-devel) and the
+    // Apache Maven release fetched from dlcdn/archive.apache.org. Ignored on
+    // Debian, where the JDK comes from the base image and Maven from the
+    // java:1 feature.
+    "javaVersion": "21",
+    "mavenVersion": "3.9.9",
+
+    // Node version. On Debian this is the version of the devcontainers/node
+    // feature; on Rocky it is the NodeSource major version (setup_<n>.x).
+    "nodeFeatureVersion": "24",
+
+    // Registry the devcontainer features are pulled from. Defaults to
+    // "ghcr.io". Point it at an internal mirror when ghcr.io is unreachable,
+    // e.g. "nexus.example.lan/docker-ghcr-io".
+    //
+    // NOTE: this only changes where the feature PACKAGES come from. The
+    // features themselves still download their payload from the internet at
+    // build time (the node feature fetches Node from nodejs.org, the java
+    // feature uses SDKMAN, several run apt-get). A fully offline build
+    // therefore needs mirrors for those too. Unused when distro = "rocky":
+    // that image is built without any devcontainer feature.
+    //
+    // "featureRegistry": "nexus.example.lan/docker-ghcr-io",
+
+    // --- Optional image build steps -----------------------------------------
+
+    // Every switch defaults to true, i.e. omitting the whole block keeps the
+    // full-featured image. Turn individual steps off when the build cannot
+    // reach a package mirror -- each one costs a specific, documented
+    // convenience rather than breaking the container:
+    //
+    //   "packages"     socat, jq, openssh-server (curl and ca-certificates are
+    //                  already in the base image). Legacy spelling:
+    //                  "aptPackages".
+    //                  off -> post-start.sh skips the docker-over-TCP fallback
+    //                         on 127.0.0.1:2375 and does NOT start the sshd
+    //                         used by IntelliJ's Database tool for tunnelling.
+    //                         The Claude statusline loses its usage segment
+    //                         (that part needs jq).
+    //   "recentGit"    a current git from Debian backports / the Ubuntu PPA.
+    //                  On Rocky there is no such channel: the step only pulls
+    //                  the newest git of the enabled repos and warns when it is
+    //                  older than 2.46.
+    //                  off -> the base image's git is used. Only matters for
+    //                         the glab credential helper, which needs 2.46+.
+    //   "chromium"     the system Chromium that bpmn-to-image renders with,
+    //                  plus the PUPPETEER_* environment that points at it.
+    //                  On Rocky this pulls in EPEL, since RHEL 9 ships no
+    //                  Chromium.
+    //                  off -> bpmn-to-image is not installed either, since it
+    //                         cannot render without a browser.
+    //
+    // "imageBuild": {
+    //     "packages": false,
+    //     "recentGit": false,
+    //     "chromium": false
+    // },
+
+    // --- Corporate proxy / TLS interception (optional) ----------------------
+
+    // Only needed behind a corporate proxy. Omit the whole "proxy" block and
+    // nothing changes -- the generated container is built exactly as before.
+    //
+    // IMPORTANT: this block covers what happens INSIDE the image build and the
+    // running container (apt, curl, npm, Maven, git). Pulling the base image
+    // itself is done by the Docker daemon, which is configured separately in
+    // Docker Desktop -> Settings -> Resources -> Proxies. See the "Corporate
+    // proxy" section of the dev-containers README.
+    //
+    // "http" / "https" / "noProxy"
+    //   Proxy URLs handed to the build (as build args) and to the running
+    //   container (as containerEnv), in both upper- and lowercase spellings.
+    //   Docker Desktop does NOT inject these by itself -- its own proxy setting
+    //   only covers image pulls by the daemon, not the build steps.
+    //
+    //   Preferred value: "http://http.docker.internal:3128". That is Docker
+    //   Desktop's own forwarder, reachable from every container, and it applies
+    //   whatever is configured under Settings -> Resources -> Proxies including
+    //   the exclusion list -- so it keeps working if the proxy moves.
+    //   Alternatively point straight at a proxy on the host with
+    //   "http://host.docker.internal:<port>". Never use "127.0.0.1": inside a
+    //   container that is the container itself.
+    //   Always list internal registries in "noProxy" so they are contacted
+    //   directly.
+    //
+    // "caCertificates"
+    //   PEM-encoded certificates (.crt) of the CA your proxy re-signs traffic
+    //   with. A TLS-intercepting proxy makes every HTTPS download fail with
+    //   "self-signed certificate in certificate chain" until its CA is trusted.
+    //   The spawn scripts copy these files into the workspace's
+    //   .devcontainer/certs/ and the image installs them into the OS trust
+    //   store, the JVM truststore (Maven!) and Node (NODE_EXTRA_CA_CERTS).
+    //   Paths are relative to THIS file's directory (absolute paths also work).
+    //   See the README for the one-liner that exports them from the Windows
+    //   certificate store.
+    //
+    // "debianUseHttps"
+    //   Rewrites the package sources from http:// to https:// before the first
+    //   package-manager run. Needed when the proxy refuses plain-HTTP
+    //   forwarding (a common policy) -- otherwise "apt-get update" fails while
+    //   HTTPS downloads work fine. On Rocky the same switch disables the
+    //   mirrorlist (whose mirrors are mostly plain HTTP) and pins the
+    //   https:// baseurl instead. Distro-neutral alias: "useHttpsRepos".
+    //
+    // "proxy": {
+    //     "http": "http://host.docker.internal:8888",
+    //     "https": "http://host.docker.internal:8888",
+    //     "noProxy": "localhost,127.0.0.1,*.example.lan",
+    //     "caCertificates": [ "certs/corporate-root-ca.crt" ],
+    //     "debianUseHttps": true
+    // },
+
+    // --- GitLab integration (optional) --------------------------------------
+
+    // Both keys must be non-empty to enable glab. Omit either (or set it to "")
+    // and the container is built without glab, without the bind-mounted glab
+    // config, and without the git credential helper for that host.
+    //
+    // "glabVersion":  "1.99.0",
+    // "glabHostname": "gitlab.example.com",
+
+    // --- GitHub integration (optional) --------------------------------------
+
+    // gh (GitHub CLI) version installed by the Dockerfile. Omit (or "") to
+    // disable the gh install, the bind-mounted gh config and the gh git
+    // credential helper. gh always targets github.com, so no hostname is
+    // needed. See https://github.com/cli/cli/releases for versions.
+    //
+    // "ghVersion": "2.97.0",
+
+    // --- IntelliJ run configurations ----------------------------------------
+
+    // Filenames of XML run-configs under dev-containers/runConfigurations/.
+    // The spawn scripts copy them into the new workspace's
+    // .idea/runConfigurations/ verbatim (same filename), then substitute
+    // placeholders (__PORT_*__ etc.) in each copy.
+    "runConfigs": [
+        "BusinessCockpitApplication.run.xml",
+        "BusinessCockpitSimulator.run.xml",
+        "DevShellSimulator.run.xml",
+        "Blueprint.run.xml",
+        "BlueprintBusinessCockpit.run.xml"
+    ],
+
+    // --- Forwarded environment variables ------------------------------------
+
+    // Names of env vars on the host that get forwarded into the container via
+    // remoteEnv AND containerEnv, and whose "${NAME}" placeholders get resolved
+    // in ~/.npmrc at spawn time. Useful for tokens that private npm/Maven
+    // registries need.
+    //
+    // Empty list = no forwarding (the standard devcontainer setup still works).
+    "forwardedEnvVars": [ ]
+}
