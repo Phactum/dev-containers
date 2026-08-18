@@ -3,7 +3,7 @@
 # dispose-workspace.sh — remove a story workspace and clean up its git worktrees.
 #
 # Usage:
-#   dev-containers/dispose-workspace.sh [--workspaces-root <path>] [--force] [--delete-branch] [--keep-container] [--keep-image] [--yes] <target>
+#   dispose-workspace.sh [--config <path>] [--workspaces-root <path>] [--force] [--delete-branch] [--keep-container] [--keep-image] [--yes] <target>
 #
 # <target> accepts any of:
 #   feature/FLOW-4711_example-story   full branch name
@@ -16,23 +16,34 @@
 # the container name (which embeds the branch leaf) without needing the branch.
 #
 # Examples:
-#   dev-containers/dispose-workspace.sh feature/FLOW-4711_example-story
-#   dev-containers/dispose-workspace.sh <PROJECT_SHORT>-FLOW-4711_example-story
-#   dev-containers/dispose-workspace.sh a3f2b1c4d5e6
-#   dev-containers/dispose-workspace.sh --force --delete-branch feature/FLOW-4711_example-story
-#   dev-containers/dispose-workspace.sh --workspaces-root /opt/dev feature/FLOW-4711_example
-#   VANILLABP_WORKSPACES_ROOT=/opt/dev dev-containers/dispose-workspace.sh feature/FLOW-4711_example
+#   dispose-workspace.sh feature/FLOW-4711_example-story
+#   dispose-workspace.sh <PROJECT_SHORT>-FLOW-4711_example-story
+#   dispose-workspace.sh a3f2b1c4d5e6
+#   dispose-workspace.sh --force --delete-branch feature/FLOW-4711_example-story
+#   dispose-workspace.sh --config ~/work/myproject/dev-containers/devcontainers-config.json feature/FLOW-4711_example
+#   dispose-workspace.sh --workspaces-root /opt/dev feature/FLOW-4711_example
+#   VANILLABP_WORKSPACES_ROOT=/opt/dev dispose-workspace.sh feature/FLOW-4711_example
+#
+# INSTALLATION
+#   Clone this directory ONCE and put it on your PATH (see spawn-workspace.sh's
+#   header). Per-project settings live in that project's own devcontainers-config.json.
+#
+# The devcontainers-config.json is located in this order:
+#   1. --config <path>   file, or a directory containing devcontainers-config.json
+#   2. ./dev-containers/devcontainers-config.json, relative to the CURRENT WORKING DIRECTORY
+#   3. ./devcontainers-config.json,                relative to the CURRENT WORKING DIRECTORY
 #
 # The <workspaces-root> directory is resolved in this order:
 #   1. --workspaces-root <path>     CLI flag (highest priority)
 #   2. $<PROJECT_SHORT>_WORKSPACES_ROOT env var (e.g. VANILLABP_WORKSPACES_ROOT)
-#   3. auto-detect: parent of the directory holding this script
+#   3. "workspacesRoot" in devcontainers-config.json (relative to the config's directory)
+#   4. auto-detect: walk up from the config's directory to the directory named
+#      <PROJECT_NAME> and take its parent; falling back to two levels up
 # The script prints the resolved target directory and asks for confirmation
 # before removing anything; pass --yes to skip the prompt.
 #
-# Project-specific values (PROJECT_NAME, PROJECT_SHORT, REPOS, ...) come from
-# the .env.sh file next to this script. Fork dev-containers/ into another
-# project's repo and edit .env.sh to retarget.
+# Project-specific values (projectName, projectShort, repos, ...) come from
+# devcontainers-config.json. Point the scripts at another project's devcontainers-config.json to retarget.
 #
 # By default this:
 #   - refuses to remove worktrees with uncommitted changes (use --force to override)
@@ -43,34 +54,43 @@
 #
 set -euo pipefail
 
-# Source project config from .env.sh next to this script (PROJECT_NAME,
-# PROJECT_SHORT, REPOS, ...). Fork the dev-containers/ directory into
-# another project's repo, edit .env.sh, and these scripts work there too.
-SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env.sh"
-if [[ ! -f "${ENV_FILE}" ]]; then
-    echo "Project config not found: ${ENV_FILE}" >&2
-    exit 1
-fi
-# shellcheck source=/dev/null
-source "${ENV_FILE}"
-
-ENV_VAR_WORKSPACES_ROOT="$(echo "${PROJECT_SHORT}" | tr '[:lower:]' '[:upper:]')_WORKSPACES_ROOT"
+# Resolve the script's own directory, following symlinks -- a PATH install
+# normally symlinks the script into /usr/local/bin, and the sibling loader
+# (env-config.sh) has to be found next to the REAL file.
+SCRIPT_SOURCE="$0"
+while [[ -L "${SCRIPT_SOURCE}" ]]; do
+    _link_dir="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "${SCRIPT_SOURCE}")"
+    [[ "${SCRIPT_SOURCE}" != /* ]] && SCRIPT_SOURCE="${_link_dir}/${SCRIPT_SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
 
 FORCE=0
 DELETE_BRANCH=0
 KEEP_CONTAINER=0
 KEEP_IMAGE=0
 WORKSPACES_ROOT_CLI=""
+CONFIG_CLI=""
 ASSUME_YES=0
 ARG=""
 
+# Argument parsing runs BEFORE the project config is loaded, because --config
+# decides which config to load in the first place.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)          FORCE=1; shift ;;
         --delete-branch)  DELETE_BRANCH=1; shift ;;
         --keep-container) KEEP_CONTAINER=1; shift ;;
         --keep-image)     KEEP_IMAGE=1; shift ;;
+        -c|--config)
+            [[ $# -lt 2 ]] && { echo "--config needs an argument" >&2; exit 2; }
+            CONFIG_CLI="${2-}"
+            shift 2
+            ;;
+        --config=*)
+            CONFIG_CLI="${1#--config=}"
+            shift
+            ;;
         --workspaces-root)
             WORKSPACES_ROOT_CLI="${2-}"
             [[ $# -lt 2 ]] && { echo "--workspaces-root needs an argument" >&2; exit 2; }
@@ -81,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -y|--yes)         ASSUME_YES=1; shift ;;
-        -h|--help)        sed -n '2,44p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '2,51p' "$0"; exit 0 ;;
         --)               shift; ARG="${1:-}"; break ;;
         -*)               echo "unknown option: $1" >&2; exit 2 ;;
         *)                [[ -n "${ARG}" ]] && { echo "unexpected argument: $1" >&2; exit 2; }
@@ -90,27 +110,62 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${ARG}" ]]; then
-    echo "usage: $0 [--workspaces-root <path>] [--force] [--delete-branch] [--keep-container] [--keep-image] [--yes] <target>" >&2
+    echo "usage: $0 [--config <path>] [--workspaces-root <path>] [--force] [--delete-branch] [--keep-container] [--keep-image] [--yes] <target>" >&2
     exit 2
 fi
 
-# Resolve the workspaces root directory in priority order:
-#   1. --workspaces-root CLI flag
-#   2. ${ENV_VAR_WORKSPACES_ROOT} environment variable (e.g. VANILLABP_WORKSPACES_ROOT)
-#   3. auto-detect via the script's own location: the script lives at
-#      <root>/<PROJECT_NAME>/dev-containers/dispose-workspace.sh, so two dirs
-#      up from SCRIPT_DIR is the root.
-DEFAULT_WORKSPACES_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-WORKSPACES_ROOT="${WORKSPACES_ROOT_CLI:-${!ENV_VAR_WORKSPACES_ROOT:-${DEFAULT_WORKSPACES_ROOT}}}"
+# Locate the project config: --config (a file or a directory containing
+# devcontainers-config.json), otherwise, relative to the CURRENT WORKING DIRECTORY,
+# ./dev-containers/devcontainers-config.json and then ./devcontainers-config.json -- which is what makes one
+# PATH-installed clone usable from every project.
+DEFAULT_CONFIG_RELS=("dev-containers/devcontainers-config.json" "devcontainers-config.json")
+if [[ -n "${CONFIG_CLI}" ]]; then
+    if [[ -d "${CONFIG_CLI}" ]]; then
+        CONFIG_JSON="${CONFIG_CLI%/}/devcontainers-config.json"
+    else
+        CONFIG_JSON="${CONFIG_CLI}"
+    fi
+    if [[ ! -f "${CONFIG_JSON}" ]]; then
+        echo "Project config not found: ${CONFIG_JSON}" >&2
+        exit 1
+    fi
+else
+    CONFIG_JSON=""
+    for _rel in "${DEFAULT_CONFIG_RELS[@]}"; do
+        if [[ -f "${PWD}/${_rel}" ]]; then
+            CONFIG_JSON="${PWD}/${_rel}"
+            break
+        fi
+    done
+    if [[ -z "${CONFIG_JSON}" ]]; then
+        echo "Project config not found. Looked for:" >&2
+        for _rel in "${DEFAULT_CONFIG_RELS[@]}"; do
+            echo "  ${PWD}/${_rel}" >&2
+        done
+        echo "Run the command from the project directory, or point at a config" >&2
+        echo "with --config <path-to-devcontainers-config.json|dir>." >&2
+        exit 1
+    fi
+fi
+CONFIG_DIR="$(cd -P "$(dirname "${CONFIG_JSON}")" && pwd)"
+CONFIG_JSON="${CONFIG_DIR}/$(basename "${CONFIG_JSON}")"
 
-if [[ ! -d "${WORKSPACES_ROOT}" ]]; then
-    echo "Workspaces root does not exist: ${WORKSPACES_ROOT}" >&2
-    echo "Override with --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}." >&2
+# Load the project config (PROJECT_NAME, PROJECT_SHORT, REPOS, ...) through the
+# shared env-config.sh loader, which lives next to this script.
+ENV_CONFIG="${SCRIPT_DIR}/env-config.sh"
+if [[ ! -f "${ENV_CONFIG}" ]]; then
+    echo "Config loader not found: ${ENV_CONFIG}" >&2
     exit 1
 fi
-# Canonicalise to an absolute path so path comparisons are reliable regardless
-# of how the user passed --workspaces-root (e.g. '.').
-WORKSPACES_ROOT="$(cd "${WORKSPACES_ROOT}" && pwd)"
+# shellcheck source=/dev/null
+source "${ENV_CONFIG}"
+
+ENV_VAR_WORKSPACES_ROOT="$(echo "${PROJECT_SHORT}" | tr '[:lower:]' '[:upper:]')_WORKSPACES_ROOT"
+
+# Resolve the workspaces root. Priority (see resolve_workspaces_root in
+# env-config.sh): --workspaces-root flag, ${ENV_VAR_WORKSPACES_ROOT} env var,
+# "workspacesRoot" in devcontainers-config.json, then auto-detect from the config location.
+WORKSPACES_ROOT="$(resolve_workspaces_root "${WORKSPACES_ROOT_CLI}")" || exit 1
 
 SOURCE_WS="${WORKSPACES_ROOT}/${PROJECT_NAME}"
 
@@ -127,14 +182,34 @@ fi
 
 # Accept "feature/FLOW-1234_foo", "FLOW-1234_foo", "<PROJECT_NAME>-FLOW-1234_foo",
 # or "<PROJECT_SHORT>-FLOW-1234_foo" (Docker container name).
-LEAF="${ARG##*/}"                       # strip optional branch prefix like feature/
-LEAF="${LEAF#"${PROJECT_NAME}"-}"       # strip optional workspace-name prefix
-LEAF="${LEAF#"${PROJECT_SHORT}"-}"      # strip optional container-name prefix
+#
+# The prefixes must NOT be stripped unconditionally: a branch leaf legitimately
+# starts with the project name whenever branches are named after the project's
+# issue key (project "FLOW", branch "feature/FLOW-4711" -> leaf "FLOW-4711", whose
+# workspace is "FLOW-FLOW-4711"). Blind stripping turned that into "4711" and the
+# workspace was never found. So we build the candidates in order of specificity
+# and pick the first one that actually exists on disk; if none does, the
+# unstripped form drives the error message.
+_RAW_LEAF="${ARG##*/}"                  # strip optional branch prefix like feature/
+LEAF_CANDIDATES=("${_RAW_LEAF}")
+[[ "${_RAW_LEAF}" != "${_RAW_LEAF#"${PROJECT_NAME}"-}" ]] && LEAF_CANDIDATES+=("${_RAW_LEAF#"${PROJECT_NAME}"-}")
+[[ "${_RAW_LEAF}" != "${_RAW_LEAF#"${PROJECT_SHORT}"-}" ]] && LEAF_CANDIDATES+=("${_RAW_LEAF#"${PROJECT_SHORT}"-}")
+
+LEAF="${_RAW_LEAF}"
+for _cand in "${LEAF_CANDIDATES[@]}"; do
+    if [[ -d "${WORKSPACES_ROOT}/${PROJECT_NAME}-${_cand}" ]]; then
+        LEAF="${_cand}"
+        break
+    fi
+done
 WS_NAME="${PROJECT_NAME}-${LEAF}"
 WS_DIR="${WORKSPACES_ROOT}/${WS_NAME}"
 
 if [[ ! -d "${WS_DIR}" ]]; then
     echo "Workspace not found: ${WS_DIR}" >&2
+    if (( ${#LEAF_CANDIDATES[@]} > 1 )); then
+        echo "(also tried: ${LEAF_CANDIDATES[*]:1})" >&2
+    fi
     echo "If your workspaces live elsewhere, pass --workspaces-root <path>" >&2
     echo "or set \$${ENV_VAR_WORKSPACES_ROOT}." >&2
     exit 1
@@ -165,7 +240,7 @@ if (( ASSUME_YES == 0 )); then
     esac
 fi
 
-# REPOS in .env.sh is a "<name>:<base-ref>" map. Dispose only needs the
+# REPOS in devcontainers-config.json is a "<name>:<base-ref>" map. Dispose only needs the
 # names; pull them out once for the loops below.
 # Length-guard: bash 3.2 + set -u fail on empty array expansion.
 REPO_NAMES=()
@@ -175,7 +250,7 @@ if (( ${#REPOS[@]} > 0 )); then
     done
 fi
 
-# Mono-repo mode: REPOS=() in .env.sh signals that the source workspace IS the
+# Mono-repo mode: REPOS=() in devcontainers-config.json signals that the source workspace IS the
 # git repo. Synthesise a single virtual entry so all downstream loops work
 # without special-casing each one (mirrors the logic in spawn-workspace.sh).
 MONO_REPO=0

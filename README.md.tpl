@@ -1,4 +1,4 @@
-# __PROJECT_NAME__ — Story Workspace `__LEAF__`
+# __PROJECT_NAME__ - Story Workspace `__LEAF__`
 
 DevContainer workspace with worktrees of all __PROJECT_NAME__ repositories.
 
@@ -22,7 +22,7 @@ DevContainer workspace with worktrees of all __PROJECT_NAME__ repositories.
      **Docker in Docker**. (The connection-status panel may stay blank --
      that's a 2026.1 cosmetic bug, the connection is fine if the next step
      works.)
-   - Open `View → Tool Windows → Services` (`⌘8`) → you should see a
+   - Open `View → Tool Windows → Services` (Mac `⌘8`) → you should see a
      **Docker** node with the currently running containers under it. If
      yes, the daemon link is alive.
 
@@ -51,9 +51,9 @@ DevContainer workspace with worktrees of all __PROJECT_NAME__ repositories.
    After entering the code, the login must be completed with the "enter" key.
 <!-- __GLAB_BLOCK_START__ -->
 5. **glab login is shared with the host**
-   `spawn-workspace.sh` resolves the host's glab config directory
+   `__SPAWN_CMD__` resolves the host's glab config directory
    (macOS: `~/Library/Application Support/glab-cli`, Linux:
-   `~/.config/glab-cli`) and bind-mounts it onto the container's
+   `~/.config/glab-cli`, Windows: `%AppData%\glab-cli`) and bind-mounts it onto the container's
    `~/.config/glab-cli`. A login on the host is immediately usable inside
    the container and vice versa. If you've never logged in anywhere, run
    once (host or container):
@@ -102,7 +102,7 @@ IntelliJ's Database tool can't introspect the in-container DB directly in
 ijent Dev Container mode (it execs the host JBR path inside the container ->
 ENOENT). Route it through the sshd this container runs instead:
 
-1. Make sure `2222` is in `HOST_PORTS` in `dev-containers/.env.sh` and
+1. Make sure `2222` is in `HOST_PORTS` in `dev-containers/devcontainers-config.json` and
    you spawned the workspace after adding it (so `2222+offset` is published
    to the host). This workspace's host SSH port is **2222+__PORT_OFFSET__ =
    __SSH_HOST_PORT__**.
@@ -116,7 +116,7 @@ ENOENT). Route it through the sshd this container runs instead:
    means the dev container.
 5. **MongoDB replica set: force a direct connection.** The dev MongoDB is a
    single-node replica set that advertises its members as `localhost:27017`.
-   Over the tunnel that address points at *your Mac*, not the container, so
+   Over the tunnel that address points at *your host machine*, not the container, so
    normal replica-set discovery makes the driver chase an unreachable primary
    and the connection **times out**. Fix: leave the **Replica set** field
    empty and set the **URL** (it overrides the fields above) to
@@ -144,7 +144,7 @@ Port offset for this workspace: **+__PORT_OFFSET__**
 |------|-----------|---------|
 __PORT_TABLE_ROWS__
 
-When parallel story containers run, `spawn-workspace.sh` automatically picks
+When parallel story containers run, `__SPAWN_CMD__` automatically picks
 the next free multiple of 10000 as the offset. The run configs for this
 workspace are pre-wired with the offset URLs:
 `vanillabp.cockpit.application-uri`, OAuth redirect URIs, and the issuer URI
@@ -153,8 +153,8 @@ auth server (see the table above) line up.
 
 ## Useful container commands
 
-| Command       | Purpose                                                         |
-|---------------|-----------------------------------------------------------------|
+| Command     | Purpose                                                         |
+|-------------|-----------------------------------------------------------------|
 | `branches`  | List the current branch of every worktree                       |
 | `docker ps` | Running Testcontainers / compose stacks                         |
 | `mvn …`     | Works in every repo directly (symlinked into /usr/local/bin)    |
@@ -182,7 +182,7 @@ shell (login, non-login, IDE terminal) picks them up automatically.
 Run on the **host** (not in the container):
 
 ```sh
-dev-containers/dispose-workspace.sh feature/__LEAF__
+__DISPOSE_CMD__ feature/__LEAF__
 ```
 
 This removes the worktrees, the workspace directory, and the Docker container.
