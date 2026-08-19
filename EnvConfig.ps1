@@ -18,7 +18,7 @@
     The returned object mirrors the variables the Bash side exposes:
 
         ProjectName, ProjectShort, BaseImage, NodeFeatureVersion,
-        GlabVersion, GlabHostname, GhVersion, PortOffsetStep
+        GlabVersion, GlabHostname, GhVersion, PortOffsetStep, TerminalShell
         Repos             [ @{ Name; BaseRef } ]
         HostPorts         [ @{ Port; Label } ]
         RunConfigs        [ string ]
@@ -215,6 +215,12 @@ function Get-DevContainerConfig {
         GlabVersion        = & $str 'glabVersion'
         GlabHostname       = & $str 'glabHostname'
         GhVersion          = & $str 'ghVersion'
+        # Optional login shell for IntelliJ's built-in terminal. Empty (the
+        # default) leaves myShellPath unset in .idea/workspace.xml, so JetBrains
+        # auto-detects a shell -- and it prefers the zsh the base image ships
+        # over the vscode account's /bin/bash login shell. Set an absolute
+        # in-container path (e.g. /bin/bash) to pin it.
+        TerminalShell      = & $str 'terminalShell'
         WorkspacesRoot     = & $str 'workspacesRoot'
         ProxyHttp          = ''
         ProxyHttps         = ''

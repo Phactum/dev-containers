@@ -891,11 +891,21 @@ Write-LfFile -Path (Join-Path $WsDir 'README.md') `
 # because the README.md written above sits at the project basePath, which the
 # heuristic prefers over module-level READMEs.
 New-Item -ItemType Directory -Path (Join-Path $WsDir '.idea') -Force | Out-Null
-Write-LfFile -Path (Join-Path $WsDir '.idea\workspace.xml') -Content @'
+# Optionally pin the terminal's login shell. Without myShellPath JetBrains
+# auto-detects one and prefers zsh when present (the base image ships oh-my-zsh
+# via common-utils) even though vscode's login shell is /bin/bash. When
+# terminalShell is set we splice a second <option> onto the same line as
+# myStartingDirectory; the value carries its own leading newline + indent, so an
+# unset terminalShell leaves that line byte-identical to before.
+$TerminalShellOption = ''
+if (-not [string]::IsNullOrWhiteSpace($cfg.TerminalShell)) {
+    $TerminalShellOption = "`n        <option name=""myShellPath"" value=""$($cfg.TerminalShell)"" />"
+}
+Write-LfFile -Path (Join-Path $WsDir '.idea\workspace.xml') -Content (@'
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
     <component name="TerminalProjectOptionsProvider">
-        <option name="myStartingDirectory" value="$PROJECT_DIR$" />
+        <option name="myStartingDirectory" value="$PROJECT_DIR$" />__TERMINAL_SHELL_OPTION__
     </component>
     <!-- "Actions on Save" toggles (FormatOnSaveOptions, OptimizeOnSaveOptions)
          are intentionally NOT seeded. Spawned workspaces serve developers
@@ -907,7 +917,7 @@ Write-LfFile -Path (Join-Path $WsDir '.idea\workspace.xml') -Content @'
          workspace. The README.md at the workspace root documents the
          choices. -->
 </project>
-'@
+'@).Replace('__TERMINAL_SHELL_OPTION__', $TerminalShellOption)
 
 # Give IntelliJ a distinctive project name. It reads .idea/.name and uses it for
 # the window title, the workspace selector and the task-switcher entry.

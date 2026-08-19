@@ -136,6 +136,14 @@
     // (docker bindings + live listeners + other workspaces' devcontainer.json).
     "portOffsetStep": 10000,
 
+    // OPTIONAL. Login shell IntelliJ's built-in terminal opens inside the
+    // container. Omit it (or set null / "") and the shell is left unset in
+    // .idea/workspace.xml, so JetBrains auto-detects one -- and it prefers zsh
+    // when present, which the base image ships (oh-my-zsh via common-utils),
+    // even though the vscode account's login shell is /bin/bash. Set an
+    // absolute in-container path here to pin it, e.g. "/bin/bash".
+    "terminalShell": "/bin/bash",
+
     // --- DevContainer image & tooling versions ------------------------------
 
     // Package-manager family of the base image. Everything distro-specific in
