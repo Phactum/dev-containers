@@ -359,7 +359,7 @@ if ($MonoRepo) {
 }
 $RepoNames = @($Repos | ForEach-Object { $_.Name })
 
-$BuildMode = $cfg.BuildMode
+$BuildsDefined = $cfg.BuildsDefined
 $BuildEntries = @($cfg.Builds)
 
 # ============================================================================
@@ -930,11 +930,11 @@ Write-LfFile -Path (Join-Path $WsDir '.idea\.name') -Content "$ProjectShort $Lea
 # treat a root pom as their parent and complain on every sync.
 $MavenPomsList = ''
 $MavenBuildCommands = ''
-# Mono-repo default: when no build list is configured and a pom.xml exists at the
-# repo root, build the project as a single Maven reactor.
-if ($MonoRepo -and $BuildEntries.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $SourceWs 'pom.xml'))) {
-    $BuildEntries = @([pscustomobject]@{ Repo = $ProjectName; Value = 'install' })
-    $BuildMode = 'maven'
+# Mono-repo default: when the "builds" key is absent entirely (not merely empty)
+# and a pom.xml exists at the repo root, build the project as a single Maven
+# reactor. An explicit "builds": [] disables warmup builds instead.
+if ($MonoRepo -and -not $BuildsDefined -and (Test-Path -LiteralPath (Join-Path $SourceWs 'pom.xml'))) {
+    $BuildEntries = @([pscustomobject]@{ Repo = $ProjectName; Type = 'mvn'; Value = 'install' })
 }
 foreach ($entry in $BuildEntries) {
     $r = $entry.Repo
@@ -942,18 +942,13 @@ foreach ($entry in $BuildEntries) {
     if (Test-Path -LiteralPath (Join-Path $WsDir "$r\pom.xml")) {
         $MavenPomsList += "                <option value=`"`$PROJECT_DIR`$/$r/pom.xml`" />`n"
     }
-    if ($BuildMode -eq 'raw') {
-        # "builds" style: the value is always a raw bash command run verbatim
-        # inside the repo dir. No mvn/MVN_FLAGS wrapping.
+    if ($entry.Type -eq 'cmd') {
+        # "command" entry: raw bash, run verbatim inside <repo>. No mvn/MVN_FLAGS
+        # wrapping -- it spells out its own mvn calls / scripts.
         $MavenBuildCommands += "[[ -d $r ]] && (cd $r && $val)`n"
-    } elseif ($val.StartsWith('$')) {
-        # "mavenBuilds" style, raw-command form: a goal starting with '$' is an
-        # arbitrary bash command run verbatim inside the repo dir (for repos with
-        # no parent pom but several sub-dir poms). MVN_FLAGS is NOT injected.
-        $raw = $val.Substring(1).TrimStart()
-        $MavenBuildCommands += "[[ -d $r ]] && (cd $r && $raw)`n"
     } else {
-        # "mavenBuilds" style, mvn-goal form: inject `mvn ${MVN_FLAGS}`.
+        # "mvn-goal" entry: inject `mvn ${MVN_FLAGS}` so the warmup build picks
+        # up -ntp / skipTests / spotless-skip.
         $MavenBuildCommands += "[[ -d $r ]] && (cd $r && mvn `${MVN_FLAGS} $val)`n"
     }
 }
@@ -2347,7 +2342,7 @@ if [[ -f .devcontainer/initialize.sh ]]; then
     bash .devcontainer/initialize.sh
 fi
 
-# Resolve build dependencies in order ("builds" / "mavenBuilds" in devcontainers-config.json).
+# Resolve build dependencies in order (the "builds" list in devcontainers-config.json).
 # Tests are skipped across the board so post-create stays fast -- the IDE just
 # needs the reactor resolved; run tests on demand.
 #

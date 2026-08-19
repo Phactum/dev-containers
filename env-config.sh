@@ -23,13 +23,15 @@
 #   PORT_LABELS[]        "<port>:<label>"
 #   RUN_CONFIGS[]        run-config XML filenames
 #   FORWARDED_ENV_VARS[] env var names
-#   MAVEN_BUILDS[]       "<repo>:<goal>"     (only if "mavenBuilds" is present)
-#   BUILDS[]             "<repo>:<command>"  (only if "builds" is present)
+#   BUILDS[]             "<repo>:<type>:<value>"  type = mvn|cmd
+#   BUILDS_DEFINED       1 if the "builds" key is present in the config, else 0
 #
-# Exactly one of MAVEN_BUILDS / BUILDS is declared, mirroring the mutually
-# exclusive keys in devcontainers-config.json — spawn-workspace.sh selects its
-# build mode via `declare -p`, so declaring both (or neither by accident)
-# would change behaviour.
+# Each "builds" entry carries exactly one of "mvn-goal" (type=mvn, run as
+# `mvn ${MVN_FLAGS} <value>`) or "command" (type=cmd, run verbatim inside the
+# repo). The value may itself contain ':' (e.g. a URL), so only the repo and the
+# type are split off at use sites. BUILDS_DEFINED lets spawn-workspace.sh tell
+# "no builds key" (mono-repo auto-build applies) from "builds": [] (warmup
+# builds disabled on purpose).
 
 # The caller normally sets CONFIG_JSON. Falling back to a devcontainers-config.json
 # next to this file keeps the loader usable stand-alone (e.g. for debugging).
@@ -173,20 +175,28 @@ while IFS= read -r -d '' _rec; do
     PROXY_CA_CERTS+=("${_rec}")
 done < <(_env_records '(.proxy.caCertificates // [])[]')
 
-# Build list: declare ONLY the key that is actually present in the JSON, so the
-# `declare -p` probe in spawn-workspace.sh picks the intended mode. An explicit
-# empty array still counts as "present" (it selects the style and disables all
-# warmup builds), which matches the documented bash behaviour.
-if _env_json_stripped | jq -e 'has("mavenBuilds")' >/dev/null; then
-    MAVEN_BUILDS=()
-    while IFS= read -r -d '' _rec; do
-        MAVEN_BUILDS+=("${_rec}")
-    done < <(_env_records '(.mavenBuilds // [])[] | "\(.repo):\(.goal)"')
-elif _env_json_stripped | jq -e 'has("builds")' >/dev/null; then
-    BUILDS=()
+# Build list: a single "builds" array whose entries each carry exactly one of
+# "mvn-goal" or "command". Normalise every entry to "<repo>:<type>:<value>"
+# (type = mvn|cmd) and fail loudly on any entry that sets both or neither.
+# BUILDS_DEFINED records whether the key was present at all -- an explicit
+# "builds": [] disables warmup builds without triggering the mono-repo auto-build.
+BUILDS=()
+BUILDS_DEFINED=0
+if _env_json_stripped | jq -e 'has("builds")' >/dev/null; then
+    BUILDS_DEFINED=1
+    _bad="$(_env_json_stripped | jq -r '
+        (.builds // []) | to_entries[]
+        | select(((.value | has("mvn-goal")) and (.value | has("command")))
+                 or ((.value | has("mvn-goal") | not) and (.value | has("command") | not)))
+        | "  entry #\(.key) (repo=\(.value.repo // "?")): set exactly one of \"mvn-goal\" / \"command\""')"
+    if [[ -n "${_bad}" ]]; then
+        echo "ERROR: invalid \"builds\" entries in ${CONFIG_JSON}:" >&2
+        printf '%s\n' "${_bad}" >&2
+        exit 1
+    fi
     while IFS= read -r -d '' _rec; do
         BUILDS+=("${_rec}")
-    done < <(_env_records '(.builds // [])[] | "\(.repo):\(.command)"')
+    done < <(_env_records '(.builds // [])[] | if has("mvn-goal") then "\(.repo):mvn:\(.["mvn-goal"])" else "\(.repo):cmd:\(.command)" end')
 fi
 
 unset _rec _required
