@@ -2572,6 +2572,17 @@ fi
 
 cd __WORKSPACE_PATH__
 
+# XDG_RUNTIME_DIR is pinned to /run/user/1000 via containerEnv, but that dir is
+# created by post-start.sh -- which the devcontainer lifecycle runs AFTER
+# postCreate. Create it here too (idempotent, same as post-start.sh) so the
+# nested dockerd has it before the initialize.sh hook below runs `docker
+# compose`; without it the daemon aborts container creation with
+#   "failed to create temp dir: stat /run/user/1000: no such file or directory".
+_rt="${XDG_RUNTIME_DIR:-/run/user/1000}"
+sudo mkdir -p "${_rt}"
+sudo chown "$(id -u):$(id -g)" "${_rt}"
+chmod 700 "${_rt}"
+
 # Copy the resolved npmrc that spawn-workspace.sh produced. It already has
 # macOS paths stripped and any forwarded token placeholders substituted with
 # values from the spawn shell, so npm in the container can auth against
