@@ -1,5 +1,12 @@
 # Known issue: Container startet nicht — fehlender Memory-Bind-Mount
 
+> **Status:** teilweise behoben. `spawn-workspace.sh` und `spawn-workspace.ps1`
+> legen jetzt eine `.keep`-Markerdatei im geteilten Memory-Ordner an, damit er
+> nicht als „leer" weggeräumt wird und über Restarts hinweg bestehen bleibt.
+> **Rest-Risiko:** wird der Ordner komplett gelöscht (nicht nur als leer
+> geprunt), scheitert der bloße Restart weiterhin — der Sofort-Workaround unten
+> gilt dann. Offen bleibt, **welcher Host-Prozess** die Ordner entfernt.
+
 ## Symptom
 
 - Ein zuvor funktionierender Story-Container **startet beim Reconnect nicht mehr**
