@@ -2230,7 +2230,13 @@ __NPM_NM_VOLUME_MOUNTS__
         // '${NEXUS_TOKEN_BASE64}') resolves inside the container regardless of
         // how the process that runs npm/mvn was launched.
         "XDG_RUNTIME_DIR": "/run/user/1000",
-        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"__CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        // Auto-approve GitHub Copilot CLI tool calls, mirroring Claude Code's
+        // permissions.defaultMode=bypassPermissions above (see .claude/settings.local.json
+        // written further up): the container is a sandbox and all tool calls go through
+        // it, so skipping the interactive confirmation prompt here doesn't loosen
+        // anything on the host. Equivalent to always passing --allow-all-tools.
+        "COPILOT_ALLOW_ALL": "true"__CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
     },
 
     // remoteEnv has higher precedence than containerEnv (and any feature's
@@ -3148,9 +3154,28 @@ _runtime_dir="${XDG_RUNTIME_DIR:-/run/user/1000}"
 sudo mkdir -p "${_runtime_dir}"
 sudo chown "$(id -u):$(id -g)" "${_runtime_dir}"
 chmod 700 "${_runtime_dir}"
-if [[ -S "${_runtime_dir}/bus" ]]; then
+# /run/user/1000 is NOT guaranteed to be a fresh tmpfs on every container start
+# (it can be a plain directory on the container's writable layer), so a `docker
+# stop`/`start` cycle can kill the dbus-daemon process while leaving its unix
+# socket special file behind. A bare `-S` test only checks "is this a socket
+# file", not "is anything listening on it", so it was mistaking that stale file
+# for a live bus and skipping the daemon restart -- leaving gnome-keyring (and
+# therefore the GitHub Copilot CLI's Secret Service backend) permanently
+# unreachable until the container was rebuilt from scratch. Probe the bus with
+# a real D-Bus call and only trust it if that call actually succeeds.
+_bus_alive=false
+if [[ -S "${_runtime_dir}/bus" ]] && command -v dbus-send >/dev/null 2>&1 \
+   && DBUS_SESSION_BUS_ADDRESS="unix:path=${_runtime_dir}/bus" dbus-send --session \
+        --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    _bus_alive=true
+fi
+if $_bus_alive; then
     echo "D-Bus session bus already listening at ${_runtime_dir}/bus"
 else
+    # Remove a stale/dead socket file before rebinding, otherwise dbus-daemon
+    # fails with "Address already in use" instead of starting a fresh bus.
+    rm -f "${_runtime_dir}/bus"
     if command -v dbus-daemon >/dev/null 2>&1; then
         nohup dbus-daemon --session --address="unix:path=${_runtime_dir}/bus" --nofork \
                     >/tmp/dbus-session.log 2>&1 &
