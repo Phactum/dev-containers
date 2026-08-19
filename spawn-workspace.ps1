@@ -2033,10 +2033,17 @@ fi
 # (x86-only) Chrome download and the CLI uses the system chromium via
 # PUPPETEER_EXECUTABLE_PATH at render time.
 #
-# Left fatal (unlike Claude Code/Copilot CLI above): this one IS a functional
-# dependency of the project's own tooling. If it 403s with MediaTypeBlocked,
-# see the registry= hint two blocks up -- same root cause, same fix.
-bash -lc "npm install -g bpmn-to-image"
+# Non-fatal (like Claude Code/Copilot CLI above): this IS a functional
+# dependency of the project's own tooling, so the WARN is louder -- but a
+# registry hiccup here must not abort the whole post-create and take the mvn/
+# claude symlinks, the copilot chown and the Maven warmup down with it. If it
+# 403s with MediaTypeBlocked, see the registry= hint two blocks up -- same root
+# cause, same fix -- then re-run `npm install -g bpmn-to-image` in the container.
+if ! bash -lc "npm install -g bpmn-to-image"; then
+    echo "WARN: bpmn-to-image install failed -- see the npm error above. This is a" >&2
+    echo "      functional dependency: BPMN diagram rendering will not work until it" >&2
+    echo "      is installed. Same registry= hint as the Claude Code warning applies." >&2
+fi
 # __CHROMIUM_BLOCK_END__
 
 # named volume for per-story Claude project state is owned by root after first mount
