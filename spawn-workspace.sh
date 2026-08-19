@@ -1206,7 +1206,7 @@ cat > "${WS_DIR}/.idea/workspace.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
     <component name="TerminalProjectOptionsProvider">
-        <option name="myStartingDirectory" value="$PROJECT_DIR$" />
+        <option name="myStartingDirectory" value="$PROJECT_DIR$" />__TERMINAL_SHELL_OPTION__
     </component>
     <!-- "Actions on Save" toggles (FormatOnSaveOptions, OptimizeOnSaveOptions)
          are intentionally NOT seeded. Spawned workspaces serve developers
@@ -1219,6 +1219,18 @@ cat > "${WS_DIR}/.idea/workspace.xml" <<'XML'
          choices. -->
 </project>
 XML
+
+# Optionally pin the terminal's login shell. Without myShellPath JetBrains
+# auto-detects one and prefers zsh when present (the base image ships oh-my-zsh
+# via common-utils) even though vscode's login shell is /bin/bash. When
+# terminalShell is set we splice a second <option> onto the same line as
+# myStartingDirectory above; the value carries its own leading newline + indent,
+# so an unset terminalShell leaves that line byte-identical to before.
+TERMINAL_SHELL_OPTION=""
+if [[ -n "${TERMINAL_SHELL:-}" ]]; then
+    TERMINAL_SHELL_OPTION=$'\n        <option name="myShellPath" value="'"${TERMINAL_SHELL}"'" />'
+fi
+splice_placeholder "${WS_DIR}/.idea/workspace.xml" "__TERMINAL_SHELL_OPTION__" "${TERMINAL_SHELL_OPTION}"
 
 # Give IntelliJ a distinctive project name even though every story container mounts
 # the workspace at the same ${WORKSPACE_PATH} path (we keep that path constant

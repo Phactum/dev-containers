@@ -17,7 +17,7 @@
 # Variables set by this file:
 #   PROJECT_NAME PROJECT_SHORT BASE_IMAGE NODE_FEATURE_VERSION
 #   DISTRO JAVA_VERSION MAVEN_VERSION
-#   GLAB_VERSION GLAB_HOSTNAME GH_VERSION PORT_OFFSET_STEP
+#   GLAB_VERSION GLAB_HOSTNAME GH_VERSION PORT_OFFSET_STEP TERMINAL_SHELL
 #   REPOS[]              "<name>:<baseRef>"
 #   HOST_PORTS[]         port numbers
 #   PORT_LABELS[]        "<port>:<label>"
@@ -87,6 +87,7 @@ GLAB_VERSION="$(_env_scalar '.glabVersion')"
 GLAB_HOSTNAME="$(_env_scalar '.glabHostname')"
 GH_VERSION="$(_env_scalar '.ghVersion')"
 PORT_OFFSET_STEP="$(_env_scalar '.portOffsetStep // 10000')"
+TERMINAL_SHELL="$(_env_scalar '.terminalShell')"
 WORKSPACES_ROOT_CONFIG="$(_env_scalar '.workspacesRoot')"
 
 # Corporate proxy / TLS interception. All optional; empty means "not behind a
