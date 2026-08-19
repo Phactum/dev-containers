@@ -895,8 +895,14 @@ splice_placeholder() {
             print
         }
     ' "${file}" > "${tmp}"
-    mv "${tmp}" "${file}"
-    rm -f "${vf}"
+    # Truncate-and-rewrite the ORIGINAL file rather than `mv`ing the mktemp over
+    # it: mv would rename the mktemp's inode into place, and mktemp files are
+    # mode 0600 with no exec bit -- silently stripping the +x that was already
+    # set on post-create.sh (invoked directly as a lifecycle command, so a
+    # missing exec bit fails it with exit 126). Redirecting into "${file}" keeps
+    # its permissions untouched.
+    cat "${tmp}" > "${file}"
+    rm -f "${vf}" "${tmp}"
 }
 
 # Resolve a base ref against the *current* repo: prefer origin/<ref>, fall back to <ref>.
