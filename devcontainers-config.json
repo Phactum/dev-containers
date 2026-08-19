@@ -90,25 +90,27 @@
 
     // --- Warmup builds ------------------------------------------------------
 
-    // Build steps run by post-create.sh, in dependency order. Two mutually
-    // exclusive styles; define AT MOST ONE of "mavenBuilds" / "builds":
+    // Build steps run by post-create.sh, in dependency order. One "builds" list;
+    // each entry sets EXACTLY ONE of "mvn-goal" or "command" (setting both or
+    // neither is a hard error):
     //
-    //   "mavenBuilds": [{ "repo": "<repo>", "goal": "<mvn-goal>" }]
-    //        <goal> runs as `mvn ${MVN_FLAGS} <goal>` inside <repo>.
-    //        A goal starting with "$" is instead a raw bash command
-    //        (everything after the "$"), run verbatim inside <repo>.
-    //        Common goals: "install" (produces a jar into ~/.m2 for downstream
-    //                                 modules),
-    //                      "compile" (resolves deps + compiles, no jar needed).
+    //   { "repo": "<repo>", "mvn-goal": "<goal>" }
+    //        runs as `mvn ${MVN_FLAGS} <goal>` inside <repo>, so the warmup build
+    //        inherits -ntp / skipTests / spotless-skip. Common goals: "install"
+    //        (produces a jar into ~/.m2 for downstream modules), "compile"
+    //        (resolves deps + compiles, no jar needed). Extra flags/profiles are
+    //        fine, e.g. "compile -Pcamunda7" or "install -P unpublish-npm".
     //
-    //   "builds":      [{ "repo": "<repo>", "command": "<raw bash command>" }]
-    //        <command> is ALWAYS run verbatim inside <repo>. No mvn/MVN_FLAGS
-    //        injection -- Maven users spell out "mvn ..." themselves.
+    //   { "repo": "<repo>", "command": "<raw bash command>" }
+    //        run verbatim inside <repo>. No mvn/MVN_FLAGS injection -- for
+    //        non-Maven steps (a script) or a repo with several sub-dir poms,
+    //        e.g. "cd a && mvn install && cd ../b && mvn install".
     //
-    // Mono-repo default: if neither is defined and a pom.xml exists at the repo
-    // root, the project is built as a single Maven reactor ("install").
-    "mavenBuilds": [
-        { "repo": "cluster-test-process", "goal": "compile" }
+    // An explicit empty "builds": [] disables all warmup builds. Mono-repo
+    // default: if the "builds" key is omitted entirely and a pom.xml exists at
+    // the repo root, the project is built as a single Maven reactor ("install").
+    "builds": [
+        { "repo": "cluster-test-process", "mvn-goal": "compile" }
     ],
 
     // --- Host ports + labels ------------------------------------------------

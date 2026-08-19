@@ -45,7 +45,7 @@
 #    by Maven, producing "parent.relativePath ... points at <agg>" errors on
 #    every sync. We list each subproject's pom in MavenProjectsManager.original
 #    Files (.idea/misc.xml) so IntelliJ imports each as a top-level project.
-#    post-create.sh builds each repo in dependency order (BUILDS / MAVEN_BUILDS
+#    post-create.sh builds each repo in dependency order (the "builds" list
 #    in devcontainers-config.json).
 #
 # 4a. Optional initialization hook (initialize.sh)
@@ -202,7 +202,7 @@
 #     root:root, so npm running as vscode would otherwise die with EACCES on
 #     'mkdir node_modules/@types' -- see the node_modules volume mounts in
 #     feature 6a / NPM_NM_VOLUME_MOUNTS), then resolves the Maven reactor in
-#     dependency order (BUILDS / MAVEN_BUILDS). Tests (unit/integration/E2E)
+#     dependency order (the "builds" list). Tests (unit/integration/E2E)
 #       are not part of the warmup -- run them on demand from the IDE.
 #     "waitFor": "postCreateCommand" makes IntelliJ block on this completing
 #     before opening the project window, so the IDE's first index pass sees
@@ -552,41 +552,21 @@ if (( ${#REPOS[@]} == 0 )); then
     REPO_NAMES=("${PROJECT_NAME}")
 fi
 
-# Build-command config -- two mutually exclusive styles are accepted; the first
-# one that is *defined* wins (checked with `declare -p`, so an explicit empty
-# array still selects its style):
-#   MAVEN_BUILDS (legacy) : "<repo>:<mvn-goal>" -- value is an mvn goal, run as
-#                           `mvn ${MVN_FLAGS} <goal>`. A value starting with '$'
-#                           is instead a raw bash command (everything after '$').
-#                           This is the original MAVEN_REPOS behaviour; the old
-#                           MAVEN_REPOS name is still honoured as an alias.
-#   BUILDS       (raw)    : "<repo>:<command>" -- value is ALWAYS a raw bash
-#                           command run verbatim inside <repo>. No mvn/MVN_FLAGS
-#                           injection and no '$' prefix; Maven users spell out
-#                           "mvn ..." themselves.
-# Everything downstream iterates the normalised BUILD_ENTRIES using BUILD_MODE
-# ("maven" or "raw") to pick the per-entry interpretation. Length-guard every
-# array read: bash 3.2 + set -u choke on empty-array expansion.
+# Build-command config -- a single "builds" list; env-config.sh normalises each
+# entry to "<repo>:<type>:<value>" with type = mvn (run as
+# `mvn ${MVN_FLAGS} <value>`) or cmd (run verbatim inside <repo>). The value may
+# contain ':' (e.g. a URL), so only the repo and the type are split off at the
+# use site below. Length-guard every array read: bash 3.2 + set -u choke on
+# empty-array expansion.
 BUILD_ENTRIES=()
-BUILD_MODE=""
-if declare -p MAVEN_BUILDS >/dev/null 2>&1; then
-    BUILD_MODE="maven"
-    (( ${#MAVEN_BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${MAVEN_BUILDS[@]}")
-elif declare -p MAVEN_REPOS >/dev/null 2>&1; then
-    BUILD_MODE="maven"
-    (( ${#MAVEN_REPOS[@]} > 0 )) && BUILD_ENTRIES=("${MAVEN_REPOS[@]}")
-elif declare -p BUILDS >/dev/null 2>&1; then
-    BUILD_MODE="raw"
-    (( ${#BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${BUILDS[@]}")
-fi
+(( ${#BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${BUILDS[@]}")
 
-# Mono-repo default: when no build list is configured and a pom.xml exists at
-# the repo root, build the project as a single Maven reactor.
-if (( MONO_REPO == 1 )) && (( ${#BUILD_ENTRIES[@]} == 0 )); then
-    if [[ -f "${SOURCE_WS}/pom.xml" ]]; then
-        BUILD_ENTRIES=("${PROJECT_NAME}:install")
-        BUILD_MODE="maven"
-    fi
+# Mono-repo default: when the "builds" key is absent entirely (BUILDS_DEFINED=0,
+# NOT merely an empty list) and a pom.xml exists at the repo root, build the
+# project as a single Maven reactor. An explicit "builds": [] disables warmup
+# builds instead.
+if (( MONO_REPO == 1 )) && (( BUILDS_DEFINED == 0 )) && [[ -f "${SOURCE_WS}/pom.xml" ]]; then
+    BUILD_ENTRIES=("${PROJECT_NAME}:mvn:install")
 fi
 
 # Resolve the workspaces root. Priority (see resolve_workspaces_root in
@@ -1254,27 +1234,20 @@ MAVEN_BUILD_COMMANDS=""
 if (( ${#BUILD_ENTRIES[@]} > 0 )); then
     for entry in "${BUILD_ENTRIES[@]}"; do
         r="${entry%%:*}"
-        cmd="${entry#*:}"
+        rest="${entry#*:}"
+        btype="${rest%%:*}"
+        val="${rest#*:}"
         [[ -f "${WS_DIR}/${r}/pom.xml" ]] && \
             MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
-        if [[ "${BUILD_MODE}" == "raw" ]]; then
-            # BUILDS style: the value is always a raw bash command, run verbatim
-            # inside the repo dir. No mvn/MVN_FLAGS wrapping -- Maven users write
-            # "mvn ..." themselves.
-            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${cmd})"$'\n'
-        elif [[ "${cmd}" == '$'* ]]; then
-            # MAVEN_BUILDS style, raw-command form: a value starting with '$' is
-            # not a Maven goal but an arbitrary bash command run verbatim inside
-            # the repo dir (for repos with no parent pom but several sub-dir
-            # poms, e.g. "repo:$ cd a; mvn install; cd ../b; mvn install").
-            # Everything after the leading '$' (whitespace trimmed) runs as-is --
-            # MVN_FLAGS is NOT injected, the value spells out its own mvn calls.
-            raw="${cmd#\$}"
-            raw="${raw#"${raw%%[![:space:]]*}"}"   # trim leading whitespace
-            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${raw})"$'\n'
+        if [[ "${btype}" == "cmd" ]]; then
+            # "command" entry: raw bash, run verbatim inside <repo>. No
+            # mvn/MVN_FLAGS wrapping -- it spells out its own mvn calls / scripts
+            # (e.g. a repo with several sub-dir poms, or a non-Maven build step).
+            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && ${val})"$'\n'
         else
-            # MAVEN_BUILDS style, mvn-goal form: inject `mvn ${MVN_FLAGS}`.
-            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${cmd})"$'\n'
+            # "mvn-goal" entry: inject `mvn ${MVN_FLAGS}` so the warmup build
+            # picks up -ntp / skipTests / spotless-skip.
+            MAVEN_BUILD_COMMANDS+="[[ -d ${r} ]] && (cd ${r} && mvn \${MVN_FLAGS} ${val})"$'\n'
         fi
     done
 fi
@@ -2930,7 +2903,7 @@ if [[ -f .devcontainer/initialize.sh ]]; then
     bash .devcontainer/initialize.sh
 fi
 
-# Resolve build dependencies in order (BUILDS / MAVEN_BUILDS in devcontainers-config.json).
+# Resolve build dependencies in order (the "builds" list in devcontainers-config.json).
 # Tests are skipped across the board so post-create stays fast -- the IDE just
 # needs the reactor resolved; run tests on demand.
 #

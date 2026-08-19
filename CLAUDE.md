@@ -190,9 +190,9 @@ so a `//` inside a string value (a URL) survives. Trailing comments after a
 value are NOT supported.
 
 Optional settings are disabled by **omitting the key** (or setting it to `null`
-/ `""`). `mavenBuilds` and `builds` are mutually exclusive and the *presence* of
-the key â€” not its content â€” selects the build mode, so an explicit `[]` still
-selects that style and disables all warmup builds.
+/ `""`). The warmup `builds` list keys off *presence*: an explicit `[]` disables
+all warmup builds, while omitting the key entirely lets the mono-repo auto-build
+kick in. Each `builds` entry must set exactly one of `mvn-goal` / `command`.
 
 When adding a setting: extend `devcontainers-config.json` (with a comment), map it in
 `env-config.sh` **and** `EnvConfig.ps1`, then read it in both spawn scripts.
@@ -212,13 +212,14 @@ When adding a setting: extend `devcontainers-config.json` (with a comment), map 
   changing behavior, and update it when you change the behavior it describes.
 
 - **Bash 3.2 compatibility.** macOS ships bash 3.2, which the spawn script must
-  run under. No associative arrays: `repos`, `builds` and `mavenBuilds` arrive
-  from `env-config.sh` as plain arrays of `"<key>:<value>"` strings, split on
-  `:` at use sites. Keep that style for any new map-like config. Guard every
-  array read with a length check before expanding (`(( ${#arr[@]} > 0 ))`) â€”
-  bash 3.2 + `set -u` error on empty `"${arr[@]}"`. To detect whether a config
-  var is defined at all, use `declare -p NAME >/dev/null 2>&1` (as the
-  `builds`/`mavenBuilds` selection does).
+  run under. No associative arrays: `repos` and `builds` arrive from
+  `env-config.sh` as plain arrays of `":"`-joined strings (`builds` as
+  `"<repo>:<type>:<value>"`, type `mvn`|`cmd`), split at use sites. Because the
+  value may contain `:` (a URL), split off only the leading fields, not with a
+  greedy split. Keep that style for any new map-like config. Guard every array
+  read with a length check before expanding (`(( ${#arr[@]} > 0 ))`) â€” bash 3.2
+  + `set -u` error on empty `"${arr[@]}"`. To detect whether a config var is
+  defined at all, use `declare -p NAME >/dev/null 2>&1`.
 
 - **`set -euo pipefail`** is active in both Bash scripts. Guard optional vars
   with `${VAR:-}` and unset-array reads accordingly.
@@ -336,19 +337,20 @@ function names in `PascalCase-Verb` form, so the two read side by side:
 - **No aggregator `pom.xml`** is written at the workspace root (it would be
   falsely picked up as a Maven parent). Each subproject pom is registered
   individually in `.idea/misc.xml`; `post-create.sh` builds them in the
-  dependency order given by the build list (`builds` / `mavenBuilds`).
-- **Build-list config: `builds` vs `mavenBuilds`.** Whichever key is *present*
-  in `devcontainers-config.json` wins (`mavenBuilds` > `builds`); `env-config.sh` declares only
-  that one so the Bash `declare -p` probe picks the intended mode, and
-  `EnvConfig.ps1` sets `BuildMode` accordingly. Both normalise into
-  `BUILD_ENTRIES` / `$BuildEntries` + a mode flag that the generation loop reads:
-  - raw mode (`builds`): the value is ALWAYS a raw bash command run
-    verbatim as `cd <repo> && <command>` â€” no `mvn`/`MVN_FLAGS` injection, no `$`.
-  - maven mode (`mavenBuilds`): the value is an `mvn`
-    goal run as `cd <repo> && mvn ${MVN_FLAGS} <goal>`; a `$`-prefixed goal is
-    instead a raw command (remainder after `$`, whitespace trimmed).
+  dependency order given by the `builds` list.
+- **Build-list config: per-entry `mvn-goal` XOR `command`.** One `builds` list;
+  each entry sets exactly one of the two (both/neither is a hard error raised in
+  `env-config.sh` / `EnvConfig.ps1`). `env-config.sh` normalises to
+  `BUILDS[]="<repo>:<type>:<value>"` (`type` = `mvn`|`cmd`) plus a
+  `BUILDS_DEFINED` flag; `EnvConfig.ps1` builds `$cfg.Builds` of
+  `@{Repo;Type;Value}` plus `$cfg.BuildsDefined`. The generation loop switches on
+  the per-entry type:
+  - `command` (type `cmd`): run verbatim as `cd <repo> && <value>` â€” no
+    `mvn`/`MVN_FLAGS` injection (non-Maven steps, multi-pom shell compounds).
+  - `mvn-goal` (type `mvn`): run as `cd <repo> && mvn ${MVN_FLAGS} <value>`.
+  The value may contain `:` (a URL), so split off only `<repo>` and `<type>`.
   Repos with no root `pom.xml` contribute nothing to `MAVEN_POMS_LIST` /
-  IntelliJ's import list regardless of mode.
+  IntelliJ's import list regardless of type.
 - **node_modules on named volumes.** Each npm module's `node_modules` is
   mounted as a Docker named volume (`NPM_NM_VOLUME_MOUNTS` / `$NpmVolumeMounts`)
   to bypass the slow hostâ†”VM bind-mount bridge.
@@ -356,9 +358,9 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   mount-point to `vscode` before any npm/Maven step â€” otherwise npm dies with
   `EACCES â€¦ mkdir node_modules/@types`. Keep that chown in sync with the
   module-discovery `find` if you touch either.
-- **Mono-repo mode:** `"repos": []` switches spawn to single-worktree mode; if no
-  build list is configured too and a root `pom.xml` exists it auto-populates a
-  single `install` Maven build in maven mode.
+- **Mono-repo mode:** `"repos": []` switches spawn to single-worktree mode; if
+  the `builds` key is omitted entirely (not merely `[]`) and a root `pom.xml`
+  exists it auto-populates a single `install` `mvn-goal` build.
 - **Host-mount repos (empty base ref).** A `repos` entry with an empty `baseRef`
   is not a git repo: the worktree loop skips worktree creation, collects it into
   `HOST_MOUNT_REPOS` / `$HostMountRepos`, and emits a bind mount

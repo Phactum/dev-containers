@@ -23,8 +23,8 @@
         HostPorts         [ @{ Port; Label } ]
         RunConfigs        [ string ]
         ForwardedEnvVars  [ string ]
-        BuildMode         'maven' | 'raw' | ''
-        Builds            [ @{ Repo; Value } ]
+        Builds            [ @{ Repo; Type; Value } ]   Type = 'mvn' | 'cmd'
+        BuildsDefined     bool -- whether the "builds" key was present
         MonoRepo          $true when Repos is empty
         WorkspacesRoot    '' unless the project pins one
         Path              the resolved config path
@@ -236,8 +236,8 @@ function Get-DevContainerConfig {
         HostPorts          = @()
         RunConfigs         = @()
         ForwardedEnvVars   = @()
-        BuildMode          = ''
         Builds             = @()
+        BuildsDefined      = $false
         MonoRepo           = $false
     }
 
@@ -289,21 +289,25 @@ function Get-DevContainerConfig {
         $cfg.ForwardedEnvVars = @($json.forwardedEnvVars | ForEach-Object { [string]$_ })
     }
 
-    # Build list: "mavenBuilds" and "builds" are mutually exclusive. Presence of
-    # the key -- not its content -- selects the mode, so an explicit empty list
-    # selects the style and disables all warmup builds (same as the Bash side).
-    if (& $has 'mavenBuilds') {
-        $cfg.BuildMode = 'maven'
-        if ($null -ne $json.mavenBuilds) {
-            $cfg.Builds = @(foreach ($b in $json.mavenBuilds) {
-                [pscustomobject]@{ Repo = [string]$b.repo; Value = [string]$b.goal }
-            })
-        }
-    } elseif (& $has 'builds') {
-        $cfg.BuildMode = 'raw'
+    # Build list: a single "builds" array whose entries each carry exactly one of
+    # "mvn-goal" (Type=mvn, run as `mvn ${MVN_FLAGS} <goal>`) or "command"
+    # (Type=cmd, run verbatim). BuildsDefined records whether the key was present,
+    # so an explicit "builds": [] disables warmup builds without triggering the
+    # mono-repo auto-build (same as the Bash side).
+    if (& $has 'builds') {
+        $cfg.BuildsDefined = $true
         if ($null -ne $json.builds) {
             $cfg.Builds = @(foreach ($b in $json.builds) {
-                [pscustomobject]@{ Repo = [string]$b.repo; Value = [string]$b.command }
+                $hasGoal = ($b.PSObject.Properties.Name -contains 'mvn-goal') -and ($null -ne $b.'mvn-goal')
+                $hasCmd  = ($b.PSObject.Properties.Name -contains 'command')  -and ($null -ne $b.command)
+                if ($hasGoal -eq $hasCmd) {
+                    throw "Invalid 'builds' entry in $($cfg.Path) (repo=$($b.repo)): set exactly one of 'mvn-goal' / 'command'"
+                }
+                if ($hasGoal) {
+                    [pscustomobject]@{ Repo = [string]$b.repo; Type = 'mvn'; Value = [string]$b.'mvn-goal' }
+                } else {
+                    [pscustomobject]@{ Repo = [string]$b.repo; Type = 'cmd'; Value = [string]$b.command }
+                }
             })
         }
     }
