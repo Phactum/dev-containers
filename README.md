@@ -30,7 +30,7 @@ Each story gets:
 | `Common.ps1`              | Shared helper functions for the PowerShell scripts               |
 | `devcontainers-config.json`             | **Per project, not part of this clone** → see "Per-project files" |
 | `README.md.tpl`           | Default template for the welcome README placed at each new workspace root |
-| `initialize.sh`           | Optional default hook run before the Maven warmup builds         |
+| `initialize.sh`           | Optional per-project hook run before the Maven warmup builds (opt-in; this clone ships none — add one to a project's `dev-containers/`) |
 | `runConfigurations/*.xml` | Default IntelliJ run configs copied into each new workspace      |
 | `claude/statusline.sh`    | Optional Claude Code statusline (usage limits + Caveman badge); copy to `~/.claude/` → see below |
 
@@ -497,10 +497,12 @@ those too.
 
 ### Optional initialization hook
 
-If an `initialize.sh` exists next to `devcontainers-config.json` (or, as a fallback, in this
-clone), the spawn scripts copy it into the new workspace's `.devcontainer/` and
-`post-create.sh` runs it **before** the Maven warmup builds, with the workspace
-root as the working directory.
+If an `initialize.sh` exists in the project's `dev-containers/` (next to
+`devcontainers-config.json`), the spawn scripts copy it into the new workspace's
+`.devcontainer/` and `post-create.sh` runs it **before** the Maven warmup
+builds, with the workspace root as the working directory. The hook is
+project-specific, so this clone deliberately ships none (and `.gitignore`s it) →
+a hook committed here would leak into every project that lacks its own.
 
 Use it for one-time setup that must precede Maven dependency resolution →
 for example starting a Docker service that hosts an artifact proxy, seeding a

@@ -1,2 +1,7 @@
 .idea
 *.iml
+
+# initialize.sh is a per-project, opt-in hook. This clone must NOT ship one:
+# it lives in SCRIPT_DIR and would become the config_asset fallback for every
+# project that lacks its own, leaking one project's setup into all others.
+/initialize.sh
