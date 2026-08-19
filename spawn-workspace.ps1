@@ -1018,7 +1018,7 @@ $SharedMemoryDir = Join-Path $HomeDir ".claude\projects\$SharedMemoryKey\memory"
 foreach ($d in (Join-Path $HomeDir '.m2'), (Join-Path $HomeDir '.ssh'),
                 (Join-Path $HomeDir '.claude'), $SharedMemoryDir,
                 (Join-Path $HomeDir '.copilot\skills'), (Join-Path $HomeDir '.copilot\instructions'),
-                (Join-Path $HomeDir '.copilot\prompts')) {
+                (Join-Path $HomeDir '.copilot\prompts'), (Join-Path $HomeDir '.dind-docker')) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
 }
 $ClaudeJson = Join-Path $HomeDir '.claude.json'
@@ -1752,6 +1752,16 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
 
         "source=__HOME_HOST__/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=__HOME_HOST__/.m2,target=/home/vscode/.m2,type=bind",
+        // Nested dockerd's OWN registry credential store (~/.docker/config.json
+        // inside the container), NOT the host's Docker Desktop config -- those
+        // are two entirely separate daemons with separate logins (Docker
+        // Desktop's own creds live in the Windows Credential Manager anyway and
+        // aren't readable from Linux). Bind-mounted (rw, host-wide, like .m2
+        // above) into a dedicated host folder so a 'docker login' run once
+        // inside any container's nested dockerd (e.g. for the internal Nexus
+        // registry) persists across that container's rebuilds and is
+        // immediately available to every other story container too.
+        "source=__HOME_HOST__/.dind-docker,target=/home/vscode/.docker,type=bind",
         // __RPM_BLOCK_START__
         // Docker's own storage tree on a named volume, one per container -- the
         // same thing the docker-in-docker feature declares on the Debian path.

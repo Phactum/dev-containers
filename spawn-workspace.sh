@@ -1383,6 +1383,11 @@ mkdir -p "${SHARED_MEMORY_DIR}"
 # prompts get shared (see the mounts block below for the full rationale).
 mkdir -p "${HOME}/.copilot/skills" "${HOME}/.copilot/instructions" "${HOME}/.copilot/prompts"
 
+# Nested dockerd's OWN registry credential store, kept in a dedicated host
+# folder (see the mounts block below for the full rationale) so a 'docker
+# login' inside any container's nested dockerd persists across rebuilds.
+mkdir -p "${HOME}/.dind-docker"
+
 # Resolve the host's glab config directory. glab is written in Go and uses
 # os.UserConfigDir(), which returns DIFFERENT paths per OS:
 #   - darwin: ~/Library/Application Support/glab-cli
@@ -2140,6 +2145,16 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
 
         "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.m2,target=/home/vscode/.m2,type=bind",
+        // Nested dockerd's OWN registry credential store (~/.docker/config.json
+        // inside the container), NOT the host's Docker Desktop config -- those
+        // are two entirely separate daemons with separate logins (Docker
+        // Desktop's own creds may live in an OS keychain anyway and aren't
+        // readable from inside the container). Bind-mounted (rw, host-wide,
+        // like .m2 above) into a dedicated host folder so a 'docker login' run
+        // once inside any container's nested dockerd (e.g. for the internal
+        // Nexus registry) persists across that container's rebuilds and is
+        // immediately available to every other story container too.
+        "source=${localEnv:HOME}/.dind-docker,target=/home/vscode/.docker,type=bind",
         // __RPM_BLOCK_START__
         // Docker's own storage tree on a named volume, one per container -- the
         // same thing the docker-in-docker feature declares on the Debian path.
