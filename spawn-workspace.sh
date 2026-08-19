@@ -1349,8 +1349,14 @@ fi
 
 # Ensure the shared memory directory exists on the host before the container mounts it.
 # All story containers use ${WORKSPACE_PATH}, encoded by Claude Code as ${MEMORY_KEY}.
+# The .keep marker keeps the directory from being pruned as "empty" between
+# sessions: it is the source of a devcontainer.json bind mount, and a bare
+# `docker start` (unlike create/rebuild) neither reruns initializeCommand's
+# mkdir nor auto-creates a missing bind source -- so a vanished dir makes the
+# container fail to start (see KNOWN-ISSUE-container-start-memory-mount.md).
 SHARED_MEMORY_DIR="${HOME}/.claude/projects/${MEMORY_KEY}/memory"
 mkdir -p "${SHARED_MEMORY_DIR}"
+[[ -e "${SHARED_MEMORY_DIR}/.keep" ]] || touch "${SHARED_MEMORY_DIR}/.keep"
 
 # Same idea for the GitHub Copilot CLI's ~/.copilot -- only skills/instructions/
 # prompts get shared (see the mounts block below for the full rationale).

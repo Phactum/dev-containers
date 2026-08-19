@@ -1016,6 +1016,13 @@ foreach ($d in (Join-Path $HomeDir '.m2'), (Join-Path $HomeDir '.ssh'),
                 (Join-Path $HomeDir '.copilot\prompts'), (Join-Path $HomeDir '.dind-docker')) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
 }
+# The .keep marker keeps the shared memory directory from being pruned as
+# "empty" between sessions: it is the source of a devcontainer.json bind mount,
+# and a bare restart (unlike create/rebuild) neither reruns the mkdir nor
+# auto-creates a missing bind source -- so a vanished dir makes the container
+# fail to start (see KNOWN-ISSUE-container-start-memory-mount.md).
+$MemoryKeep = Join-Path $SharedMemoryDir '.keep'
+if (-not (Test-Path -LiteralPath $MemoryKeep)) { New-Item -ItemType File -Path $MemoryKeep -Force | Out-Null }
 $ClaudeJson = Join-Path $HomeDir '.claude.json'
 if (-not (Test-Path -LiteralPath $ClaudeJson)) { New-Item -ItemType File -Path $ClaudeJson -Force | Out-Null }
 
