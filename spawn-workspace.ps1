@@ -897,6 +897,12 @@ New-Item -ItemType Directory -Path (Join-Path $WsDir '.idea') -Force | Out-Null
 # terminalShell is set we splice a second <option> onto the same line as
 # myStartingDirectory; the value carries its own leading newline + indent, so an
 # unset terminalShell leaves that line byte-identical to before.
+# NOTE: this XML option is necessary but NOT sufficient -- Gateway does not
+# apply it reliably (two workspaces with an identical workspace.xml were seen to
+# diverge, one bash one zsh). The same terminalShell value is therefore ALSO
+# emitted as the SHELL env var in devcontainer.json's remoteEnv/containerEnv
+# (search __SHELL_REMOTE_ENV__), which is JetBrains' next detection fallback and
+# makes the shell choice deterministic. Keep the two in sync.
 $TerminalShellOption = ''
 if (-not [string]::IsNullOrWhiteSpace($cfg.TerminalShell)) {
     $TerminalShellOption = "`n        <option name=""myShellPath"" value=""$($cfg.TerminalShell)"" />"
@@ -1883,7 +1889,7 @@ __NPM_NM_VOLUME_MOUNTS__
         // written further up): the container is a sandbox and all tool calls go through
         // it, so skipping the interactive confirmation prompt here doesn't loosen
         // anything on the host. Equivalent to always passing --allow-all-tools.
-        "COPILOT_ALLOW_ALL": "true"__CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
+        "COPILOT_ALLOW_ALL": "true"__SHELL_CONTAINER_ENV____CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
     },
 
     // remoteEnv has higher precedence than containerEnv (and any feature's
@@ -1900,7 +1906,7 @@ __NPM_NM_VOLUME_MOUNTS__
     //   These read from the env that LAUNCHED IntelliJ (or that ran
     //   spawn-workspace.ps1).
     "remoteEnv": {
-        "JAVA_HOME": "__JAVA_HOME__"__REMOTE_ENV_FORWARDED__
+        "JAVA_HOME": "__JAVA_HOME__"__SHELL_REMOTE_ENV____REMOTE_ENV_FORWARDED__
     },
 
     // Port labels for the JetBrains Services view. Keys are the container-side
@@ -2683,6 +2689,24 @@ foreach ($var in $cfg.ForwardedEnvVars) {
     $ContainerEnvForwarded += ", `"$var`": `"`${localEnv:$var}`""
 }
 
+# SHELL env snippet (leading comma + JSON key), gated on terminalShell. The
+# project-level myShellPath in .idea/workspace.xml is the documented control,
+# but Gateway does not honour it reliably (observed: two workspaces with a
+# byte-identical workspace.xml, one got bash and one got zsh) -- the terminal
+# then auto-detects and prefers zsh because oh-my-zsh ships /usr/bin/zsh. The
+# SHELL env var is JetBrains' next detection fallback, so setting it forces the
+# shell deterministically regardless of whether the XML option is applied.
+# Baked into BOTH remoteEnv (IntelliJ's terminal is a remote-daemon process and
+# reads remoteEnv first) and containerEnv (PID-1 baseline for exec sessions and
+# any launch path that bypasses remoteEnv). Empty when terminalShell is unset,
+# leaving the JSON byte-identical to before.
+$ShellRemoteEnv = ''
+$ShellContainerEnv = ''
+if (-not [string]::IsNullOrWhiteSpace($cfg.TerminalShell)) {
+    $ShellRemoteEnv = ", `"SHELL`": `"$($cfg.TerminalShell)`""
+    $ShellContainerEnv = ", `"SHELL`": `"$($cfg.TerminalShell)`""
+}
+
 # portsAttributes entries from the labelled host ports. Joined with commas; no
 # trailing comma (JSON forbids it).
 $PortsAttrs = (@($cfg.HostPorts | Where-Object { $_.Label } | ForEach-Object {
@@ -2714,6 +2738,8 @@ $Tokens = [ordered]@{
     '__GH_VERSION__'           = $cfg.GhVersion
     '__REMOTE_ENV_FORWARDED__' = $RemoteEnvForwarded
     '__CONTAINER_ENV_FORWARDED__' = $ContainerEnvForwarded
+    '__SHELL_REMOTE_ENV__'     = $ShellRemoteEnv
+    '__SHELL_CONTAINER_ENV__'  = $ShellContainerEnv
     '__PORTS_ATTRS__'          = $PortsAttrs
     '__GLAB_CONFIG_SRC__'      = (ConvertTo-DockerPath $GlabConfigSrc)
     '__GH_CONFIG_SRC__'        = (ConvertTo-DockerPath $GhConfigSrc)
