@@ -353,14 +353,25 @@ foreach ($repo in $RepoNames) {
 
     foreach ($path in $actual) {
         Write-Output "remove worktree: $repo (at $path)"
+        # git's own removal rm's the whole tree, so it hits the same mount-release
+        # race; fall back to the resilient remover. Neither may abort the loop --
+        # a stubborn repo must not strand the remaining ones as dangling worktrees.
         Invoke-Git -RepoDir $src -GitArgs @('worktree', 'remove', '--force', $path) -AllowFailure -Quiet | Out-Null
-        if ($script:LastGitExitCode -ne 0) { Remove-TreeForce -Path ($path -replace '/', '\') }
+        if ($script:LastGitExitCode -ne 0) {
+            if (-not (Remove-TreeForce -Path ($path -replace '/', '\') -AllowFailure)) {
+                Write-Err "  (warning: could not fully remove $path; remove it manually and rerun dispose)"
+            }
+        }
     }
     # Prune any remaining stale entries (e.g. directory already deleted on disk).
     Invoke-Git -RepoDir $src -GitArgs @('worktree', 'prune') -AllowFailure -Quiet | Out-Null
     # Belt-and-suspenders: remove the expected path if it still exists but wasn't
     # registered.
-    if (Test-Path -LiteralPath $wt) { Remove-TreeForce -Path $wt }
+    if (Test-Path -LiteralPath $wt) {
+        if (-not (Remove-TreeForce -Path $wt -AllowFailure)) {
+            Write-Err "  (warning: could not fully remove $wt; remove it manually and rerun dispose)"
+        }
+    }
 }
 
 # ============================================================================
@@ -390,8 +401,12 @@ if (Test-Path -LiteralPath $WsDir) {
         }
         Write-Err "Left $WsDir in place."
     } else {
-        Remove-TreeForce -Path $WsDir
-        Write-Output "removed: $WsDir"
+        if (Remove-TreeForce -Path $WsDir -AllowFailure) {
+            Write-Output "removed: $WsDir"
+        } else {
+            Write-Err "Left $WsDir in place: some entries could not be removed"
+            Write-Err '(mounts may still be releasing). Rerun dispose in a moment.'
+        }
     }
 }
 

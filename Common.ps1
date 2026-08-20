@@ -90,16 +90,37 @@ function Get-RelativePosixPath {
 
 # Recursive delete that copes with the read-only/hidden bits git sets inside
 # .git and with the odd locked handle, falling back to cmd's rd.
+#
+# Docker Desktop returns from `docker rm`/`docker volume rm` before its
+# file-sharing layer has actually released the per-module node_modules named
+# volumes bound INTO the workspace, so a delete can transiently fail with
+# access / "directory not empty" errors on those mount-points for a few seconds
+# even though the container and volumes are already gone. Retry a bounded number
+# of times before giving up. By default (spawn's callers) a final failure still
+# throws; pass -AllowFailure to get $true/$false back instead, so a caller in a
+# loop (dispose) can warn and continue rather than abort.
 function Remove-TreeForce {
-    param([Parameter(Mandatory = $true)][string] $Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    & cmd.exe /c "attrib -R -H -S `"$Path\*`" /S /D" 2>&1 | Out-Null
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-    } catch {
-        & cmd.exe /c "rd /s /q `"$Path`"" 2>&1 | Out-Null
-        if (Test-Path -LiteralPath $Path) { throw }
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [switch] $AllowFailure
+    )
+    $removed = $false
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $removed = $true
+    } else {
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            & cmd.exe /c "attrib -R -H -S `"$Path\*`" /S /D" 2>&1 | Out-Null
+            try {
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            } catch {
+                & cmd.exe /c "rd /s /q `"$Path`"" 2>&1 | Out-Null
+            }
+            if (-not (Test-Path -LiteralPath $Path)) { $removed = $true; break }
+            Start-Sleep -Seconds 2
+        }
     }
+    if (-not $removed -and -not $AllowFailure) { throw "Could not remove directory: $Path" }
+    if ($AllowFailure) { return $removed }
 }
 
 # Run a native executable and capture its output without letting PowerShell's

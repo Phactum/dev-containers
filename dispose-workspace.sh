@@ -285,6 +285,27 @@ if [[ ${#DIRTY[@]} -gt 0 ]]; then
     fi
 fi
 
+# Remove a directory that may briefly stay "busy" after Docker Desktop releases
+# its volume/bind mounts. `docker rm -f` and `docker volume rm` return before
+# the host file-sharing layer (virtiofs/gRPC-FUSE) has actually unmounted the
+# per-module node_modules named volumes bound INTO the workspace, so an
+# immediate rm -rf can fail with "Permission denied" / "Directory not empty" on
+# every .../node_modules for a few seconds -- even though the container and
+# volumes are already gone. Retry a bounded number of times (max ~12s),
+# stripping macOS 'deny delete' ACLs first. Returns 0 once the path is gone,
+# non-zero if it still exists after all attempts (caller reports, never aborts).
+remove_dir_resilient() {
+    local path="$1" attempt
+    [[ -e "${path}" ]] || return 0
+    for attempt in 1 2 3 4 5 6; do
+        chmod -RN "${path}" 2>/dev/null || true
+        rm -rf "${path}" 2>/dev/null || true
+        [[ -e "${path}" ]] || return 0
+        sleep 2
+    done
+    [[ ! -e "${path}" ]]
+}
+
 # 2. Remove the Docker container, its named volumes, and (by default) its
 # devcontainer image FIRST -- before any filesystem removal below.
 #
@@ -359,13 +380,22 @@ for repo in "${REPO_NAMES[@]}"; do
 
     if [[ -n "${actual_wt}" ]]; then
         echo "remove worktree: ${repo} (at ${actual_wt})"
-        git -C "${src}" worktree remove --force "${actual_wt}" 2>/dev/null \
-            || rm -rf "${actual_wt}"
+        # git's own removal rm's the whole tree, so it hits the same mount-release
+        # race; fall back to the resilient remover. Neither may abort the loop
+        # (set -e) -- a stubborn repo must not strand the remaining ones as
+        # dangling worktree registrations.
+        if ! git -C "${src}" worktree remove --force "${actual_wt}" 2>/dev/null; then
+            remove_dir_resilient "${actual_wt}" \
+                || echo "  (warning: could not fully remove ${actual_wt}; remove it manually and rerun dispose)" >&2
+        fi
     fi
     # Prune any remaining stale entries (e.g. directory already deleted on disk).
     git -C "${src}" worktree prune
     # Belt-and-suspenders: remove $wt if it still exists but wasn't registered.
-    [[ -e "${wt}" ]] && rm -rf "${wt}"
+    if [[ -e "${wt}" ]]; then
+        remove_dir_resilient "${wt}" \
+            || echo "  (warning: could not fully remove ${wt}; remove it manually and rerun dispose)" >&2
+    fi
 done
 
 # 4. Remove the workspace directory itself (devcontainer config, .idea, claude copy, …)
@@ -392,10 +422,14 @@ if [[ -d "${WS_DIR}" ]]; then
         echo "Left ${WS_DIR} in place." >&2
     else
         # macOS sometimes sets a 'deny delete' ACL on directories created through
-        # Docker Desktop or IntelliJ. Strip ACLs first so rm -rf is not blocked.
-        chmod -RN "${WS_DIR}" 2>/dev/null || true
-        rm -rf "${WS_DIR}"
-        echo "removed: ${WS_DIR}"
+        # Docker Desktop or IntelliJ, and the node_modules mount-points may still
+        # be settling (see remove_dir_resilient) -- strip ACLs + retry.
+        if remove_dir_resilient "${WS_DIR}"; then
+            echo "removed: ${WS_DIR}"
+        else
+            echo "Left ${WS_DIR} in place: some entries could not be removed" >&2
+            echo "(mounts may still be releasing). Rerun dispose in a moment." >&2
+        fi
     fi
 fi
 
