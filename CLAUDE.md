@@ -351,13 +351,23 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   The value may contain `:` (a URL), so split off only `<repo>` and `<type>`.
   Repos with no root `pom.xml` contribute nothing to `MAVEN_POMS_LIST` /
   IntelliJ's import list regardless of type.
-- **node_modules on named volumes.** Each npm module's `node_modules` is
-  mounted as a Docker named volume (`NPM_NM_VOLUME_MOUNTS` / `$NpmVolumeMounts`)
-  to bypass the slow hostâ†”VM bind-mount bridge.
-  Fresh named volumes are `root:root`, so `post-create.sh` must `chown` each
-  mount-point to `vscode` before any npm/Maven step â€” otherwise npm dies with
-  `EACCES â€¦ mkdir node_modules/@types`. Keep that chown in sync with the
-  module-discovery `find` if you touch either.
+- **node_modules AND Maven target/ on named volumes.** Each npm module's
+  `node_modules` (`NPM_NM_VOLUME_MOUNTS` / `$NpmVolumeMounts`, discovered from
+  every `package.json`) and each Maven module's `target/`
+  (`MVN_TARGET_VOLUME_MOUNTS` / `$MvnTargetVolumeMounts`, discovered from every
+  `pom.xml` outside `target/`/`.git`) are mounted as Docker named volumes to
+  bypass the slow hostâ†”VM bind-mount bridge â€” both are write-heavy dirs hit by
+  the same cold-bind-mount bottleneck. Volume names differ only by suffix (`-nm`
+  vs `-target`), so a dir that is both an npm and a Maven module gets two
+  non-colliding volumes; both are per-workspace and disposable (dispose removes
+  them automatically). Fresh named volumes are `root:root`, so `post-create.sh`
+  must `chown` each mount-point to `vscode` before any npm/Maven step â€” otherwise
+  npm dies with `EACCES â€¦ mkdir node_modules/@types` and Maven cannot write into
+  `target/`. Keep each chown in sync with its module-discovery `find` if you
+  touch either. `.m2/repository` is deliberately NOT on a named volume â€” it
+  stays a host bind mount so the artifact cache is shared with the host and
+  across workspaces (a per-workspace volume would force a full re-download each
+  spawn).
 - **Mono-repo mode:** `"repos": []` switches spawn to single-worktree mode; if
   the `builds` key is omitted entirely (not merely `[]`) and a root `pom.xml`
   exists it auto-populates a single `install` `mvn-goal` build.

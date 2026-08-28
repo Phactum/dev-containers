@@ -91,7 +91,7 @@
 #    as a fallback to the unix socket, mirroring the GitLab CI dind setup).
 #    JetBrains backend is preselected via customizations.jetbrains.backend.
 #
-# 6a. Per-module node_modules on Docker named volumes
+# 6a. Per-module node_modules AND Maven target/ on Docker named volumes
 #    Every npm module (each package.json outside node_modules/.git) gets its
 #    node_modules mounted as a Docker named volume instead of living in the
 #    bind-mounted workspace (NPM_NM_VOLUME_MOUNTS, injected into
@@ -105,6 +105,12 @@
 #    (and the IDE) run as vscode -- so post-create.sh (feature 12) chowns each
 #    node_modules mount-point to vscode before any npm/Maven step touches it,
 #    otherwise npm dies with "EACCES: permission denied, mkdir .../@types".
+#    The identical treatment is applied to Maven's per-module target/ dir
+#    (every pom.xml outside target/.git -> MVN_TARGET_VOLUME_MOUNTS): target/
+#    is write-heavy build output (generated sources, thousands of .class files)
+#    hit by the same cold-bind-mount bottleneck, and disposable/regenerated per
+#    build -- so a per-workspace named volume that dies with the workspace is
+#    exactly right. Same root:root caveat, same post-create chown.
 #
 # 6b. Distro support ("distro" in devcontainers-config.json)
 #    The container can also be built on a RHEL-family base ("distro": "rocky";
@@ -1083,6 +1089,38 @@ if (( ${#NPM_MODULE_DIRS[@]} > 0 )); then
         slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
         vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
         NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
+    done
+fi
+
+# Collect Maven module directories for Docker named-volume target/ mounts.
+# Same root cause and fix as the node_modules volumes above (feature 6a):
+# target/ is write-heavy build output (generated sources, thousands of .class
+# files) and suffers the identical cold-bind-mount bottleneck across the
+# host<->VM boundary. Mounting each module's target/ as a named volume lets
+# Maven write at Linux-native speed. target/ is disposable and regenerated per
+# build, so a per-workspace volume that dies with the workspace is exactly
+# right -- dispose-workspace.sh removes it automatically like the node_modules
+# ones. Discovery mirrors the npm scan: every pom.xml outside target/.git.
+# Naming: ${PROJECT_SHORT}-${LEAF}-<slug>-target (distinct -target suffix, so a
+# module that is both an npm and a Maven module gets two non-colliding volumes).
+MVN_MODULE_DIRS=()
+while IFS= read -r pom; do
+    pom_dir="$(dirname "${pom}")"
+    rel="${pom_dir#"${WS_DIR}"/}"
+    # Guard: skip if WS_DIR was not a prefix (shouldn't happen)
+    [[ "${rel}" == "${pom_dir}" ]] && continue
+    MVN_MODULE_DIRS+=("${rel}")
+done < <(find "${WS_DIR}" -name "pom.xml" \
+    -not -path "*/target/*" \
+    -not -path "*/.git/*" \
+    2>/dev/null)
+
+MVN_TARGET_VOLUME_MOUNTS=""
+if (( ${#MVN_MODULE_DIRS[@]} > 0 )); then
+    for rel_dir in "${MVN_MODULE_DIRS[@]}"; do
+        slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
+        vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-target"
+        MVN_TARGET_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/target,type=volume\"\n"
     done
 fi
 
@@ -2199,6 +2237,12 @@ __HOST_MOUNT_BINDS__
         // bind-mount bridge, eliminating the I/O bottleneck that makes npm
         // 10-100x slower on macOS. dispose-workspace.sh removes them automatically.
 __NPM_NM_VOLUME_MOUNTS__
+        // Maven target/ volumes: one Docker named volume per Maven module (each
+        // pom.xml in the workspace). Same rationale as the node_modules volumes
+        // above -- target/ is write-heavy build output that suffers the same
+        // bind-mount bottleneck. Disposable per build; removed automatically on
+        // dispose.
+__MVN_TARGET_VOLUME_MOUNTS__
     ],
 
     "remoteUser": "vscode",
@@ -2529,6 +2573,25 @@ done
     mv "${WS_DIR}/.devcontainer/devcontainer.json.nm_tmp" \
        "${WS_DIR}/.devcontainer/devcontainer.json"
     rm "${_nm_tmp}"
+}
+
+# Substitute __MVN_TARGET_VOLUME_MOUNTS__ with the Maven target/ volume lines
+# (same multi-line awk approach as the node_modules volumes above; empty ->
+# placeholder line removed).
+{
+    _tgt_tmp="$(mktemp)"
+    printf '%b' "${MVN_TARGET_VOLUME_MOUNTS}" > "${_tgt_tmp}"
+    awk -v mf="${_tgt_tmp}" '
+        /__MVN_TARGET_VOLUME_MOUNTS__/ {
+            while ((getline line < mf) > 0) print line
+            next
+        }
+        { print }
+    ' "${WS_DIR}/.devcontainer/devcontainer.json" \
+      > "${WS_DIR}/.devcontainer/devcontainer.json.tgt_tmp"
+    mv "${WS_DIR}/.devcontainer/devcontainer.json.tgt_tmp" \
+       "${WS_DIR}/.devcontainer/devcontainer.json"
+    rm "${_tgt_tmp}"
 }
 
 # Substitute __HOST_MOUNT_BINDS__ with the host-mount bind lines (same multi-line
@@ -2924,6 +2987,25 @@ find __WORKSPACE_PATH__ __HOST_MOUNT_PRUNE__-name package.json \
     nm="$(dirname "${pj}")/node_modules"
     if [[ -d "${nm}" ]]; then
         sudo chown vscode:vscode "${nm}"
+    fi
+done
+
+# Fix ownership of the per-module Maven target/ Docker named volumes -- same
+# root:root-on-fresh-volume problem as the node_modules mounts above (see
+# devcontainer.json / MVN_TARGET_VOLUME_MOUNTS). Without this the Maven warmup
+# below, running as vscode, cannot write into target/ and fails. The find
+# mirrors the module discovery in spawn-workspace.sh (pom.xml outside
+# target/.git) so it stays in sync with the volumes actually mounted, and reuses
+# the same host-mount prune as the npm scan. `if` (not `&&`) so a module without
+# a target/ dir doesn't make the loop exit non-zero under set -e/pipefail; the
+# named volume auto-creates the mount-point, so target/ exists here.
+echo "--- fixing target/ volume ownership ---"
+find __WORKSPACE_PATH__ __HOST_MOUNT_PRUNE__-name pom.xml \
+    -not -path '*/target/*' -not -path '*/.git/*' -print0 2>/dev/null \
+| while IFS= read -r -d '' pom; do
+    tgt="$(dirname "${pom}")/target"
+    if [[ -d "${tgt}" ]]; then
+        sudo chown vscode:vscode "${tgt}"
     fi
 done
 
