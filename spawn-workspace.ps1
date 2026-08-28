@@ -792,7 +792,7 @@ foreach ($repo in $RepoNames) {
 }
 
 # ============================================================================
-# node_modules named volumes + host-mount binds
+# node_modules + Maven target/ named volumes + host-mount binds
 # ============================================================================
 #
 # Every npm module (each package.json outside node_modules/.git) gets its
@@ -802,6 +802,10 @@ foreach ($repo in $RepoNames) {
 # thousands of files npm becomes 10-100x slower. Named volumes live on the VM's
 # own filesystem, so npm writes at Linux-native speed. dispose-workspace.ps1
 # removes these volumes automatically via `docker inspect` on the container.
+# The identical treatment is applied to Maven's per-module target/ dir (every
+# pom.xml outside target/.git): target/ is write-heavy build output hit by the
+# same cold-bind-mount bottleneck, and disposable/regenerated per build -- so a
+# per-workspace named volume that dies with the workspace is exactly right.
 $NpmModuleDirs = @()
 Get-ChildItem -LiteralPath $WsDir -Recurse -File -Filter 'package.json' -Force -ErrorAction SilentlyContinue |
     ForEach-Object {
@@ -818,6 +822,25 @@ foreach ($relDir in $NpmModuleDirs) {
     $slug = ($relDir -replace '[/_]', '-')
     $volName = "$ProjectShort-$Leaf-$slug-nm"
     $NpmVolumeMounts += "        ,`"source=$volName,target=$WorkspacePath/$relDir/node_modules,type=volume`"`n"
+}
+
+# Same discovery for Maven modules -> per-module target/ named volumes. Distinct
+# -target suffix so a dir that is both an npm and a Maven module gets two
+# non-colliding volumes. Excludes anything under target/ or .git.
+$MvnModuleDirs = @()
+Get-ChildItem -LiteralPath $WsDir -Recurse -File -Filter 'pom.xml' -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $rel = $_.DirectoryName.Substring($WsDir.Length).TrimStart('\')
+        $relPosix = ($rel -replace '\\', '/')
+        if ($relPosix -match '(^|/)target(/|$)' -or $relPosix -match '(^|/)\.git(/|$)') { return }
+        if ($relPosix) { $MvnModuleDirs += $relPosix }
+    }
+
+$MvnTargetVolumeMounts = ''
+foreach ($relDir in $MvnModuleDirs) {
+    $slug = ($relDir -replace '[/_]', '-')
+    $volName = "$ProjectShort-$Leaf-$slug-target"
+    $MvnTargetVolumeMounts += "        ,`"source=$volName,target=$WorkspacePath/$relDir/target,type=volume`"`n"
 }
 
 # One bind mount per host-mount repo, from the host source dir to its workspace
@@ -1832,6 +1855,12 @@ __HOST_MOUNT_BINDS__
         // eliminating the I/O bottleneck that makes npm 10-100x slower.
         // dispose-workspace.ps1 removes them automatically.
 __NPM_NM_VOLUME_MOUNTS__
+        // Maven target/ volumes: one Docker named volume per Maven module (each
+        // pom.xml in the workspace). Same rationale as the node_modules volumes
+        // above -- target/ is write-heavy build output that suffers the same
+        // bind-mount bottleneck. Disposable per build; removed automatically on
+        // dispose.
+__MVN_TARGET_VOLUME_MOUNTS__
     ],
 
     "remoteUser": "vscode",
@@ -2347,6 +2376,23 @@ find __WORKSPACE_PATH__ __HOST_MOUNT_PRUNE__-name package.json \
     fi
 done
 
+# Fix ownership of the per-module Maven target/ Docker named volumes -- same
+# root:root-on-fresh-volume problem as the node_modules mounts above. Without
+# this the Maven warmup below, running as vscode, cannot write into target/ and
+# fails. The find mirrors the module discovery in the spawn script (pom.xml
+# outside target/.git) and reuses the same host-mount prune. `if` (not `&&`) so
+# a module without a target/ dir doesn't make the loop exit non-zero under
+# set -e/pipefail; the named volume auto-creates the mount-point.
+echo "--- fixing target/ volume ownership ---"
+find __WORKSPACE_PATH__ __HOST_MOUNT_PRUNE__-name pom.xml \
+    -not -path '*/target/*' -not -path '*/.git/*' -print0 2>/dev/null \
+| while IFS= read -r -d '' pom; do
+    tgt="$(dirname "${pom}")/target"
+    if [[ -d "${tgt}" ]]; then
+        sudo chown vscode:vscode "${tgt}"
+    fi
+done
+
 # Optional project-specific initialization hook. Place initialize.sh next to
 # the spawn scripts in dev-containers/; they copy it here. Runs with the
 # workspace root as CWD, before the Maven warmup builds.
@@ -2820,7 +2866,9 @@ $dcText = (Read-TextFile $dcPath).
             Replace("__HOST_MOUNT_BINDS__`n", $HostMountBinds).
             Replace('__HOST_MOUNT_BINDS__', $HostMountBinds.TrimEnd("`n")).
             Replace("__NPM_NM_VOLUME_MOUNTS__`n", $NpmVolumeMounts).
-            Replace('__NPM_NM_VOLUME_MOUNTS__', $NpmVolumeMounts.TrimEnd("`n"))
+            Replace('__NPM_NM_VOLUME_MOUNTS__', $NpmVolumeMounts.TrimEnd("`n")).
+            Replace("__MVN_TARGET_VOLUME_MOUNTS__`n", $MvnTargetVolumeMounts).
+            Replace('__MVN_TARGET_VOLUME_MOUNTS__', $MvnTargetVolumeMounts.TrimEnd("`n"))
 Write-LfFile -Path $dcPath -Content $dcText
 
 Update-Placeholders -Path $dcPath
