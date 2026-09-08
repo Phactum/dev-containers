@@ -1531,11 +1531,17 @@ RUN set -eux; \
 #                plaintext) something real to talk to. post-start.sh starts a
 #                per-container session bus + auto-unlocked keyring at a fixed
 #                address (see DBUS_SESSION_BUS_ADDRESS in containerEnv below).
+# python3     -- the Debian base ships only python3-minimal (a transitive
+#                dependency, never a deliberate choice), which lacks much of the
+#                stdlib: json, difflib, xml, sqlite3, decimal, venv, ... Coding
+#                agents keep tripping over that. The full python3 costs ~10 MiB
+#                on a 4+ GiB image. Debian-only: on rocky dnf itself already
+#                depends on the full python3 stdlib.
 # __DEB_BLOCK_START__
 RUN rm -f /etc/apt/sources.list.d/yarn.list /etc/apt/keyrings/yarn.gpg \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        socat ca-certificates curl jq openssh-server \
+        socat ca-certificates curl jq openssh-server python3 \
         dbus gnome-keyring libsecret-tools \
  && rm -rf /var/lib/apt/lists/*
 # __DEB_BLOCK_END__
