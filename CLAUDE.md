@@ -322,6 +322,21 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   `FLOW-FLOW-4711`). Both scripts therefore build the candidate leaves and pick the
   first whose directory exists. Don't "simplify" that back to unconditional
   stripping.
+- **Dispose also prunes IntelliJ's per-container config.** IntelliJ IDEA's Dev
+  Containers integration keys each connection to the container's
+  `com.intellij.devcontainer.id` **label** (a 12-hex prefix, not the docker id)
+  and persists per-container state under the IDE config dir
+  (`options/Devcontainer-<id>@/`, `workspace/Devcontainer__<id>.*.xml`, plus
+  `<entry>` blocks in `options/{recentProjects,trusted-paths,nonLocalTargets}.xml`).
+  It never cleans that up, so orphaned ids make the Eel VFS throw "Cannot find
+  container with id" on every file access — a flood that starves the IO threads
+  and blocks reconnecting *live* devcontainers. `dispose-workspace.sh` /
+  `dispose-workspace.ps1` therefore read the label before `docker rm` and remove
+  that state (`prune_intellij_devcontainer` / `Remove-IntellijDevcontainerConfig`).
+  The shared `*.xml` indexes are only pruned when IntelliJ is **not running** (an
+  open IDE rewrites them on exit); the self-contained per-container dir/xml are
+  removed regardless. The sed range in `prune_ij_xml_entries` is safe only
+  because these `<entry>` blocks never nest another `<entry>`.
 - **Two READMEs.** `README.md` documents this repo and is hand-maintained.
   `README.md.tpl` is the template for the welcome README placed at each spawned
   workspace root â€” edit the `.tpl` for workspace-facing docs, not `README.md`.

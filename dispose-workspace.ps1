@@ -244,6 +244,68 @@ function Get-SourceRepoDir {
     return (Join-Path $SourceWs $Repo)
 }
 
+# IntelliJ IDEA's Dev Containers integration keys every connection to a container
+# by its `com.intellij.devcontainer.id` label (a 12-hex prefix, NOT the docker
+# container id) and persists per-container state under the IDE config dir without
+# ever cleaning it up on dispose. Left behind, the dead ids make the IDE's Eel VFS
+# throw "Cannot find container with id" on every file access, starving the IO
+# threads that would otherwise (re)connect a live devcontainer. So on dispose we
+# remove that state for the id we tear down. See dispose-workspace.sh for the
+# matching Bash implementation -- keep the two in lockstep.
+function Remove-IjXmlEntries {
+    param([Parameter(Mandatory = $true)][string] $File,
+          [Parameter(Mandatory = $true)][string] $Id)
+    if (-not (Test-Path -LiteralPath $File)) { return }
+    try { [xml] $xml = Get-Content -LiteralPath $File -Raw } catch { return }
+    $nodes = @($xml.SelectNodes('//entry[@key]') | Where-Object { $_.key -like "*$Id*" })
+    if ($nodes.Count -eq 0) { return }
+    foreach ($n in $nodes) { [void] $n.ParentNode.RemoveChild($n) }
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.OmitXmlDeclaration = $true
+    $settings.Indent = $true
+    $sw = New-Object System.IO.StringWriter
+    $writer = [System.Xml.XmlWriter]::Create($sw, $settings)
+    $xml.Save($writer); $writer.Flush(); $writer.Close()
+    Write-LfFile -Path $File -Content $sw.ToString()
+}
+
+function Remove-IntellijDevcontainerConfig {
+    param([Parameter(Mandatory = $true)][string] $Id)
+    if (-not $Id) { return }
+    $roots = @()
+    if ($env:APPDATA -and (Test-Path -LiteralPath (Join-Path $env:APPDATA 'JetBrains'))) {
+        $roots += (Join-Path $env:APPDATA 'JetBrains')
+    }
+    if ($roots.Count -eq 0) { return }
+
+    # The shared *.xml indexes are rewritten by a running IDE on exit, so prune
+    # them only when IntelliJ is not running. The per-container options dir and
+    # workspace xml are self-contained and safe to delete anytime.
+    $ideRunning = [bool] (Get-Process -Name 'idea64', 'idea' -ErrorAction SilentlyContinue)
+
+    Write-Output "removing IntelliJ devcontainer config for id $Id"
+    foreach ($root in $roots) {
+        foreach ($prod in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'IntelliJIdea*' -ErrorAction SilentlyContinue)) {
+            $optDir = Join-Path $prod.FullName 'options'
+            $wsDir = Join-Path $prod.FullName 'workspace'
+            $dc = Join-Path $optDir "Devcontainer-$Id@"
+            if (Test-Path -LiteralPath $dc) { Remove-Item -Recurse -Force -LiteralPath $dc -ErrorAction SilentlyContinue }
+            Get-ChildItem -Path (Join-Path $wsDir "Devcontainer__$Id.*.xml") -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
+            if (-not $ideRunning) {
+                foreach ($f in 'recentProjects.xml', 'trusted-paths.xml', 'nonLocalTargets.xml') {
+                    Remove-IjXmlEntries -File (Join-Path $optDir $f) -Id $Id
+                }
+            }
+        }
+    }
+    if ($ideRunning) {
+        Write-Output "  note: IntelliJ is running -- left recentProjects/trusted-paths/"
+        Write-Output "        nonLocalTargets entries for $Id in place (an open IDE would"
+        Write-Output '        rewrite them on exit). Quit IntelliJ once to clear them.'
+    }
+}
+
 # ============================================================================
 # 1. Dirty check
 # ============================================================================
@@ -298,6 +360,8 @@ if (-not $KeepContainer) {
             $volTpl = '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}'
             $volumes = @((Invoke-Docker @('inspect', '--format', $volTpl, $Container)).StdOut -split "`r?`n" |
                          ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $ijId = (Invoke-Docker @('inspect', '--format', '{{index .Config.Labels "com.intellij.devcontainer.id"}}', $Container)).StdOut.Trim()
+            if ($ijId -eq '<no value>') { $ijId = '' }
             Invoke-Docker @('rm', '-f', $Container) | Out-Null
             foreach ($v in $volumes) {
                 Write-Output "removing docker volume '$v'"
@@ -311,6 +375,7 @@ if (-not $KeepContainer) {
                     Write-Output '  (image not removed: still referenced by another container)'
                 }
             }
+            if ($ijId) { Remove-IntellijDevcontainerConfig -Id $ijId.Substring(0, [Math]::Min(12, $ijId.Length)) }
         }
     } else {
         Write-Err 'docker not on PATH, skipping container cleanup'

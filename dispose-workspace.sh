@@ -306,6 +306,74 @@ remove_dir_resilient() {
     [[ ! -e "${path}" ]]
 }
 
+# IntelliJ IDEA's Dev Containers integration keys every connection to a
+# container by its `com.intellij.devcontainer.id` label (a 12-hex prefix, NOT
+# the docker container id). It persists per-container state under the IDE config
+# dir and never cleans it up when the container is disposed. Left behind, the
+# dead ids make the IDE's Eel VFS throw "Cannot find container with id" on every
+# file access -- thousands per second -- which starves the IO threads that would
+# otherwise (re)connect a live devcontainer. So on dispose we remove that state
+# for the id we are tearing down. `id` is the 12-hex label prefix.
+prune_intellij_devcontainer() {
+    local id="$1" ide_running=0 root prod
+    local roots=()
+    [[ -n "${id}" ]] || return 0
+    if [[ -d "${HOME}/Library/Application Support/JetBrains" ]]; then
+        roots+=("${HOME}/Library/Application Support/JetBrains")
+    fi
+    if [[ -d "${HOME}/.config/JetBrains" ]]; then
+        roots+=("${HOME}/.config/JetBrains")
+    fi
+    (( ${#roots[@]} > 0 )) || return 0
+
+    # The self-contained artifacts (per-container options dir, workspace xml) are
+    # safe to delete anytime. The shared *.xml indexes below are rewritten by a
+    # running IDE on exit, so we only prune them when IntelliJ is not running.
+    if pgrep -f 'IntelliJ IDEA.app/Contents/MacOS/idea' >/dev/null 2>&1 \
+       || pgrep -f 'Contents/bin/idea' >/dev/null 2>&1; then
+        ide_running=1
+    fi
+
+    echo "removing IntelliJ devcontainer config for id ${id}"
+    for root in "${roots[@]}"; do
+        for prod in "${root}"/IntelliJIdea* "${root}"/IdeaIC*; do
+            [[ -d "${prod}" ]] || continue
+            rm -rf "${prod}/options/Devcontainer-${id}@" 2>/dev/null || true
+            rm -f "${prod}"/workspace/Devcontainer__"${id}".*.xml 2>/dev/null || true
+            if [[ ${ide_running} -eq 0 ]]; then
+                prune_ij_xml_entries "${prod}/options/recentProjects.xml" "${id}"
+                prune_ij_xml_entries "${prod}/options/trusted-paths.xml" "${id}"
+                prune_ij_xml_entries "${prod}/options/nonLocalTargets.xml" "${id}"
+            fi
+        done
+    done
+    if [[ ${ide_running} -eq 1 ]]; then
+        echo "  note: IntelliJ is running -- left recentProjects/trusted-paths/"
+        echo "        nonLocalTargets entries for ${id} in place (an open IDE would"
+        echo "        rewrite them on exit). Quit IntelliJ once to clear them."
+    fi
+    return 0
+}
+
+# Delete every "<entry key=\"...<id>...\"> ... </entry>" block (and the
+# self-closing "<entry ... />" variant) from an IntelliJ options XML, in place.
+# These entries never nest another <entry>, so the sed range is unambiguous.
+prune_ij_xml_entries() {
+    local file="$1" id="$2" tmp
+    [[ -f "${file}" ]] || return 0
+    grep -q "${id}" "${file}" 2>/dev/null || return 0
+    tmp="${file}.dispose-tmp.$$"
+    if sed -E \
+        -e "/<entry key=\"[^\"]*${id}[^\"]*\"[^>]*\/>/d" \
+        -e "/<entry key=\"[^\"]*${id}[^\"]*\">/,/<\/entry>/d" \
+        "${file}" > "${tmp}" 2>/dev/null; then
+        mv "${tmp}" "${file}"
+    else
+        rm -f "${tmp}" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # 2. Remove the Docker container, its named volumes, and (by default) its
 # devcontainer image FIRST -- before any filesystem removal below.
 #
@@ -327,9 +395,12 @@ if [[ ${KEEP_CONTAINER} -eq 0 ]]; then
         if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
             echo
             echo "removing docker container '${CONTAINER}'"
-            # Collect the image ID and all attached named volumes before removal.
+            # Collect the image ID, attached named volumes and the IntelliJ
+            # devcontainer id (label) before removal -- all are gone after rm.
             image_id="$(docker inspect --format '{{.Image}}' "${CONTAINER}" 2>/dev/null || true)"
             volumes="$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "${CONTAINER}" 2>/dev/null || true)"
+            ij_devcontainer_id="$(docker inspect --format '{{index .Config.Labels "com.intellij.devcontainer.id"}}' "${CONTAINER}" 2>/dev/null || true)"
+            [[ "${ij_devcontainer_id}" == "<no value>" ]] && ij_devcontainer_id=""
             docker rm -f "${CONTAINER}" >/dev/null
             for v in ${volumes}; do
                 echo "removing docker volume '${v}'"
@@ -339,6 +410,9 @@ if [[ ${KEEP_CONTAINER} -eq 0 ]]; then
                 echo "removing devcontainer image ${image_id}"
                 docker rmi "${image_id}" >/dev/null 2>&1 \
                     || echo "  (image not removed: still referenced by another container)"
+            fi
+            if [[ -n "${ij_devcontainer_id}" ]]; then
+                prune_intellij_devcontainer "${ij_devcontainer_id:0:12}"
             fi
         fi
     else
