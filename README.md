@@ -749,16 +749,22 @@ An optional host-side statusline that shows your Claude Code usage limits and
 keeps the Caveman badge. It renders, left to right:
 
 ```
-[CAVEMAN]  Opus 4.8 (1M) | Sitzung 24% | Woche 41%
+[CAVEMAN]  Opus 4.8 | Kontext 250k/1M · 25% | Sitzung 24% | Woche 41%
 ```
 
+- **Kontext** → the **context-window fill**: tokens currently in context vs. the
+  model's limit (`context_window.*`), e.g. `250k/1M · 25%`. The limit renders as
+  `1M` for extended-context models and `<n>k` otherwise.
 - **Sitzung** → the rolling **5-hour** window (`rate_limits.five_hour`).
 - **Woche** → the **7-day / weekly** window across all models
   (`rate_limits.seven_day`).
 
-The limit fields are only present for Claude.ai Pro/Max subscribers, and only
-**after the first API response** of a session → until then only the badge and
-model name show, which is expected.
+The rate-limit fields are only present for Claude.ai Pro/Max subscribers, and
+only **after the first API response** of a session; the context fill likewise
+fills in once the first response arrives (and resets after `/compact`). Until
+then only the badge and model name show, which is expected. Every segment
+degrades gracefully: an older Claude Code without `context_window` simply omits
+the Kontext part.
 
 **Why it also works inside every story container:** `spawn-workspace.sh`
 bind-mounts the host `~/.claude` into each container

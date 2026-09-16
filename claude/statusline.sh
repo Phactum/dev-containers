@@ -5,8 +5,9 @@
 # Renders (left to right):
 #   1. the Caveman plugin badge (if the plugin is installed + active), then
 #   2. the active model name and the current usage / rate limits:
-#        Sitzung <n>%   -> rolling 5-hour window   (rate_limits.five_hour)
-#        Woche   <n>%   -> weekly / 7-day window    (rate_limits.seven_day)
+#        Kontext <u>k/<max> · <n>%  -> context-window fill (context_window.*)
+#        Sitzung <n>%        -> rolling 5-hour window   (rate_limits.five_hour)
+#        Woche   <n>%        -> weekly / 7-day window    (rate_limits.seven_day)
 #
 # The rate_limits.* fields are only present for Claude.ai Pro/Max subscribers
 # and only AFTER the first API response of a session — until then this just
@@ -54,8 +55,28 @@ if command -v jq >/dev/null 2>&1; then
   five="$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty | numbers | round' 2>/dev/null)"
   week="$(printf '%s' "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty | numbers | round' 2>/dev/null)"
 
+  # Context-window fill: tokens currently in context vs. the model's limit,
+  # e.g. "Kontext 250k/1M · 25%". context_window.* is sent from Claude Code 2.x;
+  # the token counts are null/absent before the first API response and right
+  # after /compact, so fall back to 0. The limit renders as "1M" for the
+  # extended-context models and "<n>k" otherwise. If context_window is missing
+  # entirely (older CC), ctx_size is empty and the segment is simply omitted.
+  ctx_used="$(printf '%s' "$input" | jq -r '((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)) | floor' 2>/dev/null)"
+  ctx_size="$(printf '%s' "$input" | jq -r '.context_window.context_window_size // empty' 2>/dev/null)"
+  ctx=""
+  if [ -n "$ctx_size" ] && [ "$ctx_size" -gt 0 ] 2>/dev/null; then
+    if [ "$ctx_size" -ge 1000000 ]; then ctx_total="$((ctx_size / 1000000))M"; else ctx_total="$((ctx_size / 1000))k"; fi
+    ctx_used="${ctx_used:-0}"
+    # Percent from the SAME token total shown as k/k, so "250k/1M" and "25%" agree
+    # (Claude Code's own context_window.used_percentage is input-only and would
+    # not quite match). Integer math is enough for a status line.
+    ctx_pct=$(( ctx_used * 100 / ctx_size ))
+    ctx="Kontext $(( ctx_used / 1000 ))k/${ctx_total} · ${ctx_pct}%"
+  fi
+
   seg=""
   [ -n "$model" ] && seg="$model"
+  [ -n "$ctx" ] && seg="${seg:+$seg | }$ctx"
   [ -n "$five" ] && seg="${seg:+$seg | }Sitzung ${five}%"
   [ -n "$week" ] && seg="${seg:+$seg | }Woche ${week}%"
 
