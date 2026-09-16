@@ -508,27 +508,46 @@ if [[ -d "${WS_DIR}" ]]; then
 fi
 
 # 5. Optional: delete the local branch in each source repo.
-if [[ ${DELETE_BRANCH} -eq 1 && -n "${BRANCH}" ]]; then
+#
+# Only worktree mode creates the story branch IN the source repos; clone mode
+# keeps its branch inside the clone and container mode inside the container's
+# volume, both already removed above. We decide what to do by DETECTING whether
+# the branch is actually present in a source repo, NOT by trusting a repoMode
+# value -- dispose only sees the config's current default, which may differ from
+# the mode this workspace was spawned with (a --repo-mode override leaves no
+# trace in the config). BRANCH is empty when the workspace had no host checkout
+# to read HEAD from (container mode).
+if [[ ${DELETE_BRANCH} -eq 1 ]]; then
     echo
-    echo "deleting local branch '${BRANCH}' in source repos:"
-    for repo in "${REPO_NAMES[@]}"; do
-        # Mono-repo: the git repo lives at SOURCE_WS itself, not in a sub-directory.
-        if (( MONO_REPO == 1 )); then
-            src="${SOURCE_WS}"
-        else
-            src="${SOURCE_WS}/${repo}"
-        fi
-        # -e (not -d): submodules carry a .git *file* pointer, not a directory.
-        [[ -e "${src}/.git" ]] || continue
-        if git -C "${src}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    if [[ -z "${BRANCH}" ]]; then
+        echo "--delete-branch: the workspace had no host-side git checkout to read a branch"
+        echo "  from (container mode), so there is no source-repo branch to delete."
+    else
+        _found_branch=0
+        for repo in "${REPO_NAMES[@]}"; do
+            # Mono-repo: the git repo lives at SOURCE_WS itself, not in a sub-directory.
+            if (( MONO_REPO == 1 )); then
+                src="${SOURCE_WS}"
+            else
+                src="${SOURCE_WS}/${repo}"
+            fi
+            # -e (not -d): submodules carry a .git *file* pointer, not a directory.
+            [[ -e "${src}/.git" ]] || continue
+            git -C "${src}" show-ref --verify --quiet "refs/heads/${BRANCH}" || continue
+            _found_branch=1
+            echo "deleting local branch '${BRANCH}' in ${repo}"
             if [[ ${FORCE} -eq 1 ]]; then
                 git -C "${src}" branch -D "${BRANCH}" || true
             else
                 git -C "${src}" branch -d "${BRANCH}" || \
                     echo "  ${repo}: branch not fully merged, keep or rerun with --force" >&2
             fi
+        done
+        if (( _found_branch == 0 )); then
+            echo "--delete-branch: branch '${BRANCH}' is not present in any source repo -- clone /"
+            echo "  container mode keeps it inside the removed clone/container, so nothing to delete."
         fi
-    done
+    fi
 fi
 
 echo

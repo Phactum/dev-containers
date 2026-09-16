@@ -10,7 +10,8 @@ project-specific lives in that project's own `devcontainers-config.json`.
 Each story gets:
 
 - a sibling workspace directory `workspace/<PROJECT_NAME>-<leaf>/`
-- one git worktree per source repo
+- each source repo provisioned per the chosen **repo mode** (default: cloned
+  inside the container; see [Repo modes](#repo-modes))
 - a Dev Container (Java 21 + Maven + Node + Docker-in-Docker) with a
   preselected JetBrains backend, pre-wired run configs, port offset to
   run several stories in parallel, and a shared Claude-Code memory mount
@@ -106,6 +107,26 @@ spawn-workspace.sh --config ~/work/myproject/devcontainers-config.json feature/P
 `devcontainers-config.json` is JSON with **full-line `//` comments** (JSONC). Trailing comments
 after a value are *not* supported → put every comment on its own line.
 See the copy in this repository for the full list of settings and what they do.
+
+### Repo modes
+
+How each source repo is provisioned into the story workspace. Set it once with
+`"repoMode"` in `devcontainers-config.json`, or per run with `--repo-mode`, which
+overrides the config:
+
+```sh
+spawn-workspace.sh --repo-mode clone feature/PRJ-4711_example-story
+```
+
+| Mode | What happens | When to use |
+|---|---|---|
+| `worktree` | a git worktree of each source repo (shares its git object store) | disk-cheapest; fine for a single active story |
+| `clone` | an independent local clone per repo with its own branch; all host mounts stay as in `worktree` | several parallel stories, but you still want the repos visible on the host |
+| `container` *(default)* | no host checkout — the repos are cloned **inside the container** onto a per-story named volume, so there are no repo / `node_modules` / `target` host mounts at all | fastest; avoids the slow host↔VM mount bridge and worktree contention entirely |
+
+`container` mode clones from each repo's `origin` **inside** the container, so it
+needs working git credentials there — the ssh / gh / glab mounts already provide
+them. The shared `~/.m2` cache mount is kept in every mode.
 
 ### Requirements
 

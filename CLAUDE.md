@@ -38,7 +38,7 @@ Rules that follow from that:
 
 ## Conditional blocks in the templates
 
-Nine marker pairs drive optional content in the generated files. Each is
+Ten marker pairs drive optional content in the generated files. Each is
 independent, and `substitute_placeholders` / `Update-Placeholders` either strips
 just the markers (feature on) or the markers **and** everything between them
 (feature off):
@@ -46,6 +46,7 @@ just the markers (feature on) or the markers **and** everything between them
 | Marker | Driven by |
 |---|---|
 | `__GLAB_BLOCK_*__` | `glabHostname` + `glabVersion` |
+| `__WORKTREE_MOUNT_BLOCK_*__` | `repoMode` != `container` (the source-workspace self-bind(s) that let a worktree's absolute-path gitdir resolve inside the container; dropped when there is no host checkout) |
 | `__GH_BLOCK_*__` | `ghVersion` |
 | `__SSHAGENT_BLOCK_*__` | PowerShell only: the Windows `ssh-agent` service is running |
 | `__PROXY_BLOCK_*__` | `proxy.http` / `proxy.https` |
@@ -75,6 +76,57 @@ blocks that are resolved in the wrong order.
 `env-config.sh` therefore has a dedicated `_env_bool` helper; `_env_scalar`'s
 `// ""` fallback has the same flaw and must not be used for booleans either.
 This bit once, and it fails silently â€” the config looks respected but isn't.
+
+## Repo provisioning modes (`repoMode`: `worktree` | `clone` | `container`)
+
+How each source repo lands in the story workspace. Set via `repoMode` in
+`devcontainers-config.json` (default **`container`**) or the `--repo-mode` CLI flag,
+which overrides the config. The CLI value is validated a second time in each
+spawn script; the config value is validated in `env-config.sh` / `EnvConfig.ps1`.
+The dispatch is a single `case` / `switch` in the repos loop; `worktree` and
+`clone` are near-identical (own function each: `create_worktree` / `create_clone`,
+`New-Worktree` / `New-Clone`), `container` is the divergent one, guarded by
+`IS_CONTAINER_MODE` / `$IsContainerMode` at four localised sites (NOT a fork).
+
+| Mode | Host checkout | Repo mounts | Where the branch lives |
+|---|---|---|---|
+| `worktree` | `git worktree add` per repo | source-WS self-bind + per-module `node_modules`/`target` volumes | in the **source** repo (shared) |
+| `clone` | independent `git clone` per repo, `origin` repointed at the real upstream, branch started from the *current* `origin/<baseRef>` | **identical to worktree** | only in the **clone** |
+| `container` | none (empty placeholder dir) | **one named volume per repo** at `__WORKSPACE_PATH__/<repo>`; no self-bind, no nm/target volumes; `.m2` bind kept | only in the **container** volume |
+
+Things that follow from this and must stay in lockstep across both ports:
+
+- **container mode clones inside the container.** Spawn captures each repo's
+  `git remote get-url origin` and bakes `clone_repo_bg '<repo>' '<url>' '<branch>'
+  '<base>'` calls into `post-create.sh` (placeholder `__CONTAINER_CLONE_COMMANDS__`,
+  spliced). A repo with no `origin` remote is a hard error in this mode. The
+  clones run as `vscode` using the mounted ssh/gh/glab creds, after a `chown` of
+  the root:root fresh volume mountpoint, and BEFORE the ownership fixes + warmup.
+  They run **concurrently** through a capped background pool (`clone_repo_bg`,
+  `CLONE_MAX_PARALLEL=6`, drained + failure-checked via `wait -n`) because the
+  network fetch dominates first-start time on a fresh container. The `git clone`
+  is strictly non-interactive (`StrictHostKeyChecking=accept-new`, `BatchMode=yes`,
+  `GIT_TERMINAL_PROMPT=0`, `ConnectTimeout`) — a missing host key or passphrase
+  in the TTY-less postCreate would otherwise hang it forever.
+- **The `__WORKTREE_MOUNT_BLOCK_*__` markers** wrap the source-workspace self-bind
+  and are stripped only in container mode (`1 - IS_CONTAINER_MODE` /
+  `-not $IsContainerMode`).
+- **The per-repo volume mounts** are injected via the same multi-line awk-splice
+  (Bash) / `.Replace` pair (PowerShell) as the nm/target volumes, at placeholder
+  `__CONTAINER_REPO_MOUNTS__`.
+- **IntelliJ's `MavenProjectsManager` pom list** is filesystem-derived
+  (`-f <repo>/pom.xml`) in worktree/clone mode, but in container mode there is no
+  host checkout yet, so it is emitted statically for every `mvn-goal` build entry.
+- **The per-source-repo git config normalisation** (`core.fileMode` etc.) runs on
+  the SOURCE repos in worktree mode only (worktrees inherit it); clone mode sets
+  the same keys on the clone itself, container mode not at all (Linux volume).
+- **`gc.worktreePruneExpire=never`** is set on each source repo in worktree mode
+  so a background gc can't mark a live-but-unreachable worktree "prunable".
+- **dispose is mode-agnostic** (volumes come from `docker inspect`, non-git dirs
+  are skipped) EXCEPT `--delete-branch`: it can't trust `repoMode` (a `--repo-mode`
+  override leaves no trace in the config), so it DETECTS by branch presence in the
+  source repos. Worktree branches are deleted there; clone/container report that
+  the branch lived in the removed clone/container.
 
 ## Distro split (`distro`: `debian` | `rocky`)
 
@@ -307,7 +359,7 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   `Resolve-WorkspacesRoot`: all near the top.
 - `config_asset()` / `Get-ConfigAsset` â€” project asset lookup with
   `CONFIG_DIR` â†’ `SCRIPT_DIR` fallback.
-- `is_port_in_use()` / `Test-PortInUse`, port-offset probing logic â€” checks live listeners, ports statically reserved by other workspaces' `devcontainer.json`, **and** ports bound by any docker container (`docker inspect` over `docker ps -a`, catching stopped/other-project containers). Offset step is configurable via `portOffsetStep` in `devcontainers-config.json` (default 10000, valid range 500..10000; the scripts abort outside it).
+- `is_port_in_use()` / `Test-PortInUse`, port-offset probing logic â€” checks live listeners, ports statically reserved by other workspaces' `devcontainer.json`, **and** ports bound by any docker container (`docker inspect` over `docker ps -a`, catching stopped/other-project containers). Offset step is configurable via `portOffsetStep` in `devcontainers-config.json` (default 10000, valid range 500..10000; the scripts abort outside it). The probe START offset is `initialPortOffset` (default 10000, range 0..50000): it is added to every host port before probing, so the standard host ports are kept free even when idle (8080 → 18080, 2222 → 12222). Set it to 0 to probe from the native numbers (the old behaviour).
 - `resolve_base()` / `create_worktree()` â€” `Resolve-BaseRef` / `New-Worktree` â€” per-repo worktree strategy (reuse / track / fork from base ref). The PowerShell version additionally calls `Convert-WorktreeLinkToRelative`.
 - Generated artifacts, in order: `.claude/settings.local.json`, `.idea/*` (workspace/misc/compiler xml), `.devcontainer/Dockerfile`, `devcontainer.json`, `post-create.sh`, `post-start.sh`, run-config XMLs, sshd config.
 - `substitute_placeholders()` / `Update-Placeholders`, `detect_java_home()` (inside the generated `post-create.sh`).

@@ -18,7 +18,8 @@
     The returned object mirrors the variables the Bash side exposes:
 
         ProjectName, ProjectShort, BaseImage, NodeFeatureVersion,
-        GlabVersion, GlabHostname, GhVersion, PortOffsetStep, TerminalShell
+        GlabVersion, GlabHostname, GhVersion, PortOffsetStep, InitialPortOffset, TerminalShell
+        Distro, RepoMode
         Repos             [ @{ Name; BaseRef } ]
         HostPorts         [ @{ Port; Label } ]
         RunConfigs        [ string ]
@@ -206,6 +207,13 @@ function Get-DevContainerConfig {
         # (JDK, Maven, Node, docker) directly, because the devcontainer features
         # only support Debian/Ubuntu.
         Distro             = (& $str 'distro' 'debian').ToLowerInvariant()
+        # How each source repo is provisioned into the story workspace:
+        #   worktree  git worktree (shares the source repo's object store)
+        #   clone     independent local clone with its own branch
+        #   container no host checkout -- cloned INSIDE the container onto a named
+        #             volume, so no repo/node_modules/target host mounts at all
+        # Default "container": fastest layout, immune to cross-worktree gc races.
+        RepoMode           = (& $str 'repoMode' 'container').ToLowerInvariant()
         # Rocky only: JDK major version (dnf package java-<n>-openjdk-devel) and
         # the Apache Maven version installed from the binary tarball. Ignored on
         # Debian, where the java:1 feature provides Maven and the base image the
@@ -232,6 +240,7 @@ function Get-DevContainerConfig {
         ImageRecentGit     = $true
         ImageChromium      = $true
         PortOffsetStep     = 10000
+        InitialPortOffset  = 10000
         Repos              = @()
         HostPorts          = @()
         RunConfigs         = @()
@@ -254,8 +263,16 @@ function Get-DevContainerConfig {
         throw "Invalid 'distro' in $($cfg.Path): '$($cfg.Distro)' (expected 'debian' or 'rocky')"
     }
 
+    if ($cfg.RepoMode -notin @('worktree', 'clone', 'container')) {
+        throw "Invalid 'repoMode' in $($cfg.Path): '$($cfg.RepoMode)' (expected 'worktree', 'clone' or 'container')"
+    }
+
     if (& $has 'portOffsetStep') {
         $cfg.PortOffsetStep = [int]$json.portOffsetStep
+    }
+
+    if (& $has 'initialPortOffset') {
+        $cfg.InitialPortOffset = [int]$json.initialPortOffset
     }
 
     if ((& $has 'repos') -and $null -ne $json.repos) {
