@@ -16,8 +16,9 @@
 #
 # Variables set by this file:
 #   PROJECT_NAME PROJECT_SHORT BASE_IMAGE NODE_FEATURE_VERSION
-#   DISTRO JAVA_VERSION MAVEN_VERSION
-#   GLAB_VERSION GLAB_HOSTNAME GH_VERSION PORT_OFFSET_STEP TERMINAL_SHELL
+#   DISTRO JAVA_VERSION MAVEN_VERSION REPO_MODE
+#   GLAB_VERSION GLAB_HOSTNAME GH_VERSION PORT_OFFSET_STEP INITIAL_PORT_OFFSET
+#   TERMINAL_SHELL
 #   REPOS[]              "<name>:<baseRef>"
 #   HOST_PORTS[]         port numbers
 #   PORT_LABELS[]        "<port>:<label>"
@@ -89,6 +90,7 @@ GLAB_VERSION="$(_env_scalar '.glabVersion')"
 GLAB_HOSTNAME="$(_env_scalar '.glabHostname')"
 GH_VERSION="$(_env_scalar '.ghVersion')"
 PORT_OFFSET_STEP="$(_env_scalar '.portOffsetStep // 10000')"
+INITIAL_PORT_OFFSET="$(_env_scalar '.initialPortOffset // 10000')"
 TERMINAL_SHELL="$(_env_scalar '.terminalShell')"
 WORKSPACES_ROOT_CONFIG="$(_env_scalar '.workspacesRoot')"
 
@@ -127,6 +129,20 @@ DISTRO="$(_env_scalar '.distro // "debian"')"
 DISTRO="$(printf '%s' "${DISTRO}" | tr '[:upper:]' '[:lower:]')"
 if [[ "${DISTRO}" != "debian" && "${DISTRO}" != "rocky" ]]; then
     echo "Invalid 'distro' in ${ENV_JSON}: '${DISTRO}' (expected 'debian' or 'rocky')" >&2
+    exit 1
+fi
+
+# How each source repo is provisioned into the story workspace:
+#   worktree   git worktree of the source repo (shares its object store)
+#   clone      independent local clone, own branch (no worktree contention)
+#   container  no host checkout at all -- repos are cloned INSIDE the container
+#              onto a named volume, so no repo/node_modules/target host mounts
+# Default is "container": the fastest layout (it drops the slow host<->VM
+# bind/volume mounts entirely) and the one immune to cross-worktree gc races.
+REPO_MODE="$(_env_scalar '.repoMode // "container"')"
+REPO_MODE="$(printf '%s' "${REPO_MODE}" | tr '[:upper:]' '[:lower:]')"
+if [[ "${REPO_MODE}" != "worktree" && "${REPO_MODE}" != "clone" && "${REPO_MODE}" != "container" ]]; then
+    echo "Invalid 'repoMode' in ${ENV_JSON}: '${REPO_MODE}' (expected 'worktree', 'clone' or 'container')" >&2
     exit 1
 fi
 

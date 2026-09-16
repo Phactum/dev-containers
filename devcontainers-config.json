@@ -138,6 +138,15 @@
     // (docker bindings + live listeners + other workspaces' devcontainer.json).
     "portOffsetStep": 10000,
 
+    // Base offset the port probe STARTS from (default 10000, must be 0..50000).
+    // It is added to every host port before any collision check, so the standard
+    // host ports are kept free even when idle: 8080 -> 18080, 2222 -> 12222, ...
+    // This prevents a container from shadowing whatever you run natively on the
+    // well-known numbers. The probe then steps upward from here in portOffsetStep
+    // increments. Set it to 0 to restore the old behaviour (probe from the native
+    // port numbers, so a free 8080 on the host stays 8080).
+    "initialPortOffset": 10000,
+
     // OPTIONAL. Login shell IntelliJ's built-in terminal opens inside the
     // container. Omit it (or set null / "") and the shell is left unset in
     // .idea/workspace.xml, so JetBrains auto-detects one -- and it prefers zsh
@@ -145,6 +154,31 @@
     // even though the vscode account's login shell is /bin/bash. Set an
     // absolute in-container path here to pin it, e.g. "/bin/bash".
     "terminalShell": "/bin/bash",
+
+    // How each source repo is provisioned into the story workspace. The scripts
+    // also accept --repo-mode <value> on the command line, which overrides this.
+    //
+    //   "worktree"
+    //        A git worktree of each source repo (the historical behaviour).
+    //        Shares the source repo's object store -- fast and disk-cheap, but
+    //        several live worktrees of the same repo contend on its git metadata,
+    //        and a stopped container's worktree can be marked "prunable" by gc.
+    //   "clone"
+    //        An independent local clone per repo, with its own local branch.
+    //        All host mounts stay exactly as with "worktree" (incl. the
+    //        node_modules / target named volumes and the shared .m2 cache), but
+    //        the clone shares no git state with the source, so no worktree
+    //        contention. The branch starts from the CURRENT origin state of its
+    //        baseRef (the source repo is fetched first).
+    //   "container" (default)
+    //        No host checkout at all: the repos are cloned INSIDE the container
+    //        onto a per-story named volume during post-create. Therefore NO repo
+    //        host mounts exist -- not for the repos, not for node_modules, not
+    //        for target/. This is the fastest layout (it avoids the slow
+    //        host<->VM bind/volume bridge entirely) and immune to gc races. The
+    //        shared ~/.m2 cache mount is kept. Requires git credentials inside
+    //        the container (the ssh / gh / glab mounts already provide them).
+    "repoMode": "container",
 
     // --- DevContainer image & tooling versions ------------------------------
 

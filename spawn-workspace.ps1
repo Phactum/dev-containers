@@ -203,13 +203,21 @@ function Get-HostIanaTimeZone {
 # ============================================================================
 
 $Usage = @'
-usage: spawn-workspace.ps1 [--config <path>] [--workspaces-root <path>] [--yes] [--rebuild-base-image] <branch-name>
+usage: spawn-workspace.ps1 [--config <path>] [--workspaces-root <path>] [--repo-mode <mode>] [--yes] [--rebuild-base-image] <branch-name>
 
   -c, --config <path>       devcontainers-config.json to use, or a directory containing it
                             (default: .\dev-containers\devcontainers-config.json, relative to
                             the current directory)
   --workspaces-root <path>  directory holding <PROJECT_NAME> and the story
                             workspaces (default: from "workspacesRoot" in devcontainers-config.json, else auto-detected)
+  --repo-mode <mode>        how source repos are provisioned into the workspace;
+                            overrides "repoMode" in devcontainers-config.json (default container):
+                              worktree  git worktree of each repo
+                              clone     independent local clone, own branch,
+                                        same host mounts as worktree
+                              container no host checkout -- repos cloned inside
+                                        the container onto a named volume (no
+                                        repo/node_modules/target host mounts)
   -y, --yes                 skip the confirmation prompt
   --rebuild-base-image      force a fresh build of the cached base image even
                             if a matching tag already exists locally (use
@@ -227,6 +235,7 @@ $WorkspacesRootCli = ''
 $ConfigCli = ''
 $AssumeYes = $false
 $RebuildBaseImage = $false
+$RepoModeCli = ''
 
 for ($i = 0; $i -lt $Arguments.Count; $i++) {
     $a = $Arguments[$i]
@@ -245,6 +254,13 @@ for ($i = 0; $i -lt $Arguments.Count; $i++) {
             continue
         }
         '^--workspaces-root=' { $WorkspacesRootCli = $a.Substring('--workspaces-root='.Length); continue }
+        '^--repo-mode$'       {
+            if ($i + 1 -ge $Arguments.Count) { Fail '--repo-mode needs an argument (worktree|clone|container)' 2 }
+            $RepoModeCli = $Arguments[$i + 1]
+            $i++
+            continue
+        }
+        '^--repo-mode='       { $RepoModeCli = $a.Substring('--repo-mode='.Length); continue }
         '^(-y|--yes)$'        { $AssumeYes = $true; continue }
         '^--rebuild-base-image$' { $RebuildBaseImage = $true; continue }
         '^(-h|--help|-\?)$'   { Write-Output $Usage; exit 0 }
@@ -332,6 +348,20 @@ if ($cfg.FeatureRegistry -ne 'ghcr.io') { Write-Output "feature registry:  $($cf
 # toolchain from dnf / upstream tarballs instead.
 $IsRocky = ($cfg.Distro -eq 'rocky')
 $DebianEnabled = -not $IsRocky
+
+# CLI --repo-mode overrides the config's repoMode (Get-DevContainerConfig already
+# validated the config value; validate the CLI override the same way).
+$RepoMode = $cfg.RepoMode
+if ($RepoModeCli) {
+    $RepoMode = $RepoModeCli.ToLowerInvariant()
+    if ($RepoMode -notin @('worktree', 'clone', 'container')) {
+        Fail "ERROR: --repo-mode must be worktree|clone|container, got '$RepoModeCli'" 2
+    }
+}
+# Single derived flag for the container branch (no host checkout, repos cloned
+# inside the container). worktree vs clone is dispatched inline where they differ.
+$IsContainerMode = ($RepoMode -eq 'container')
+Write-Output "repo mode:        $RepoMode"
 
 # Where the JDK ends up, which the generated files hard-code in a dozen places
 # (containerEnv, remoteEnv, profile.d, bashrc, post-create's probe).
@@ -464,7 +494,9 @@ if (-not $AssumeYes) {
 #
 # Pick an offset (multiple of portOffsetStep) where ALL forwarded ports are free
 # on the host, so several stories can run their containers in parallel without
-# colliding. Offset 0 means the original port numbers. Three sources are probed:
+# colliding. The probe starts from initialPortOffset (default 10000) so the
+# standard host ports stay free by default; set it to 0 for the native numbers.
+# Three sources are probed:
 # ports statically reserved by other story workspaces' devcontainer.json files,
 # ports bound by ANY docker container (including stopped ones and containers of
 # other projects), and currently-live listeners.
@@ -543,7 +575,19 @@ if ($PortOffsetStep -lt 500 -or $PortOffsetStep -gt 10000) {
 }
 
 $PortOffsetMax = 50000
-$PortOffset = 0
+
+# Base offset the probe STARTS from (default 10000). It keeps the standard host
+# ports free -- 8080 becomes 18080, 2222 becomes 12222, ... -- even when those
+# ports are idle on the host, so a container never shadows whatever the developer
+# runs natively on the well-known numbers. The search steps upward from here in
+# $PortOffsetStep increments. Set initialPortOffset to 0 to probe from the native
+# numbers (the old behaviour).
+$InitialPortOffset = $cfg.InitialPortOffset
+if ($InitialPortOffset -lt 0 -or $InitialPortOffset -gt $PortOffsetMax) {
+    Fail "ERROR: initialPortOffset must be between 0 and $PortOffsetMax, got $InitialPortOffset"
+}
+
+$PortOffset = $InitialPortOffset
 while ($PortOffset -le $PortOffsetMax) {
     $freeRange = $true
     foreach ($p in $HostPortNumbers) {
@@ -553,7 +597,7 @@ while ($PortOffset -le $PortOffsetMax) {
     $PortOffset += $PortOffsetStep
 }
 if ($PortOffset -gt $PortOffsetMax) {
-    Fail "ERROR: no free port range found (tried offset 0..$PortOffsetMax in $PortOffsetStep steps)"
+    Fail "ERROR: no free port range found (tried offset $InitialPortOffset..$PortOffsetMax in $PortOffsetStep steps)"
 }
 Write-Output "port offset: $PortOffset"
 
@@ -690,6 +734,14 @@ function New-Worktree {
     $baseLabel = if ($BaseRef) { $BaseRef } else { '<origin/HEAD>' }
     Write-Output "worktree: $Repo (base $baseLabel)"
 
+    # Keep this repo's worktree admin files from being auto-pruned by gc (see the
+    # Bash script for the full rationale). The default 3-month expiry lets a
+    # background gc drop the metadata of a worktree whose directory is momentarily
+    # unreachable -- a stopped devcontainer / unmounted volume -- which then marks
+    # a live worktree "prunable". 'never' disables that expiry; the explicit
+    # 'git worktree prune' below still removes genuinely deleted worktrees.
+    Invoke-Git -RepoDir $src -GitArgs @('config', 'gc.worktreePruneExpire', 'never') -AllowFailure -Quiet | Out-Null
+
     # Prune stale worktree entries before adding. Without this, a failed or
     # mis-pathed previous spawn leaves git metadata pointing at a deleted
     # directory, causing "already used by worktree" on the next attempt.
@@ -755,20 +807,113 @@ function New-Worktree {
     Convert-WorktreeLinkToRelative -WorktreeDir $dst
 }
 
-# Host-mount repos: an entry with an EMPTY baseRef is not a git repo -- no
-# worktree is created. Instead the host directory <SourceWs>/<repo> is
-# bind-mounted straight into the workspace at the same path a worktree would
-# occupy. Use this for pre-built artifacts / non-versioned dirs that should
-# still be visible and buildable inside the container. (Mono-repo's synthetic
-# entry also has an empty base ref but IS a real git repo, hence the guard.)
+# clone mode counterpart of New-Worktree: provision each repo as an INDEPENDENT
+# local clone with its own branch instead of a git worktree. Shares no git
+# metadata with the source, so parallel stories never contend on worktree state
+# or hit gc "prunable" races. Objects are hard-linked from the local source
+# (fast, offline); the working copy / index / branches are self-contained. All
+# host mounts stay exactly as in worktree mode.
+function New-Clone {
+    param(
+        [Parameter(Mandatory = $true)][string] $Repo,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BaseRef
+    )
+
+    $src = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $Repo }
+    $dst = Join-Path $WsDir $Repo
+
+    if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) {
+        Write-Output "skip ${Repo}: no git repo at $src"
+        return
+    }
+
+    $baseLabel = if ($BaseRef) { $BaseRef } else { '<origin/HEAD>' }
+    Write-Output "clone: $Repo (base $baseLabel)"
+
+    # Real upstream URL captured before cloning: a clone of a local path would
+    # otherwise have origin pointing at the source DIRECTORY, breaking push.
+    $originUrl = Invoke-Git -RepoDir $src -GitArgs @('remote', 'get-url', 'origin') -AllowFailure -Quiet
+
+    # Local clone: hard-linked objects, no worktree registration in the source.
+    Invoke-Git -RepoDir $src -GitArgs @('clone', '--quiet', $src, $dst) | Out-Null
+
+    # Repoint origin at the real upstream and refresh so refs/remotes/origin/*
+    # reflect the CURRENT origin state (the local clone initially mirrored the
+    # source's possibly-stale local branches). Offline: keep the local state.
+    if ($originUrl) {
+        Invoke-Git -RepoDir $dst -GitArgs @('remote', 'set-url', 'origin', $originUrl) | Out-Null
+        Invoke-Git -RepoDir $dst -GitArgs @('fetch', '--quiet', 'origin') -AllowFailure -Quiet | Out-Null
+    }
+
+    # Story branch resolved against origin only (an isolated clone has no stake
+    # in the source's local branches):
+    #  (i)  origin/<Branch> exists -> local branch tracking it (re-spawn / shared)
+    #  (ii) otherwise              -> new branch from origin/<BaseRef> (or HEAD)
+    if (Test-GitSucceeded -RepoDir $dst -GitArgs @('show-ref', '--verify', '--quiet', "refs/remotes/origin/$Branch")) {
+        Write-Output "  tracking origin/$Branch"
+        Invoke-Git -RepoDir $dst -GitArgs @('checkout', '--quiet', '-b', $Branch, '--track', "origin/$Branch") | Out-Null
+    } else {
+        $base = ''
+        if ($BaseRef -and (Test-GitSucceeded -RepoDir $dst -GitArgs @('show-ref', '--verify', '--quiet', "refs/remotes/origin/$BaseRef"))) {
+            $base = "origin/$BaseRef"
+        } else {
+            if ($BaseRef) {
+                Write-Output "  note: base '$BaseRef' not found in $Repo, using origin/HEAD instead"
+            }
+            $base = Invoke-Git -RepoDir $dst -GitArgs @('symbolic-ref', '--short', 'refs/remotes/origin/HEAD') -AllowFailure -Quiet
+            if (-not $base) { $base = 'origin/main' }
+        }
+        Write-Output "  new branch from $base"
+        # --no-track: same reason as worktree mode -- forking from a remote-
+        # tracking ref must not wire it up as upstream, or push.default=simple
+        # refuses a plain 'git push'. The first 'git push -u origin HEAD' fixes it.
+        Invoke-Git -RepoDir $dst -GitArgs @('checkout', '--quiet', '--no-track', '-b', $Branch, $base) | Out-Null
+    }
+
+    # The host-mount-friendly git config the worktree path sets on the SOURCE
+    # repo (so worktrees inherit it) has to be set on the clone itself: a fresh
+    # clone gets git's auto-detected defaults, not the source's config, yet it
+    # lives on the same bind mount and would otherwise hit the rebase stat-drift
+    # worked around in post-create.sh.
+    Invoke-Git -RepoDir $dst -GitArgs @('config', 'core.fileMode', 'false') | Out-Null
+    Invoke-Git -RepoDir $dst -GitArgs @('config', 'core.autocrlf', 'input') | Out-Null
+    Invoke-Git -RepoDir $dst -GitArgs @('config', 'core.checkStat', 'minimal') | Out-Null
+    Invoke-Git -RepoDir $dst -GitArgs @('config', 'core.trustctime', 'false') | Out-Null
+}
+
+# Host-mount repos are orthogonal to $RepoMode: they are non-git data, so there
+# is nothing to worktree/clone in any mode -- they stay bind-mounted from the
+# source (including under container mode; there is no in-container clone for a
+# non-git directory). (Mono-repo's synthetic entry also has an empty base ref
+# but IS a real git repo, hence the guard.)
 $HostMountRepos = @()
+# container mode collects, per git repo, what post-create.sh needs to clone it
+# INSIDE the container: the real upstream URL and the base ref.
+$ContainerRepos = @()
 foreach ($entry in $Repos) {
     if (-not $MonoRepo -and [string]::IsNullOrEmpty($entry.BaseRef)) {
         Write-Output "host-mount: $($entry.Name) (bind $SourceWs\$($entry.Name), no worktree)"
         $HostMountRepos += $entry.Name
         continue
     }
-    New-Worktree -Repo $entry.Name -BaseRef $entry.BaseRef
+    switch ($RepoMode) {
+        'worktree' { New-Worktree -Repo $entry.Name -BaseRef $entry.BaseRef }
+        'clone'    { New-Clone   -Repo $entry.Name -BaseRef $entry.BaseRef }
+        'container' {
+            $csrc = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $entry.Name }
+            if (Test-Path -LiteralPath (Join-Path $csrc '.git')) {
+                $url = Invoke-Git -RepoDir $csrc -GitArgs @('remote', 'get-url', 'origin') -AllowFailure -Quiet
+                if (-not $url) {
+                    Fail "ERROR: repo '$($entry.Name)' has no origin remote -- container mode clones inside the container and needs one"
+                }
+                $baseLabel = if ($entry.BaseRef) { $entry.BaseRef } else { '<origin/HEAD>' }
+                Write-Output "container-clone: $($entry.Name) (base $baseLabel, $url)"
+                $ContainerRepos += [pscustomobject]@{ Name = $entry.Name; BaseRef = $entry.BaseRef; Url = $url }
+            } else {
+                Write-Output "skip $($entry.Name): no git repo at $csrc"
+            }
+        }
+    }
 }
 
 # Each source repo has its own .git/config which can ship with stale settings
@@ -778,17 +923,24 @@ foreach ($entry in $Repos) {
 # config trumps global. Set them locally per source repo so the container-
 # friendly values stick everywhere. autocrlf=input additionally keeps the
 # checked-out worktree free of CRLF, which the Linux build would trip over.
-foreach ($repo in $RepoNames) {
-    $srcRepo = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $repo }
-    if (-not (Test-Path -LiteralPath (Join-Path $srcRepo '.git'))) { continue }
-    Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.fileMode', 'false') | Out-Null
-    Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.autocrlf', 'input') | Out-Null
-    # Same as the --global settings in post-create.sh, but written locally so
-    # they survive even if a future global gets cleared. checkStat/trustctime
-    # work around bind-mount stat drift that makes rebase steps spuriously abort
-    # with "Your local changes would be overwritten".
-    Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.checkStat', 'minimal') | Out-Null
-    Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.trustctime', 'false') | Out-Null
+#
+# WORKTREE MODE ONLY: clone mode sets the same config on the clone itself (see
+# New-Clone; it does not share the source's config) and must not mutate the
+# source repo. Container mode clones onto a Linux volume where these bind-mount
+# workarounds are irrelevant.
+if ($RepoMode -eq 'worktree') {
+    foreach ($repo in $RepoNames) {
+        $srcRepo = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $repo }
+        if (-not (Test-Path -LiteralPath (Join-Path $srcRepo '.git'))) { continue }
+        Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.fileMode', 'false') | Out-Null
+        Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.autocrlf', 'input') | Out-Null
+        # Same as the --global settings in post-create.sh, but written locally so
+        # they survive even if a future global gets cleared. checkStat/trustctime
+        # work around bind-mount stat drift that makes rebase steps spuriously abort
+        # with "Your local changes would be overwritten".
+        Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.checkStat', 'minimal') | Out-Null
+        Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.trustctime', 'false') | Out-Null
+    }
 }
 
 # ============================================================================
@@ -861,6 +1013,20 @@ if ($HostMountRepos.Count -gt 0) {
         $pruneParts += "-path $WorkspacePath/$repo"
     }
     $HostMountPrune = '\( ' + ($pruneParts -join ' -o ') + ' \) -prune -o '
+}
+
+# container mode: one Docker named volume per repo, mounted where a worktree /
+# clone would sit. The repo's whole tree (working copy, node_modules, target/)
+# lives on the volume -- no host bind for repo content, no separate nm/target
+# volumes -- and post-create.sh clones into it. An empty placeholder dir gives
+# the volume a mountpoint inside the workspaceMount; it stays empty on the host.
+# Removed on dispose via docker inspect. Empty in worktree / clone mode.
+$ContainerRepoMounts = ''
+foreach ($cr in $ContainerRepos) {
+    New-Item -ItemType Directory -Path (Join-Path $WsDir $cr.Name) -Force | Out-Null
+    $slug = ($cr.Name -replace '[/_]', '-')
+    $volName = "$ProjectShort-$Leaf-$slug-repo"
+    $ContainerRepoMounts += "        ,`"source=$volName,target=$WorkspacePath/$($cr.Name),type=volume`"`n"
 }
 
 # ============================================================================
@@ -968,7 +1134,10 @@ if ($MonoRepo -and -not $BuildsDefined -and (Test-Path -LiteralPath (Join-Path $
 foreach ($entry in $BuildEntries) {
     $r = $entry.Repo
     $val = $entry.Value
-    if (Test-Path -LiteralPath (Join-Path $WsDir "$r\pom.xml")) {
+    # Container mode has no host checkout yet (cloned inside the container in
+    # post-create), so the pom.xml can't be tested for; emit the root-pom entry
+    # for every mvn-goal build instead. worktree / clone keep the existence check.
+    if ((Test-Path -LiteralPath (Join-Path $WsDir "$r\pom.xml")) -or ($IsContainerMode -and $entry.Type -eq 'mvn')) {
         $MavenPomsList += "                <option value=`"`$PROJECT_DIR`$/$r/pom.xml`" />`n"
     }
     if ($entry.Type -eq 'cmd') {
@@ -982,6 +1151,18 @@ foreach ($entry in $BuildEntries) {
     }
 }
 $MavenBuildCommands = $MavenBuildCommands.TrimEnd("`n")
+
+# container mode: the clone calls post-create.sh runs INSIDE the container, one
+# per git repo, from the upstream URL captured in the repo loop. The story branch
+# ($Branch) is the same for all; the base ref is per repo. Single-quoted so URLs
+# survive the splice. Empty in worktree / clone mode -> placeholder line removed.
+$ContainerCloneCommands = ''
+if ($IsContainerMode) {
+    foreach ($cr in $ContainerRepos) {
+        $ContainerCloneCommands += "clone_repo_bg '$($cr.Name)' '$($cr.Url)' '$Branch' '$($cr.BaseRef)'`n"
+    }
+}
+$ContainerCloneCommands = $ContainerCloneCommands.TrimEnd("`n")
 
 Write-LfFile -Path (Join-Path $WsDir '.idea\misc.xml') -Content @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1771,13 +1952,16 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
     //   2. named volume per story  -> overrides per-project state (history, todos)
     //   3. shared memory bind      -> overrides only the memory/ subfolder back to shared
     "mounts": [
+        // __WORKTREE_MOUNT_BLOCK_START__
         // Source workspace. A worktree's .git file points at
         //   ../../<PROJECT_NAME>/<repo>/.git/worktrees/<name>
         // so the source repos must be reachable next to the story workspace;
         // without this mount git reports "not a git repository" for every
         // worktree, the 'branches' helper shows '?', and IntelliJ/Maven get
-        // confused about the module structure.
+        // confused about the module structure. clone mode keeps it (mounts stay
+        // identical); container mode drops it -- there is no host checkout.
         "source=__SOURCE_WS_HOST__,target=__SOURCE_WS__,type=bind",
+        // __WORKTREE_MOUNT_BLOCK_END__
 
         // Project-level Claude skills are shared back to the SOURCE workspace so
         // that skills created or edited by an agent inside one story container
@@ -1867,6 +2051,12 @@ __NPM_NM_VOLUME_MOUNTS__
         // bind-mount bottleneck. Disposable per build; removed automatically on
         // dispose.
 __MVN_TARGET_VOLUME_MOUNTS__
+        // container repo volumes: one Docker named volume per repo (container
+        // repo mode only). The repo -- working copy, node_modules and target/ --
+        // lives entirely on the volume; post-create.sh clones into it. Replaces
+        // the host bind + nm/target volumes of the other modes. Removed on
+        // dispose via docker inspect like the volumes above.
+__CONTAINER_REPO_MOUNTS__
     ],
 
     "remoteUser": "vscode",
@@ -2357,6 +2547,75 @@ done
 BRANCHES
 sudo chmod +x /usr/local/bin/branches
 
+# container repo mode: clone each source repo from its upstream, INSIDE the
+# container, onto its per-repo named volume. No repo is bind-mounted from the
+# host in this mode, so this must run before the ownership fixes and the warmup
+# build below. Runs as vscode, so git uses the mounted ssh / gh / glab
+# credentials. A fresh named volume is root:root, hence the chown before cloning
+# into the mountpoint. The clone_repo calls are spliced in below and are EMPTY in
+# worktree / clone mode, making this whole section a no-op there.
+clone_repo() {
+    local repo="$1" url="$2" branch="$3" base="$4"
+    local dir="__WORKSPACE_PATH__/${repo}"
+    sudo chown vscode:vscode "${dir}"
+    if [[ -e "${dir}/.git" ]]; then
+        echo "  ${repo}: already present, skipping clone"
+        return
+    fi
+    echo "--- cloning ${repo} from ${url} ---"
+    # Strictly non-interactive: postCreate has no TTY, so ANY prompt hangs it
+    # forever. A fresh container's known_hosts may not yet trust the git host, so
+    # an ssh (git@...) clone would block on "Are you sure you want to continue
+    # connecting?"; StrictHostKeyChecking=accept-new auto-trusts it. BatchMode=yes
+    # makes ssh fail instead of prompting for a key passphrase (keys come from the
+    # mounted ssh-agent), GIT_TERMINAL_PROMPT=0 stops git from asking for
+    # HTTP(S) credentials, and ConnectTimeout bounds a dead network. A genuine
+    # auth failure then surfaces via the ERR trap (fast, diagnosable) instead of
+    # an endless "Creating container…" hang.
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15' \
+        git clone --quiet "${url}" "${dir}"
+    git -C "${dir}" config core.fileMode false
+    if git -C "${dir}" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+        echo "  tracking origin/${branch}"
+        git -C "${dir}" checkout --quiet -b "${branch}" --track "origin/${branch}"
+    else
+        local start
+        if [[ -n "${base}" ]] && git -C "${dir}" show-ref --verify --quiet "refs/remotes/origin/${base}"; then
+            start="origin/${base}"
+        else
+            start="$(git -C "${dir}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+        fi
+        echo "  new branch ${branch} from ${start}"
+        git -C "${dir}" checkout --quiet --no-track -b "${branch}" "${start}"
+    fi
+}
+
+# Clone the repos CONCURRENTLY: a fresh container fetches every repo over the
+# network, which dominates first-start time, so a capped background pool cuts it
+# several-fold. clone_repo_bg throttles to CLONE_MAX_PARALLEL in-flight clones;
+# each clone runs as a background job and any failure is captured (via wait -n's
+# exit status) and turned into a hard error once the pool drains -- a bad repo
+# must NOT be silently skipped under set -e. The ERR trap is inherited into the
+# background subshells (set -E), so a failing clone still prints its culprit.
+# Empty in worktree / clone mode, so this whole block is a no-op there.
+CLONE_MAX_PARALLEL=6
+_clone_fail=0
+clone_repo_bg() {
+    while (( $(jobs -rp | wc -l) >= CLONE_MAX_PARALLEL )); do
+        wait -n || _clone_fail=1
+    done
+    clone_repo "$@" &
+}
+__CONTAINER_CLONE_COMMANDS__
+while (( $(jobs -rp | wc -l) > 0 )); do
+    wait -n || _clone_fail=1
+done
+if (( _clone_fail != 0 )); then
+    echo "ERROR: at least one repo clone failed (see the messages above)" >&2
+    exit 1
+fi
+
 # Fix ownership of the per-module node_modules Docker named volumes.
 # Each npm module's node_modules is mounted as a named volume so npm writes at
 # Linux-native speed instead of through the slow host bind-mount. A freshly
@@ -2432,7 +2691,8 @@ echo "post-create done."
 $postCreatePath = Join-Path $WsDir '.devcontainer\post-create.sh'
 $pc = (Read-TextFile $postCreatePath).
         Replace('__MAVEN_BUILD_COMMANDS__', $MavenBuildCommands).
-        Replace('__HOST_MOUNT_PRUNE__', $HostMountPrune)
+        Replace('__HOST_MOUNT_PRUNE__', $HostMountPrune).
+        Replace('__CONTAINER_CLONE_COMMANDS__', $ContainerCloneCommands)
 Write-LfFile -Path $postCreatePath -Content $pc
 
 # Copy the optional initialization hook into the workspace's .devcontainer/.
@@ -2855,6 +3115,9 @@ function Update-Placeholders {
     $text = Remove-ConditionalBlock -Text $text -Name 'APT_PKGS' -Enabled $AptPkgsEnabled
     $text = Remove-ConditionalBlock -Text $text -Name 'RECENT_GIT' -Enabled $RecentGitEnabled
     $text = Remove-ConditionalBlock -Text $text -Name 'CHROMIUM' -Enabled $ChromiumEnabled
+    # Worktree self-bind: kept in worktree/clone mode, dropped in container mode
+    # (no host checkout to resolve). Not nested in any other block.
+    $text = Remove-ConditionalBlock -Text $text -Name 'WORKTREE_MOUNT' -Enabled (-not $IsContainerMode)
     # Distro split. MUST run last: the DEB/RPM markers are nested INSIDE several
     # of the blocks above (CA, APT_HTTPS, APT_PKGS, RECENT_GIT, CHROMIUM), and
     # Remove-ConditionalBlock has no nesting depth counter -- it relies on the
@@ -2874,7 +3137,9 @@ $dcText = (Read-TextFile $dcPath).
             Replace("__NPM_NM_VOLUME_MOUNTS__`n", $NpmVolumeMounts).
             Replace('__NPM_NM_VOLUME_MOUNTS__', $NpmVolumeMounts.TrimEnd("`n")).
             Replace("__MVN_TARGET_VOLUME_MOUNTS__`n", $MvnTargetVolumeMounts).
-            Replace('__MVN_TARGET_VOLUME_MOUNTS__', $MvnTargetVolumeMounts.TrimEnd("`n"))
+            Replace('__MVN_TARGET_VOLUME_MOUNTS__', $MvnTargetVolumeMounts.TrimEnd("`n")).
+            Replace("__CONTAINER_REPO_MOUNTS__`n", $ContainerRepoMounts).
+            Replace('__CONTAINER_REPO_MOUNTS__', $ContainerRepoMounts.TrimEnd("`n"))
 Write-LfFile -Path $dcPath -Content $dcText
 
 Update-Placeholders -Path $dcPath
