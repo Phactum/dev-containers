@@ -904,11 +904,26 @@ foreach ($entry in $Repos) {
             if (Test-Path -LiteralPath (Join-Path $csrc '.git')) {
                 $url = Invoke-Git -RepoDir $csrc -GitArgs @('remote', 'get-url', 'origin') -AllowFailure -Quiet
                 if (-not $url) {
-                    Fail "ERROR: repo '$($entry.Name)' has no origin remote -- container mode clones inside the container and needs one"
+                    # A repo with no 'origin' can't be cloned inside the container.
+                    # Rather than abort, offer an empty, writable volume at its
+                    # workspace path for the user to populate by hand (e.g. unpack
+                    # a ZIP). --yes proceeds without asking.
+                    Write-Err "WARNING: repo '$($entry.Name)' has no 'origin' remote, so container mode cannot clone it"
+                    Write-Err "  inside the container. It can instead get an EMPTY, writable volume at"
+                    Write-Err "  $WorkspacePath/$($entry.Name) for you to populate yourself (e.g. unpack a ZIP)."
+                    if (-not $AssumeYes) {
+                        $reply = Read-Host "  Continue with an empty dir for '$($entry.Name)'? [Y/n]"
+                        if ($reply -match '^[Nn]') {
+                            Fail "aborted. Remove the partial workspace with 'dispose-workspace.ps1 $Branch'."
+                        }
+                    }
+                    Write-Output "container-prepare: $($entry.Name) (no origin -- empty writable volume)"
+                    $ContainerRepos += [pscustomobject]@{ Name = $entry.Name; BaseRef = $entry.BaseRef; Url = '' }
+                } else {
+                    $baseLabel = if ($entry.BaseRef) { $entry.BaseRef } else { '<origin/HEAD>' }
+                    Write-Output "container-clone: $($entry.Name) (base $baseLabel, $url)"
+                    $ContainerRepos += [pscustomobject]@{ Name = $entry.Name; BaseRef = $entry.BaseRef; Url = $url }
                 }
-                $baseLabel = if ($entry.BaseRef) { $entry.BaseRef } else { '<origin/HEAD>' }
-                Write-Output "container-clone: $($entry.Name) (base $baseLabel, $url)"
-                $ContainerRepos += [pscustomobject]@{ Name = $entry.Name; BaseRef = $entry.BaseRef; Url = $url }
             } else {
                 Write-Output "skip $($entry.Name): no git repo at $csrc"
             }
@@ -2558,6 +2573,13 @@ clone_repo() {
     local repo="$1" url="$2" branch="$3" base="$4"
     local dir="__WORKSPACE_PATH__/${repo}"
     sudo chown vscode:vscode "${dir}"
+    # No URL: a source repo with no 'origin' remote (spawn asked and you agreed).
+    # Just hand over an empty, vscode-owned dir to populate by hand (e.g. unpack
+    # a ZIP). The chown above already made the fresh volume writable.
+    if [[ -z "${url}" ]]; then
+        echo "  ${repo}: no origin remote -- left as an empty writable dir (populate it manually)"
+        return
+    fi
     if [[ -e "${dir}/.git" ]]; then
         echo "  ${repo}: already present, skipping clone"
         return
