@@ -99,8 +99,12 @@ Things that follow from this and must stay in lockstep across both ports:
 - **container mode clones inside the container.** Spawn captures each repo's
   `git remote get-url origin` and bakes `clone_repo_bg '<repo>' '<url>' '<branch>'
   '<base>'` calls into `post-create.sh` (placeholder `__CONTAINER_CLONE_COMMANDS__`,
-  spliced). A repo with no `origin` remote is a hard error in this mode. The
-  clones run as `vscode` using the mounted ssh/gh/glab creds, after a `chown` of
+  spliced). A repo with no `origin` remote can't be cloned: spawn WARNs and
+  asks whether to continue (`--yes` proceeds); on confirmation it gets an empty,
+  vscode-owned volume at its workspace path (an empty `url` makes `clone_repo`
+  only `chown` the mountpoint, then return) for the user to populate by hand
+  (e.g. unpack a ZIP); declining aborts. The clones run as `vscode` using the
+  mounted ssh/gh/glab creds, after a `chown` of
   the root:root fresh volume mountpoint, and BEFORE the ownership fixes + warmup.
   They run **concurrently** through a capped background pool (`clone_repo_bg`,
   `CLONE_MAX_PARALLEL=6`, drained + failure-checked via `wait -n`) because the
