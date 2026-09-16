@@ -1182,8 +1182,27 @@ for entry in "${REPOS[@]}"; do
             fi
             _url="$(git -C "${_src}" remote get-url origin 2>/dev/null || true)"
             if [[ -z "${_url}" ]]; then
-                echo "ERROR: repo '${repo}' has no origin remote -- container mode clones inside the container and needs one" >&2
-                exit 1
+                # A repo with no 'origin' can't be cloned inside the container.
+                # Rather than abort, offer to give it an empty, writable volume at
+                # its workspace path that the user populates by hand (e.g. copy in
+                # a ZIP and unpack it). --yes proceeds without asking.
+                echo "WARNING: repo '${repo}' has no 'origin' remote, so container mode cannot clone it" >&2
+                echo "  inside the container. It can instead get an EMPTY, writable volume at" >&2
+                echo "  ${WORKSPACE_PATH}/${repo} for you to populate yourself (e.g. unpack a ZIP)." >&2
+                if (( ASSUME_YES == 0 )); then
+                    read -r -p "  Continue with an empty dir for '${repo}'? [Y/n] " _reply
+                    case "${_reply}" in
+                        [Nn]*)
+                            echo "aborted. Remove the partial workspace with '${DISPOSE_CMD} ${BRANCH}'." >&2
+                            exit 1
+                            ;;
+                    esac
+                fi
+                echo "container-prepare: ${repo} (no origin -- empty writable volume)"
+                CONTAINER_REPOS+=("${repo}")
+                CONTAINER_BASES+=("${base_ref}")
+                CONTAINER_URLS+=("")
+                continue
             fi
             echo "container-clone: ${repo} (base ${base_ref:-<origin/HEAD>}, ${_url})"
             CONTAINER_REPOS+=("${repo}")
@@ -3236,6 +3255,13 @@ clone_repo() {
     local repo="$1" url="$2" branch="$3" base="$4"
     local dir="__WORKSPACE_PATH__/${repo}"
     sudo chown vscode:vscode "${dir}"
+    # No URL: a source repo with no 'origin' remote (spawn asked and you agreed).
+    # Just hand over an empty, vscode-owned dir to populate by hand (e.g. unpack
+    # a ZIP). The chown above already made the fresh volume writable.
+    if [[ -z "${url}" ]]; then
+        echo "  ${repo}: no origin remote -- left as an empty writable dir (populate it manually)"
+        return
+    fi
     if [[ -e "${dir}/.git" ]]; then
         echo "  ${repo}: already present, skipping clone"
         return
