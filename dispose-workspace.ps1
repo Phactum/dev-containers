@@ -478,21 +478,39 @@ if (Test-Path -LiteralPath $WsDir) {
 # ============================================================================
 # 5. Optional: delete the local branch in each source repo
 # ============================================================================
-if ($DeleteBranch -and $Branch) {
+# Only worktree mode creates the story branch IN the source repos; clone mode
+# keeps its branch inside the clone and container mode inside the container's
+# volume, both already removed above. Decide by DETECTING whether the branch is
+# actually present in a source repo, NOT by trusting a repoMode value -- dispose
+# only sees the config's current default, which may differ from the mode this
+# workspace was spawned with (a --repo-mode override leaves no trace in the
+# config). $Branch is empty when the workspace had no host checkout (container).
+if ($DeleteBranch) {
     Write-Output ''
-    Write-Output "deleting local branch '$Branch' in source repos:"
-    foreach ($repo in $RepoNames) {
-        $src = Get-SourceRepoDir -Repo $repo
-        if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { continue }
-        if (-not (Test-GitSucceeded -RepoDir $src -GitArgs @('show-ref', '--verify', '--quiet', "refs/heads/$Branch"))) {
-            continue
+    if (-not $Branch) {
+        Write-Output "--delete-branch: the workspace had no host-side git checkout to read a branch"
+        Write-Output "  from (container mode), so there is no source-repo branch to delete."
+    } else {
+        $foundBranch = $false
+        foreach ($repo in $RepoNames) {
+            $src = Get-SourceRepoDir -Repo $repo
+            if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { continue }
+            if (-not (Test-GitSucceeded -RepoDir $src -GitArgs @('show-ref', '--verify', '--quiet', "refs/heads/$Branch"))) {
+                continue
+            }
+            $foundBranch = $true
+            Write-Output "deleting local branch '$Branch' in $repo"
+            $flag = if ($Force) { '-D' } else { '-d' }
+            $out = Invoke-Git -RepoDir $src -GitArgs @('branch', $flag, $Branch) -AllowFailure
+            if ($script:LastGitExitCode -ne 0) {
+                Write-Err "  ${repo}: branch not fully merged, keep or rerun with --force"
+            } elseif ($out) {
+                Write-Output "  $out"
+            }
         }
-        $flag = if ($Force) { '-D' } else { '-d' }
-        $out = Invoke-Git -RepoDir $src -GitArgs @('branch', $flag, $Branch) -AllowFailure
-        if ($script:LastGitExitCode -ne 0) {
-            Write-Err "  ${repo}: branch not fully merged, keep or rerun with --force"
-        } elseif ($out) {
-            Write-Output "  $out"
+        if (-not $foundBranch) {
+            Write-Output "--delete-branch: branch '$Branch' is not present in any source repo -- clone /"
+            Write-Output "  container mode keeps it inside the removed clone/container, so nothing to delete."
         }
     }
 }
