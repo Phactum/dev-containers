@@ -147,6 +147,23 @@
     // port numbers, so a free 8080 on the host stays 8080).
     "initialPortOffset": 10000,
 
+    // OPTIONAL per-container memory cap, passed straight to `docker run` via
+    // runArgs. Both keys are optional; omit BOTH (or set null / "") and no memory
+    // flag is emitted -- the container may use the whole Docker VM, exactly as
+    // before. Values are docker size strings (e.g. "16g", "512m", "2048k", or a
+    // bare byte count); units are powers of 1024.
+    //   vmRamSize  -> --memory=<size>        hard RAM ceiling for the container.
+    //   vmSwapSize -> --memory-swap=<total>  the SWAP portion; the scripts add it
+    //                 to vmRamSize because docker's --memory-swap is the
+    //                 memory+swap TOTAL, not the swap size on its own. Requires
+    //                 vmRamSize (docker rejects --memory-swap without --memory).
+    // NOTE: on Docker Desktop / Colima every container shares one Linux VM, so
+    // --memory can only CAP a container, never give it more RAM than the VM has;
+    // more real headroom means enlarging the Docker VM itself. More swap
+    // (vmSwapSize), on the other hand, does reduce OOM kills on short spikes.
+    // "vmRamSize": "16g",
+    // "vmSwapSize": "2g",
+
     // OPTIONAL. Login shell IntelliJ's built-in terminal opens inside the
     // container. Omit it (or set null / "") and the shell is left unset in
     // .idea/workspace.xml, so JetBrains auto-detects one -- and it prefers zsh
