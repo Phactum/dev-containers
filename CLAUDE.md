@@ -439,6 +439,21 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   stays a host bind mount so the artifact cache is shared with the host and
   across workspaces (a per-workspace volume would force a full re-download each
   spawn).
+- **Per-container memory cap (`vmRamSize` / `vmSwapSize`).** Both optional; each
+  maps to a `docker run` flag emitted into `devcontainer.json` runArgs at
+  placeholder `__VM_MEM_RUNARGS__` (built next to `PORT_RUNARGS` / `$PortRunArgs`,
+  substituted like it). `vmRamSize` → `--memory=<size>`. `vmSwapSize` → `--memory-swap`,
+  and **docker's `--memory-swap` is the memory+swap TOTAL, not the swap size** —
+  so the scripts convert both sizes to bytes (`_size_to_bytes` / `Convert-SizeToBytes`,
+  units are powers of 1024) and emit `ram+swap`. `vmSwapSize` therefore REQUIRES
+  `vmRamSize` (docker rejects `--memory-swap` without `--memory`); that pairing is
+  a hard error in both spawn scripts. Omitting both leaves runArgs byte-identical.
+  The snippet ends with a trailing `", "` and sits before `__PORT_RUNARGS__`; the
+  resulting trailing comma is fine because `devcontainer.json` is JSONC (the same
+  reason a portless `PORT_RUNARGS` already leaves one). Docker-VM reality: on
+  Docker Desktop / Colima `--memory` only CAPS a container within the shared VM's
+  RAM — it never adds headroom; only a bigger VM does. More swap does cut OOM
+  kills on spikes.
 - **Mono-repo mode:** `"repos": []` switches spawn to single-worktree mode; if
   the `builds` key is omitted entirely (not merely `[]`) and a root `pom.xml`
   exists it auto-populates a single `install` `mvn-goal` build.

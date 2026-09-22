@@ -19,6 +19,7 @@
 
         ProjectName, ProjectShort, BaseImage, NodeFeatureVersion,
         GlabVersion, GlabHostname, GhVersion, PortOffsetStep, InitialPortOffset, TerminalShell
+        VmRamSize, VmSwapSize
         Distro, RepoMode
         Repos             [ @{ Name; BaseRef } ]
         HostPorts         [ @{ Port; Label } ]
@@ -230,6 +231,13 @@ function Get-DevContainerConfig {
         # in-container path (e.g. /bin/bash) to pin it.
         TerminalShell      = & $str 'terminalShell'
         WorkspacesRoot     = & $str 'workspacesRoot'
+        # Optional per-container memory cap, mapped to docker run --memory /
+        # --memory-swap via runArgs. Both empty (the default) leave runArgs
+        # untouched. vmSwapSize is the SWAP portion only; spawn-workspace.ps1
+        # turns it into docker's --memory-swap (memory+swap TOTAL) by adding it
+        # to vmRamSize.
+        VmRamSize          = & $str 'vmRamSize'
+        VmSwapSize         = & $str 'vmSwapSize'
         ProxyHttp          = ''
         ProxyHttps         = ''
         ProxyNoProxy       = ''
