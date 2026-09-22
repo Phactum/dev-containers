@@ -91,6 +91,12 @@ GLAB_HOSTNAME="$(_env_scalar '.glabHostname')"
 GH_VERSION="$(_env_scalar '.ghVersion')"
 PORT_OFFSET_STEP="$(_env_scalar '.portOffsetStep // 10000')"
 INITIAL_PORT_OFFSET="$(_env_scalar '.initialPortOffset // 10000')"
+# Optional per-container memory cap, mapped to `docker run --memory` /
+# `--memory-swap` via runArgs. Both empty (the default) leave runArgs untouched.
+# vmSwapSize is the SWAP portion only; spawn-workspace.sh turns it into docker's
+# --memory-swap (which is the TOTAL of memory+swap) by adding it to vmRamSize.
+VM_RAM_SIZE="$(_env_scalar '.vmRamSize')"
+VM_SWAP_SIZE="$(_env_scalar '.vmSwapSize')"
 TERMINAL_SHELL="$(_env_scalar '.terminalShell')"
 WORKSPACES_ROOT_CONFIG="$(_env_scalar '.workspacesRoot')"
 

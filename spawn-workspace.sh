@@ -871,6 +871,59 @@ fi
 PORT_TABLE_ROWS="${PORT_TABLE_ROWS%$'\n'}"
 PORT_OUTPUT_LINES="${PORT_OUTPUT_LINES%$'\n'}"
 
+# Optional per-container memory cap (vmRamSize / vmSwapSize in devcontainers-config.json),
+# emitted into devcontainer.json runArgs as "docker run" flags:
+#   vmRamSize  -> --memory=<size>        (hard RAM ceiling for the container)
+#   vmSwapSize -> --memory-swap=<total>  (docker's --memory-swap is memory+swap,
+#                 so it is computed as ram+swap in bytes, not the swap size alone)
+# Both optional; omitting BOTH leaves __VM_MEM_RUNARGS__ empty and the generated
+# runArgs byte-identical to before. Note that on Docker Desktop / Colima all
+# containers share one Linux VM: --memory can cap a container but never grant it
+# more RAM than the VM itself has -- raising real headroom needs a bigger VM.
+# vmSwapSize needs vmRamSize (docker rejects --memory-swap without --memory).
+VM_RAM_SIZE="${VM_RAM_SIZE:-}"
+VM_SWAP_SIZE="${VM_SWAP_SIZE:-}"
+VM_MEM_RUNARGS=""
+# Convert a docker size string (e.g. 16g, 512m, 2048k, 1073741824) to bytes.
+# Docker's units are powers of 1024; a bare number is bytes. Prints nothing and
+# returns 1 on a malformed value.
+_size_to_bytes() {
+    local s="$1" num unit
+    if [[ "${s}" =~ ^([0-9]+)([bBkKmMgG]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')"
+    else
+        return 1
+    fi
+    case "${unit}" in
+        ""|B) echo "${num}" ;;
+        K)    echo $(( num * 1024 )) ;;
+        M)    echo $(( num * 1024 * 1024 )) ;;
+        G)    echo $(( num * 1024 * 1024 * 1024 )) ;;
+    esac
+}
+if [[ -n "${VM_SWAP_SIZE}" && -z "${VM_RAM_SIZE}" ]]; then
+    echo "ERROR: vmSwapSize requires vmRamSize (docker --memory-swap needs --memory)" >&2
+    exit 1
+fi
+if [[ -n "${VM_RAM_SIZE}" ]]; then
+    if ! [[ "${VM_RAM_SIZE}" =~ ^[0-9]+[bBkKmMgG]?$ ]]; then
+        echo "ERROR: vmRamSize must be a docker size like 16g / 512m / 2048k, got '${VM_RAM_SIZE}'" >&2
+        exit 1
+    fi
+    VM_MEM_RUNARGS="\"--memory=${VM_RAM_SIZE}\", "
+    if [[ -n "${VM_SWAP_SIZE}" ]]; then
+        if ! [[ "${VM_SWAP_SIZE}" =~ ^[0-9]+[bBkKmMgG]?$ ]]; then
+            echo "ERROR: vmSwapSize must be a docker size like 1g / 512m / 2048k, got '${VM_SWAP_SIZE}'" >&2
+            exit 1
+        fi
+        _ram_bytes="$(_size_to_bytes "${VM_RAM_SIZE}")" || { echo "ERROR: cannot parse vmRamSize '${VM_RAM_SIZE}'" >&2; exit 1; }
+        _swap_bytes="$(_size_to_bytes "${VM_SWAP_SIZE}")" || { echo "ERROR: cannot parse vmSwapSize '${VM_SWAP_SIZE}'" >&2; exit 1; }
+        VM_MEM_RUNARGS="${VM_MEM_RUNARGS}\"--memory-swap=$(( _ram_bytes + _swap_bytes ))\", "
+    fi
+    echo "container memory cap: --memory=${VM_RAM_SIZE}${VM_SWAP_SIZE:+ + swap ${VM_SWAP_SIZE}}"
+fi
+
 # Pre-compute README template values that substitute_placeholders needs.
 # SSH_HOST_PORT: host-side port for the container's sshd (port 2222 + offset).
 # FIRST_REPO: first repo name, used as an example in the tab-completion docs.
@@ -2354,6 +2407,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         // capabilities, and --init reaps the processes it leaves behind.
         "--privileged", "--init",
         // __RPM_BLOCK_END__
+        __VM_MEM_RUNARGS__
         __PORT_RUNARGS__
     ],
 
@@ -2716,6 +2770,7 @@ substitute_placeholders() {
         -e "s/__LEAF__/${LEAF}/g" \
         "${PORT_SED_ARGS[@]}" \
         -e "s|__PORT_RUNARGS__|${PORT_RUNARGS}|g" \
+        -e "s|__VM_MEM_RUNARGS__|${VM_MEM_RUNARGS}|g" \
         -e "s/__PROJECT_NAME__/${PROJECT_NAME}/g" \
         -e "s/__PROJECT_SHORT__/${PROJECT_SHORT}/g" \
         -e "s|__WORKSPACE_PATH__|${WORKSPACE_PATH}|g" \

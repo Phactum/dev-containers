@@ -622,6 +622,51 @@ $PortRunArgs = $portRunArgsParts -join ', '
 $PortTableRows = $portTableRowsParts -join "`n"
 $PortOutputLines = $portOutputParts -join "`n"
 
+# Optional per-container memory cap (vmRamSize / vmSwapSize in devcontainers-config.json),
+# emitted into devcontainer.json runArgs as "docker run" flags:
+#   vmRamSize  -> --memory=<size>        (hard RAM ceiling for the container)
+#   vmSwapSize -> --memory-swap=<total>  (docker's --memory-swap is memory+swap,
+#                 so it is computed as ram+swap in bytes, not the swap size alone)
+# Both optional; omitting BOTH leaves $VmMemRunArgs empty and the generated
+# runArgs byte-identical to before. On Docker Desktop / Colima all containers
+# share one Linux VM, so --memory can cap a container but never grant it more RAM
+# than the VM has. vmSwapSize needs vmRamSize (docker rejects --memory-swap
+# without --memory).
+function Convert-SizeToBytes {
+    # Docker size string (16g, 512m, 2048k, or bare bytes) -> bytes. Units are
+    # powers of 1024. Throws on a malformed value.
+    param([string]$Size)
+    if ($Size -notmatch '^([0-9]+)([bBkKmMgG]?)$') { throw "cannot parse size '$Size'" }
+    $num = [long]$Matches[1]
+    switch ($Matches[2].ToUpperInvariant()) {
+        'K'     { $num * 1024L }
+        'M'     { $num * 1024L * 1024L }
+        'G'     { $num * 1024L * 1024L * 1024L }
+        default { $num }   # '' or 'B'
+    }
+}
+$VmRamSize  = $cfg.VmRamSize
+$VmSwapSize = $cfg.VmSwapSize
+$VmMemRunArgs = ''
+if ((-not [string]::IsNullOrWhiteSpace($VmSwapSize)) -and [string]::IsNullOrWhiteSpace($VmRamSize)) {
+    Fail "ERROR: vmSwapSize requires vmRamSize (docker --memory-swap needs --memory)"
+}
+if (-not [string]::IsNullOrWhiteSpace($VmRamSize)) {
+    if ($VmRamSize -notmatch '^[0-9]+[bBkKmMgG]?$') {
+        Fail "ERROR: vmRamSize must be a docker size like 16g / 512m / 2048k, got '$VmRamSize'"
+    }
+    $VmMemRunArgs = "`"--memory=$VmRamSize`", "
+    if (-not [string]::IsNullOrWhiteSpace($VmSwapSize)) {
+        if ($VmSwapSize -notmatch '^[0-9]+[bBkKmMgG]?$') {
+            Fail "ERROR: vmSwapSize must be a docker size like 1g / 512m / 2048k, got '$VmSwapSize'"
+        }
+        $total = (Convert-SizeToBytes $VmRamSize) + (Convert-SizeToBytes $VmSwapSize)
+        $VmMemRunArgs += "`"--memory-swap=$total`", "
+    }
+    $swapNote = if (-not [string]::IsNullOrWhiteSpace($VmSwapSize)) { " + swap $VmSwapSize" } else { '' }
+    Write-Output "container memory cap: --memory=$VmRamSize$swapNote"
+}
+
 # SSH_HOST_PORT: host-side port for the container's sshd (2222 + offset).
 # FIRST_REPO: first repo name, used as an example in the README's shortcut docs.
 $SshHostPort = 2222 + $PortOffset
@@ -1929,6 +1974,7 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
         // capabilities, and --init reaps the processes it leaves behind.
         "--privileged", "--init",
         // __RPM_BLOCK_END__
+        __VM_MEM_RUNARGS__
         __PORT_RUNARGS__
     ],
 
@@ -3058,6 +3104,7 @@ $Tokens = [ordered]@{
     '__PROJECT_NAME__'         = $ProjectName
     '__PROJECT_SHORT__'        = $ProjectShort
     '__PORT_RUNARGS__'         = $PortRunArgs
+    '__VM_MEM_RUNARGS__'       = $VmMemRunArgs
     '__WORKSPACE_PATH__'       = $WorkspacePath
     '__SOURCE_WS__'            = $SourceWsContainer
     '__WS_DIR_HOST__'          = (ConvertTo-DockerPath $WsDir)
