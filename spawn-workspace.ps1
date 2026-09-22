@@ -3281,11 +3281,34 @@ if ($RebuildBaseImage -or -not $baseExists) {
     # exit code via $LASTEXITCODE instead.
     $previousEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # PowerShell 7.3+ additionally honors $PSNativeCommandUseErrorActionPreference:
+    # when set, ANY stderr line from a native command (even on success) is
+    # promoted to a terminating error under $ErrorActionPreference = 'Stop'.
+    # Disable it locally so docker's normal BuildKit progress output (which it
+    # writes to stderr) doesn't abort the build.
+    $previousNativeEap = $null
+    $hasNativeEapVar = Test-Path Variable:\PSNativeCommandUseErrorActionPreference
+    if ($hasNativeEapVar) {
+        $previousNativeEap = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+    }
     try {
-        & docker @dockerBuildArgs 2>&1 | ForEach-Object { Write-Output $_ }
+        & docker @dockerBuildArgs 2>&1 | ForEach-Object {
+            # Native stderr lines arrive as ErrorRecord objects; unwrap them to
+            # plain text so they print as normal output instead of being
+            # rendered as a scary "NativeCommandError" PowerShell error record.
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                Write-Output $_.Exception.Message
+            } else {
+                Write-Output $_
+            }
+        }
         $buildExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousEap
+        if ($hasNativeEapVar) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeEap
+        }
     }
     if ($buildExit -ne 0) {
         Fail "base image build failed ($BaseImageTag) -- see docker output above"
