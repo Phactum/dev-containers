@@ -197,6 +197,14 @@
     //        the container (the ssh / gh / glab mounts already provide them).
     "repoMode": "container",
 
+    // Which AI coding assistant CLIs post-create.sh installs inside the
+    // container. Omit this key to get BOTH (the default -- existing configs are
+    // unchanged); list only the ones you want otherwise. An external partner
+    // that must NOT have Claude Code installed, for instance, sets just
+    // ["copilot"]. An explicit empty list [] installs neither. Recognised
+    // values: "claude-code", "copilot". Anything else is rejected as a typo.
+    //   "aiTools": [ "claude-code", "copilot" ],
+
     // --- DevContainer image & tooling versions ------------------------------
 
     // Package-manager family of the base image. Everything distro-specific in

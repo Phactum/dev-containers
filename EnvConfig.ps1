@@ -27,6 +27,8 @@
         ForwardedEnvVars  [ string ]
         Builds            [ @{ Repo; Type; Value } ]   Type = 'mvn' | 'cmd'
         BuildsDefined     bool -- whether the "builds" key was present
+        ClaudeCodeEnabled bool -- install Claude Code in post-create.sh
+        CopilotEnabled    bool -- install the GitHub Copilot CLI in post-create.sh
         MonoRepo          $true when Repos is empty
         WorkspacesRoot    '' unless the project pins one
         Path              the resolved config path
@@ -255,6 +257,10 @@ function Get-DevContainerConfig {
         ForwardedEnvVars   = @()
         Builds             = @()
         BuildsDefined      = $false
+        # Which AI coding assistant CLIs post-create.sh installs. Both default
+        # to on; "aiTools" narrows the set (see below).
+        ClaudeCodeEnabled  = $true
+        CopilotEnabled     = $true
         MonoRepo           = $false
     }
 
@@ -335,6 +341,25 @@ function Get-DevContainerConfig {
                 }
             })
         }
+    }
+
+    # Which AI coding assistant CLIs post-create.sh installs, driving the
+    # __CLAUDE_CODE_BLOCK_*__ / __COPILOT_BLOCK_*__ markers. Omit "aiTools" to get
+    # both (the default, so existing configs are unchanged); list only the ones
+    # to keep otherwise -- e.g. an external partner that must NOT have Claude Code
+    # sets ["copilot"]. An explicit empty list installs neither. Unknown entries
+    # are rejected to catch typos rather than silently installing nothing.
+    if (& $has 'aiTools') {
+        # Match the Bash side's `(.aiTools // [])`: a present-but-null key means
+        # "install neither", not "fall back to both".
+        $aiTools = @()
+        if ($null -ne $json.aiTools) { $aiTools = @($json.aiTools | ForEach-Object { [string]$_ }) }
+        $aiUnknown = @($aiTools | Where-Object { $_ -ne 'claude-code' -and $_ -ne 'copilot' })
+        if ($aiUnknown.Count -gt 0) {
+            throw "Invalid 'aiTools' entry in $($cfg.Path): $($aiUnknown -join ' ') (expected 'claude-code' and/or 'copilot')"
+        }
+        $cfg.ClaudeCodeEnabled = $aiTools -contains 'claude-code'
+        $cfg.CopilotEnabled    = $aiTools -contains 'copilot'
     }
 
     # Corporate proxy / TLS interception. All optional; absent means "not behind

@@ -38,7 +38,7 @@ Rules that follow from that:
 
 ## Conditional blocks in the templates
 
-Ten marker pairs drive optional content in the generated files. Each is
+Twelve marker pairs drive optional content in the generated files. Each is
 independent, and `substitute_placeholders` / `Update-Placeholders` either strips
 just the markers (feature on) or the markers **and** everything between them
 (feature off):
@@ -55,6 +55,8 @@ just the markers (feature on) or the markers **and** everything between them
 | `__APT_PKGS_BLOCK_*__` | `imageBuild.aptPackages` / `imageBuild.packages` |
 | `__RECENT_GIT_BLOCK_*__` | `imageBuild.recentGit` |
 | `__CHROMIUM_BLOCK_*__` | `imageBuild.chromium` (Dockerfile **and** the bpmn-to-image install in post-create.sh) |
+| `__CLAUDE_CODE_BLOCK_*__` | `aiTools` contains `claude-code` (the `npm install -g @anthropic-ai/claude-code` in post-create.sh) |
+| `__COPILOT_BLOCK_*__` | `aiTools` contains `copilot` (the `npm install -g @github/copilot` in post-create.sh) |
 | `__DEB_BLOCK_*__` / `__RPM_BLOCK_*__` | `distro` (`debian` \| `rocky`) â€” exactly one of the two survives |
 
 When adding optional content, wrap it in a marker pair rather than branching in
@@ -409,6 +411,19 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   falsely picked up as a Maven parent). Each subproject pom is registered
   individually in `.idea/misc.xml`; `post-create.sh` builds them in the
   dependency order given by the `builds` list.
+- **`.mvn/maven.config` at the workspace root pins the local repository.** It
+  contains `-Dmaven.repo.local=/home/vscode/.m2/repository` (the bind-mount
+  target of the host `~/.m2`). Without it, Maven inherits `<localRepository>`
+  from the bind-mounted host `settings.xml`; on a Windows host that is a
+  backslash path (`C:\Users\...\.m2\repository`) which Linux treats as relative,
+  so Maven resolves it under `$HOME` into the broken
+  `/home/vscode/C:\Users\...\.m2\repository`. A `-Dmaven.repo.local` CLI arg
+  overrides settings.xml, IntelliJ honours it via "Use settings from
+  .mvn/maven.config", and Maven's upward `.mvn` discovery applies it to every
+  repo and the warmup builds. A `.mvn` dir is not a pom, so it does NOT trigger
+  the false-parent problem above. Both spawn ports write it identically. A repo
+  that ships its OWN `.mvn/maven.config` shadows this one (Maven reads only the
+  nearest `.mvn`) -- that repo then needs the same line in its own file.
 - **Build-list config: per-entry `mvn-goal` XOR `command`.** One `builds` list;
   each entry sets exactly one of the two (both/neither is a hard error raised in
   `env-config.sh` / `EnvConfig.ps1`). `env-config.sh` normalises to

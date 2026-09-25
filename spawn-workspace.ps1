@@ -335,6 +335,16 @@ if (-not ($AptPkgsEnabled -and $RecentGitEnabled -and $ChromiumEnabled)) {
     Write-Output ("image build steps: apt-packages={0} recent-git={1} chromium={2}" -f `
         [int]$AptPkgsEnabled, [int]$RecentGitEnabled, [int]$ChromiumEnabled)
 }
+
+# Which AI coding assistant CLIs post-create.sh installs (EnvConfig.ps1 derives
+# these from the optional "aiTools" list; both default to on). They drive the
+# __CLAUDE_CODE_BLOCK_*__ / __COPILOT_BLOCK_*__ markers in post-create.sh.
+$ClaudeCodeEnabled = [bool]$cfg.ClaudeCodeEnabled
+$CopilotEnabled = [bool]$cfg.CopilotEnabled
+if (-not ($ClaudeCodeEnabled -and $CopilotEnabled)) {
+    Write-Output ("AI tools:          claude-code={0} copilot={1}" -f `
+        [int]$ClaudeCodeEnabled, [int]$CopilotEnabled)
+}
 if ($cfg.FeatureRegistry -ne 'ghcr.io') { Write-Output "feature registry:  $($cfg.FeatureRegistry)" }
 
 # Package-manager family of the base image ("debian" | "rocky"). Everything
@@ -1178,6 +1188,20 @@ Write-LfFile -Path (Join-Path $WsDir '.idea\workspace.xml') -Content (@'
 # the window title, the workspace selector and the task-switcher entry.
 Write-LfFile -Path (Join-Path $WsDir '.idea\.name') -Content "$ProjectShort $Leaf"
 
+# Pin Maven's local repository to the in-container path, overriding whatever
+# <localRepository> the bind-mounted host ~/.m2/settings.xml declares. On a
+# Windows host that element is a backslash path (e.g. C:\Users\you\.m2\repository)
+# which Linux does not treat as absolute, so Maven resolves it under $HOME and
+# ends up at the nonsense /home/vscode/C:\Users\you\.m2\repository -- the failure
+# the user hits. A -Dmaven.repo.local CLI arg beats settings.xml, and because
+# ~/.m2 is bind-mounted at /home/vscode/.m2 this points straight at the shared
+# host cache. We write it to .mvn/maven.config (not MAVEN_OPTS) because that is
+# the one override IntelliJ also honours -- exactly the "Use settings from
+# .mvn/maven.config" checkbox. Placed at the workspace root so Maven's upward
+# .mvn discovery picks it up for every repo (and the warmup builds) alike.
+New-Item -ItemType Directory -Path (Join-Path $WsDir '.mvn') -Force | Out-Null
+Write-LfFile -Path (Join-Path $WsDir '.mvn\maven.config') -Content "-Dmaven.repo.local=/home/vscode/.m2/repository"
+
 # Build the MavenProjectsManager originalFiles list and the post-create build
 # commands at spawn time, so they only contain repos that actually got checked
 # out. NO aggregator pom.xml is created at the workspace root: subprojects'
@@ -1495,6 +1519,47 @@ if (Test-Path -LiteralPath $HostNpmrc -PathType Leaf) {
     Write-Output 'wrote .devcontainer/host-npmrc.resolved (tokens substituted from this shell)'
 } else {
     Write-Output 'note: no ~/.npmrc on host -- npm in the container will use defaults only'
+}
+
+# container mode clones internal HTTPS repos with GIT_TERMINAL_PROMPT=0 (there is
+# no TTY inside postCreate to answer a password prompt), so a credential must
+# already be on hand before the clone runs. There is no live host<->container
+# forwarding available here (no WSL interop to exec the Windows GCM binary from
+# Linux, and Docker Desktop has no equivalent of the ssh-agent pipe-forwarding
+# trick for GCM) -- so instead this asks the HOST's own git-credential chain
+# (Git Credential Manager / Windows Credential Manager, whatever is already
+# cached there, e.g. from a previous `git clone`/`git fetch` on the host) once
+# per unique https:// host among this story's repos, and bakes the answers into
+# a ready-made .git-credentials file that travels into the container exactly
+# like host-npmrc.resolved above. It's a snapshot taken at spawn time, same
+# caveat as the npmrc: if the host credential later expires/rotates, re-spawn to
+# refresh it.
+$GitCredentialLines = @()
+if ($IsContainerMode) {
+    $httpsHosts = $ContainerRepos |
+        Where-Object { $_.Url -match '^https://' } |
+        ForEach-Object { ([Uri]$_.Url).Host } |
+        Sort-Object -Unique
+    foreach ($h in $httpsHosts) {
+        $fillInput = @('protocol=https', "host=$h", '')
+        $fillOutput = $fillInput | & git credential fill 2>$null
+        $userLine = $fillOutput | Where-Object { $_ -like 'username=*' } | Select-Object -First 1
+        $passLine = $fillOutput | Where-Object { $_ -like 'password=*' } | Select-Object -First 1
+        if ($userLine -and $passLine) {
+            $gcUser = [Uri]::EscapeDataString($userLine.Substring(9))
+            $gcPass = [Uri]::EscapeDataString($passLine.Substring(9))
+            $GitCredentialLines += "https://${gcUser}:${gcPass}@${h}"
+            Write-Output "git-credential: resolved cached HTTPS credentials for $h from the host's git"
+        } else {
+            Write-Err "WARNING: no cached HTTPS credential for '$h' in the host's git-credential chain."
+            Write-Err "  Run once on the HOST, e.g. 'git ls-remote https://$h/<some-repo>.git', to let"
+            Write-Err "  Git Credential Manager cache it (and possibly prompt you once), then re-spawn."
+        }
+    }
+}
+if ($GitCredentialLines.Count -gt 0) {
+    Write-LfFile -Path (Join-Path $WsDir '.devcontainer\host-git-credentials.resolved') -Content ($GitCredentialLines -join "`n")
+    Write-Output "wrote .devcontainer/host-git-credentials.resolved ($($GitCredentialLines.Count) host(s))"
 }
 
 # ============================================================================
@@ -2211,7 +2276,15 @@ __CONTAINER_REPO_MOUNTS__
 
     // Invoked through 'bash' rather than relying on the executable bit: the
     // scripts live on an NTFS bind mount, which carries no POSIX permissions.
-    "postCreateCommand": "bash __WORKSPACE_PATH__/.devcontainer/post-create.sh",
+    //
+    // 'setsid --wait' runs post-create.sh in its own session so it survives
+    // Gateway closing/killing the "Building" window (which sends SIGHUP to
+    // whatever's attached to that session) -- without it, a closed window can
+    // silently abort postCreateCommand before it even reaches the tee'd log
+    // redirect below, leaving both the IDE and /var/log/post-create.log empty.
+    // '--wait' still blocks and forwards the real exit code, so 'waitFor'
+    // keeps working as before.
+    "postCreateCommand": "setsid --wait bash __WORKSPACE_PATH__/.devcontainer/post-create.sh",
 
     // Re-runs every time the container starts (postCreate runs only once).
     // Used to kick dockerd: the docker-in-docker feature installs an init
@@ -2266,6 +2339,16 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\post-create.sh') -Content @'
 # -E (errtrace): make the ERR trap fire inside functions, command
 # substitutions and pipeline elements too, not just at the top level.
 set -Eeuo pipefail
+
+# Mirror all stdout/stderr to a log file in addition to the normal lifecycle
+# output. JetBrains Gateway closes the "Building" window as soon as the IDE
+# attaches, which can race a failing postCreateCommand and hide its output
+# before it's readable -- /tmp/post-create.log survives that so the failure
+# can be inspected with `docker exec` after the fact. /tmp (not /var/log:
+# postCreateCommand runs as remoteUser "vscode", which has no write access to
+# root-owned /var/log -- tee would silently fail there) is world-writable
+# regardless of which user ends up running this.
+exec > >(tee -a /tmp/post-create.log) 2>&1
 
 # The devcontainer lifecycle runner only reports "failed with exit code: 1" and
 # swallows the failing command. This trap surfaces the real culprit -- the line
@@ -2327,6 +2410,24 @@ else
     echo "WARN: ${RESOLVED_NPMRC} not found -- npm install of private packages will 401" >&2
 fi
 
+# Same idea as the npmrc above, but for HTTPS git remotes: spawn-workspace.ps1
+# asked the HOST's own git-credential chain (GCM / Windows Credential Manager)
+# for each internal https:// host this story clones, and wrote the answers into
+# host-git-credentials.resolved. Installing it as ~/.git-credentials + the
+# plain "store" helper lets the later clone_repo_bg calls (GIT_TERMINAL_PROMPT=0,
+# no TTY to prompt on) authenticate without ever touching the host live -- it's
+# a snapshot from spawn time. Nothing to install (and no warning) when the
+# story has no https:// repos or the host had no cached credential for them;
+# those repos just fall through to the ERR trap's usual "genuine auth failure"
+# diagnostics on clone.
+RESOLVED_GIT_CREDENTIALS=__WORKSPACE_PATH__/.devcontainer/host-git-credentials.resolved
+if [[ -f "${RESOLVED_GIT_CREDENTIALS}" ]]; then
+    install -m 600 "${RESOLVED_GIT_CREDENTIALS}" /home/vscode/.git-credentials
+    git config --global credential.helper store
+    echo "git-credentials installed from ${RESOLVED_GIT_CREDENTIALS}"
+fi
+
+# __CLAUDE_CODE_BLOCK_START__
 # install Claude Code globally â€” via login shell so npm/node from the Node feature
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
 #
@@ -2344,7 +2445,9 @@ if ! bash -lc "npm install -g @anthropic-ai/claude-code"; then
     echo "      'registry=' line to ~/.npmrc on the HOST (pointing at your internal" >&2
     echo "      npm mirror) and re-spawn the workspace." >&2
 fi
+# __CLAUDE_CODE_BLOCK_END__
 
+# __COPILOT_BLOCK_START__
 # install the GitHub Copilot CLI globally, same rationale and same non-fatal
 # handling as Claude Code above. Unlike the JetBrains Copilot plugin (which
 # hardcodes a local proxy port and doesn't understand Gateway's remote-dev
@@ -2355,6 +2458,7 @@ if ! bash -lc "npm install -g @github/copilot"; then
     echo "WARN: GitHub Copilot CLI install failed -- see the npm error above (same" >&2
     echo "      registry= hint as the Claude Code warning applies here too)." >&2
 fi
+# __COPILOT_BLOCK_END__
 
 # __CHROMIUM_BLOCK_START__
 # install bpmn-to-image (https://github.com/bpmn-io/bpmn-to-image) globally.
@@ -3187,6 +3291,10 @@ function Update-Placeholders {
     # Worktree self-bind: kept in worktree/clone mode, dropped in container mode
     # (no host checkout to resolve). Not nested in any other block.
     $text = Remove-ConditionalBlock -Text $text -Name 'WORKTREE_MOUNT' -Enabled (-not $IsContainerMode)
+    # AI coding assistant installs in post-create.sh. Independent of each other
+    # and not nested in any other block, so order among this group is irrelevant.
+    $text = Remove-ConditionalBlock -Text $text -Name 'CLAUDE_CODE' -Enabled $ClaudeCodeEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'COPILOT' -Enabled $CopilotEnabled
     # Distro split. MUST run last: the DEB/RPM markers are nested INSIDE several
     # of the blocks above (CA, APT_HTTPS, APT_PKGS, RECENT_GIT, CHROMIUM), and
     # Remove-ConditionalBlock has no nesting depth counter -- it relies on the

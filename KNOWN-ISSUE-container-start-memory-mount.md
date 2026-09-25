@@ -68,7 +68,7 @@ aus und legt den Ordner neu an).
 
 ## Prompt für den dauerhaften Fix
 
-> Im dev-containers-Tooling scheitert der reine Container-**Restart**, wenn der
+> Im dev-containers-Tooling scheitert der reine Container- **Restart**, wenn der
 > Host-Bind-Quellpfad `~/.claude/projects/-workspaces-<PROJECT_NAME>/memory`
 > fehlt (Details siehe `KNOWN-ISSUE-container-start-memory-mount.md`). Der
 > `initializeCommand` legt ihn nur bei Create/Rebuild an, `docker start` legt
@@ -76,7 +76,7 @@ aus und legt den Ordner neu an).
 > Sessions.
 >
 > Bitte in **beiden Ports** (`spawn-workspace.sh` **und** `spawn-workspace.ps1`)
-> absichern, im Lockstep, und `CLAUDE.md`/`README` bei Bedarf ergänzen:
+> absichern, im Lockstep, und `AGENTS.md`/`README` bei Bedarf ergänzen:
 >
 > 1. Beim Spawn eine **Marker-Datei** (z. B. `.keep`) in den geteilten
 >    Memory-Ordner schreiben, damit er nicht als „leer" weggeräumt wird und über
