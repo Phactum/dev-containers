@@ -26,6 +26,8 @@
 #   FORWARDED_ENV_VARS[] env var names
 #   BUILDS[]             "<repo>:<type>:<value>"  type = mvn|cmd
 #   BUILDS_DEFINED       1 if the "builds" key is present in the config, else 0
+#   AI_CLAUDE_CODE       1 if post-create.sh should install Claude Code, else 0
+#   AI_COPILOT           1 if post-create.sh should install the Copilot CLI, else 0
 #
 # Each "builds" entry carries exactly one of "mvn-goal" (type=mvn, run as
 # `mvn ${MVN_FLAGS} <value>`) or "command" (type=cmd, run verbatim inside the
@@ -219,6 +221,25 @@ if _env_json_stripped | jq -e 'has("builds")' >/dev/null; then
     while IFS= read -r -d '' _rec; do
         BUILDS+=("${_rec}")
     done < <(_env_records '(.builds // [])[] | if has("mvn-goal") then "\(.repo):mvn:\(.["mvn-goal"])" else "\(.repo):cmd:\(.command)" end')
+fi
+
+# Which AI coding assistant CLIs post-create.sh installs, driving the
+# __CLAUDE_CODE_BLOCK_*__ / __COPILOT_BLOCK_*__ markers in the generated
+# post-create.sh. Omit the "aiTools" key to get both (the default, so existing
+# configs are unchanged); list only the ones to keep otherwise -- e.g. an
+# external partner that must NOT have Claude Code installed sets ["copilot"]. An
+# explicit empty list installs neither. Unknown entries are rejected to catch
+# typos rather than silently installing nothing.
+AI_CLAUDE_CODE=1
+AI_COPILOT=1
+if _env_json_stripped | jq -e 'has("aiTools")' >/dev/null; then
+    _ai_unknown="$(_env_json_stripped | jq -r '(.aiTools // [])[] | select(. != "claude-code" and . != "copilot")')"
+    if [[ -n "${_ai_unknown}" ]]; then
+        echo "Invalid 'aiTools' entry in ${ENV_JSON}: $(printf '%s ' ${_ai_unknown})(expected 'claude-code' and/or 'copilot')" >&2
+        exit 1
+    fi
+    AI_CLAUDE_CODE="$(_env_json_stripped | jq -r 'if ((.aiTools // []) | index("claude-code")) then 1 else 0 end')"
+    AI_COPILOT="$(_env_json_stripped | jq -r 'if ((.aiTools // []) | index("copilot")) then 1 else 0 end')"
 fi
 
 unset _rec _required

@@ -58,7 +58,7 @@
 #    still available). The file is not created automatically; simply add
 #    initialize.sh next to spawn-workspace.sh to activate the hook.
 #
-# 5. CLAUDE.md, .claude/ and README.md placed at the workspace root
+# 5. AGENTS.md, .claude/ and README.md placed at the workspace root
 #    Claude Code in the new workspace inherits the same project-level
 #    instructions, agents, and skills as the source workspace. .claude/ is
 #    seeded by a one-time cp -R, EXCEPT .claude/skills which is additionally
@@ -162,6 +162,12 @@
 #    ${TOKEN_NAME}-style placeholders for every var in FORWARDED_ENV_VARS with
 #    the spawn shell's value) and writes .devcontainer/host-npmrc.resolved
 #    into the workspace, which post-create copies to /home/vscode/.npmrc.
+#    The same snapshot trick covers HTTPS git remotes in container mode: since
+#    the repos are cloned INSIDE the container (no TTY to prompt on), spawn asks
+#    the HOST's git-credential chain once per unique https:// host and writes
+#    .devcontainer/host-git-credentials.resolved, which post-create installs as
+#    ~/.git-credentials + the "store" helper so the in-container clones auth
+#    non-interactively.
 #    We tried bind-mounting before but JetBrains' devcontainer setup didn't
 #    surface the mount under /tmp on this user's Docker, leaving npm without
 #    auth. Going through the workspace bind is reliable. ~/.gitconfig is NOT
@@ -539,6 +545,15 @@ RECENT_GIT_ENABLED="$(_bool_enabled "${IMAGE_RECENT_GIT:-true}")"
 CHROMIUM_ENABLED="$(_bool_enabled "${IMAGE_CHROMIUM:-true}")"
 if (( APT_PKGS_ENABLED == 0 || RECENT_GIT_ENABLED == 0 || CHROMIUM_ENABLED == 0 )); then
     echo "image build steps: apt-packages=${APT_PKGS_ENABLED} recent-git=${RECENT_GIT_ENABLED} chromium=${CHROMIUM_ENABLED}"
+fi
+
+# Which AI coding assistant CLIs post-create.sh installs (env-config.sh derives
+# these from the optional "aiTools" list; both default to on). They drive the
+# __CLAUDE_CODE_BLOCK_*__ / __COPILOT_BLOCK_*__ markers in post-create.sh.
+CLAUDE_CODE_ENABLED="${AI_CLAUDE_CODE:-1}"
+COPILOT_ENABLED="${AI_COPILOT:-1}"
+if (( CLAUDE_CODE_ENABLED == 0 || COPILOT_ENABLED == 0 )); then
+    echo "AI tools:          claude-code=${CLAUDE_CODE_ENABLED} copilot=${COPILOT_ENABLED}"
 fi
 [[ "${FEATURE_REGISTRY}" != "ghcr.io" ]] && echo "feature registry:  ${FEATURE_REGISTRY}"
 
@@ -1430,7 +1445,7 @@ fi
 # letting our post-create.sh build each repo separately. No aggregator -> no
 # false-parent shadow.
 
-# carry CLAUDE.md and .claude into the new workspace so Claude Code has the same context
+# carry AGENTS.md and .claude into the new workspace so Claude Code has the same context
 [[ -f "${SOURCE_WS}/CLAUDE.md" ]] && cp "${SOURCE_WS}/CLAUDE.md" "${WS_DIR}/"
 [[ -d "${SOURCE_WS}/.claude"   ]] && cp -R "${SOURCE_WS}/.claude" "${WS_DIR}/"
 
@@ -1924,6 +1939,61 @@ if [[ -f "${HOST_NPMRC}" ]]; then
     echo "wrote .devcontainer/host-npmrc.resolved (tokens substituted from this shell)"
 else
     echo "note: no ~/.npmrc on host -- npm in the container will use defaults only"
+fi
+
+# Same idea as the npmrc above, but for HTTPS git remotes. In container mode the
+# repos are cloned INSIDE the container by post-create.sh with GIT_TERMINAL_PROMPT=0
+# (there is no TTY there to answer a password prompt), so a credential must
+# already be on hand before the clone runs. There is no live host<->container
+# forwarding for git credentials here, so instead this asks the HOST's own
+# git-credential chain (osxkeychain / GCM / store -- whatever is configured and
+# already cached, e.g. from a previous `git clone`/`git fetch` on the host) once
+# per unique https:// host among this story's container repos, and bakes the
+# answers into a ready-made .git-credentials file that travels into the container
+# exactly like host-npmrc.resolved above. It's a snapshot taken at spawn time,
+# same caveat as the npmrc: if the host credential later expires/rotates, re-spawn
+# to refresh it. Only container mode clones inside the container, so this is a
+# no-op in worktree/clone mode (the host checkout already carries its remotes).
+GIT_CREDENTIAL_LINES=()
+if (( IS_CONTAINER_MODE == 1 )) && (( ${#CONTAINER_URLS[@]} > 0 )); then
+    _https_hosts=()
+    for _url in "${CONTAINER_URLS[@]}"; do
+        [[ "${_url}" == https://* ]] || continue
+        _h="${_url#https://}"   # strip scheme
+        _h="${_h#*@}"           # strip any user@ prefix
+        _h="${_h%%/*}"          # strip path
+        _h="${_h%%:*}"          # strip any :port
+        [[ -n "${_h}" ]] || continue
+        _seen=0
+        if (( ${#_https_hosts[@]} > 0 )); then
+            for _e in "${_https_hosts[@]}"; do [[ "${_e}" == "${_h}" ]] && { _seen=1; break; }; done
+        fi
+        (( _seen == 0 )) && _https_hosts+=("${_h}")
+    done
+    if (( ${#_https_hosts[@]} > 0 )); then
+        for _h in "${_https_hosts[@]}"; do
+            _fill="$(printf 'protocol=https\nhost=%s\n\n' "${_h}" | git credential fill 2>/dev/null || true)"
+            _cuser="$(printf '%s\n' "${_fill}" | sed -n 's/^username=//p' | head -n1)"
+            _cpass="$(printf '%s\n' "${_fill}" | sed -n 's/^password=//p' | head -n1)"
+            if [[ -n "${_cuser}" && -n "${_cpass}" ]]; then
+                # URL-encode both halves so a token containing '/', '@' or ':' can't
+                # break the credential URL. jq is already a hard dependency here.
+                _cuser="$(jq -rn --arg s "${_cuser}" '$s|@uri')"
+                _cpass="$(jq -rn --arg s "${_cpass}" '$s|@uri')"
+                GIT_CREDENTIAL_LINES+=("https://${_cuser}:${_cpass}@${_h}")
+                echo "git-credential: resolved cached HTTPS credentials for ${_h} from the host's git"
+            else
+                echo "WARNING: no cached HTTPS credential for '${_h}' in the host's git-credential chain." >&2
+                echo "  Run once on the HOST, e.g. 'git ls-remote https://${_h}/<some-repo>.git', to let" >&2
+                echo "  your credential helper cache it (and possibly prompt you once), then re-spawn." >&2
+            fi
+        done
+    fi
+fi
+if (( ${#GIT_CREDENTIAL_LINES[@]} > 0 )); then
+    printf '%s\n' "${GIT_CREDENTIAL_LINES[@]}" > "${WS_DIR}/.devcontainer/host-git-credentials.resolved"
+    chmod 600 "${WS_DIR}/.devcontainer/host-git-credentials.resolved"
+    echo "wrote .devcontainer/host-git-credentials.resolved (${#GIT_CREDENTIAL_LINES[@]} host(s))"
 fi
 
 # Custom Dockerfile so we can patch the base image *before* devcontainer features run.
@@ -2857,6 +2927,10 @@ substitute_placeholders() {
     # (no host checkout to resolve). Not nested in any other block, so order among
     # this group is irrelevant.
     strip_block WORKTREE_MOUNT "$(( 1 - IS_CONTAINER_MODE ))"
+    # AI coding assistant installs in post-create.sh. Independent of each other
+    # and not nested in any other block, so order among this group is irrelevant.
+    strip_block CLAUDE_CODE "${CLAUDE_CODE_ENABLED}"
+    strip_block COPILOT "${COPILOT_ENABLED}"
 
     # Distro split LAST. The DEB/RPM markers are NESTED inside several of the
     # blocks above (PROXY, CA, APT_HTTPS, APT_PKGS, RECENT_GIT, CHROMIUM), and
@@ -3014,6 +3088,24 @@ else
     echo "WARN: ${RESOLVED_NPMRC} not found -- npm install of private packages will 401" >&2
 fi
 
+# Same idea as the npmrc above, but for HTTPS git remotes: spawn-workspace.sh
+# asked the HOST's own git-credential chain (osxkeychain / GCM / store) for each
+# internal https:// host this story clones, and wrote the answers into
+# host-git-credentials.resolved. Installing it as ~/.git-credentials + the plain
+# "store" helper lets the later clone_repo_bg calls (GIT_TERMINAL_PROMPT=0, no
+# TTY to prompt on) authenticate without ever touching the host live -- it's a
+# snapshot from spawn time. Nothing to install (and no warning) when the story
+# has no https:// repos or the host had no cached credential for them; those
+# repos just fall through to the ERR trap's usual "genuine auth failure"
+# diagnostics on clone.
+RESOLVED_GIT_CREDENTIALS=__WORKSPACE_PATH__/.devcontainer/host-git-credentials.resolved
+if [[ -f "${RESOLVED_GIT_CREDENTIALS}" ]]; then
+    install -m 600 "${RESOLVED_GIT_CREDENTIALS}" /home/vscode/.git-credentials
+    git config --global credential.helper store
+    echo "git-credentials installed from ${RESOLVED_GIT_CREDENTIALS}"
+fi
+
+# __CLAUDE_CODE_BLOCK_START__
 # install Claude Code globally — via login shell so npm/node from the Node feature
 # are on PATH. No sudo: the Node feature makes /usr/local/share/nvm user-writable.
 #
@@ -3031,7 +3123,9 @@ if ! bash -lc "npm install -g @anthropic-ai/claude-code"; then
     echo "      'registry=' line to ~/.npmrc on the HOST (pointing at your internal" >&2
     echo "      npm mirror) and re-spawn the workspace." >&2
 fi
+# __CLAUDE_CODE_BLOCK_END__
 
+# __COPILOT_BLOCK_START__
 # install the GitHub Copilot CLI globally, same rationale and same non-fatal
 # handling as Claude Code above. Unlike the JetBrains Copilot plugin (which
 # hardcodes a local proxy port and doesn't understand Gateway's remote-dev
@@ -3042,6 +3136,7 @@ if ! bash -lc "npm install -g @github/copilot"; then
     echo "WARN: GitHub Copilot CLI install failed -- see the npm error above (same" >&2
     echo "      registry= hint as the Claude Code warning applies here too)." >&2
 fi
+# __COPILOT_BLOCK_END__
 
 # __CHROMIUM_BLOCK_START__
 # install bpmn-to-image (https://github.com/bpmn-io/bpmn-to-image) globally.
