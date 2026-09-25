@@ -411,19 +411,33 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   falsely picked up as a Maven parent). Each subproject pom is registered
   individually in `.idea/misc.xml`; `post-create.sh` builds them in the
   dependency order given by the `builds` list.
-- **`.mvn/maven.config` at the workspace root pins the local repository.** It
-  contains `-Dmaven.repo.local=/home/vscode/.m2/repository` (the bind-mount
-  target of the host `~/.m2`). Without it, Maven inherits `<localRepository>`
-  from the bind-mounted host `settings.xml`; on a Windows host that is a
-  backslash path (`C:\Users\...\.m2\repository`) which Linux treats as relative,
-  so Maven resolves it under `$HOME` into the broken
-  `/home/vscode/C:\Users\...\.m2\repository`. A `-Dmaven.repo.local` CLI arg
-  overrides settings.xml, IntelliJ honours it via "Use settings from
-  .mvn/maven.config", and Maven's upward `.mvn` discovery applies it to every
-  repo and the warmup builds. A `.mvn` dir is not a pom, so it does NOT trigger
-  the false-parent problem above. Both spawn ports write it identically. A repo
-  that ships its OWN `.mvn/maven.config` shadows this one (Maven reads only the
-  nearest `.mvn`) -- that repo then needs the same line in its own file.
+- **Only `~/.m2/repository` is bind-mounted; `settings.xml` is resolved, not
+  mounted.** The dependency cache is shared via a bind mount of
+  `~/.m2/repository` → `/home/vscode/.m2/repository`. The host `settings.xml` is
+  NOT mounted: a raw bind carries its `<localRepository>`, and a value like
+  `${user.home}/.m2/repository` is expanded by IntelliJ's **Gateway frontend to
+  the Windows home** (`C:\Users\...`), which then breaks inside Linux (Maven
+  treats the non-`/`-prefixed string as relative → the broken
+  `/home/vscode/C:\Users\...\.m2\repository`). Instead spawn snapshots
+  each file in the `~/.m2` whitelist (`settings.xml`, `settings-security.xml`,
+  `toolchains.xml` — the config files Maven evaluates) into
+  `.devcontainer/host-m2-<file>.resolved`, rewriting `<localRepository>` to the
+  absolute `/home/vscode/.m2/repository` (present only in `settings.xml`; a no-op
+  in the others; single-line element assumed; a minimal `settings.xml` is emitted
+  if the host has none). `post-create.sh` installs each as `/home/vscode/.m2/<file>`.
+  An absolute path leaves nothing for IntelliJ to misexpand and fixes both
+  IntelliJ and the CLI. Docker creates `~/.m2` as root when it mounts the
+  `repository/` submount, so post-create `chown`s the dir NON-recursively (never
+  the huge mounted cache). Caveat: `toolchains.xml` is carried verbatim, but its
+  `<jdkHome>`/tool paths are HOST paths that won't resolve in the container.
+- **`.mvn/maven.config` is the CLI belt-and-suspenders.** It contains
+  `-Dmaven.repo.local=/home/vscode/.m2/repository` at the workspace root. The
+  resolved `settings.xml` above already pins the same path, but this override is
+  applied by Maven's upward `.mvn` discovery to every repo and the warmup builds,
+  so the CLI stays correct even for a repo that ships its own `settings.xml`. A
+  `.mvn` dir is not a pom, so it does NOT trigger the false-parent problem above.
+  Both spawn ports write it identically. A repo that ships its OWN
+  `.mvn/maven.config` shadows this one (Maven reads only the nearest `.mvn`).
 - **Build-list config: per-entry `mvn-goal` XOR `command`.** One `builds` list;
   each entry sets exactly one of the two (both/neither is a hard error raised in
   `env-config.sh` / `EnvConfig.ps1`). `env-config.sh` normalises to
