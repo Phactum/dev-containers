@@ -1188,17 +1188,14 @@ Write-LfFile -Path (Join-Path $WsDir '.idea\workspace.xml') -Content (@'
 # the window title, the workspace selector and the task-switcher entry.
 Write-LfFile -Path (Join-Path $WsDir '.idea\.name') -Content "$ProjectShort $Leaf"
 
-# Pin Maven's local repository to the in-container path, overriding whatever
-# <localRepository> the bind-mounted host ~/.m2/settings.xml declares. On a
-# Windows host that element is a backslash path (e.g. C:\Users\you\.m2\repository)
-# which Linux does not treat as absolute, so Maven resolves it under $HOME and
-# ends up at the nonsense /home/vscode/C:\Users\you\.m2\repository -- the failure
-# the user hits. A -Dmaven.repo.local CLI arg beats settings.xml, and because
-# ~/.m2 is bind-mounted at /home/vscode/.m2 this points straight at the shared
-# host cache. We write it to .mvn/maven.config (not MAVEN_OPTS) because that is
-# the one override IntelliJ also honours -- exactly the "Use settings from
-# .mvn/maven.config" checkbox. Placed at the workspace root so Maven's upward
-# .mvn discovery picks it up for every repo (and the warmup builds) alike.
+# Belt-and-suspenders for Maven's local repository. The resolved settings.xml
+# that post-create.sh installs already pins <localRepository> to the in-container
+# path (see the m2 resolve step further down), which fixes both IntelliJ and the
+# CLI. This .mvn/maven.config adds a -Dmaven.repo.local override that Maven's
+# upward .mvn discovery applies to every repo and the warmup builds, so the CLI
+# stays correct even for a repo that ships its own settings.xml. Both point at
+# /home/vscode/.m2/repository -- the bind-mounted shared host cache. A .mvn dir is
+# not a pom, so it never becomes a false Maven parent.
 New-Item -ItemType Directory -Path (Join-Path $WsDir '.mvn') -Force | Out-Null
 Write-LfFile -Path (Join-Path $WsDir '.mvn\maven.config') -Content "-Dmaven.repo.local=/home/vscode/.m2/repository"
 
@@ -1304,7 +1301,7 @@ foreach ($rcFile in $cfg.RunConfigs) {
 # script does this in devcontainer.json's initializeCommand; on Windows that
 # command would run through cmd.exe, so we prepare everything here instead.
 $SharedMemoryDir = Join-Path $HomeDir ".claude\projects\$SharedMemoryKey\memory"
-foreach ($d in (Join-Path $HomeDir '.m2'), (Join-Path $HomeDir '.ssh'),
+foreach ($d in (Join-Path $HomeDir '.m2\repository'), (Join-Path $HomeDir '.ssh'),
                 (Join-Path $HomeDir '.claude'), $SharedMemoryDir,
                 (Join-Path $HomeDir '.copilot\skills'), (Join-Path $HomeDir '.copilot\instructions'),
                 (Join-Path $HomeDir '.copilot\prompts'), (Join-Path $HomeDir '.dind-docker')) {
@@ -1560,6 +1557,52 @@ if ($IsContainerMode) {
 if ($GitCredentialLines.Count -gt 0) {
     Write-LfFile -Path (Join-Path $WsDir '.devcontainer\host-git-credentials.resolved') -Content ($GitCredentialLines -join "`n")
     Write-Output "wrote .devcontainer/host-git-credentials.resolved ($($GitCredentialLines.Count) host(s))"
+}
+
+# Resolve the config files Maven reads from ~/.m2 into the workspace so
+# post-create.sh can install them under /home/vscode/.m2. We do NOT bind-mount
+# them (only ~/.m2/repository is mounted, for the shared cache): a bind-mounted
+# settings.xml carries its <localRepository>, and a value like
+# ${user.home}/.m2/repository is expanded by IntelliJ's Gateway frontend to the
+# WINDOWS home (C:\Users\...), which then breaks inside the Linux container --
+# exactly the failure this whole change fixes.
+#
+# $M2Whitelist is the set of files Maven evaluates in ~/.m2 (the repository/ cache
+# aside). Each is copied and run through the same resolve step: <localRepository>
+# is rewritten to the absolute in-container path (present only in settings.xml; a
+# no-op in the others), and if settings.xml lacks the element one is injected.
+# Everything else -- servers, mirrors, ${env.TOKEN} placeholders resolved at
+# runtime via forwarded env vars -- is kept verbatim. [^<] spans newlines in .NET
+# regex, so a multi-line <localRepository> value is handled too. Plaintext
+# credentials may live here -- these files stay under the story workspace dir
+# (below $HOME); never commit or share them.
+#   settings.xml           user settings (servers, mirrors, localRepository)
+#   settings-security.xml  master-password store for encrypted passwords
+#   toolchains.xml         user toolchains -- WARNING: its <jdkHome>/tool paths are
+#                          HOST paths and will NOT resolve inside the container;
+#                          carried for completeness, adjust by hand if you use it
+$M2Whitelist = @('settings.xml', 'settings-security.xml', 'toolchains.xml')
+$M2RepoContainer = '/home/vscode/.m2/repository'
+foreach ($m2f in $M2Whitelist) {
+    $m2src = Join-Path $HomeDir ".m2\$m2f"
+    if (-not (Test-Path -LiteralPath $m2src)) { continue }
+    $m2 = Read-TextFile $m2src
+    if ($m2 -match '<localRepository>[^<]*</localRepository>') {
+        $m2 = [regex]::Replace($m2, '<localRepository>[^<]*</localRepository>', "<localRepository>$M2RepoContainer</localRepository>")
+    } elseif ($m2 -notmatch '<localRepository' -and $m2 -match '</settings>') {
+        $m2 = [regex]::Replace($m2, '</settings>', "  <localRepository>$M2RepoContainer</localRepository>`n</settings>")
+    }
+    Write-LfFile -Path (Join-Path $WsDir ".devcontainer\host-m2-$m2f.resolved") -Content $m2
+    Write-Output "wrote .devcontainer/host-m2-$m2f.resolved"
+    if ($m2f -eq 'toolchains.xml') {
+        Write-Err "note: toolchains.xml carried verbatim -- its host JDK/tool paths won't resolve in the container"
+    }
+}
+# No settings.xml on the host? Still emit a minimal one so IntelliJ never falls
+# back to its own ${user.home} default for the local repository.
+if (-not (Test-Path -LiteralPath (Join-Path $HomeDir '.m2\settings.xml'))) {
+    Write-LfFile -Path (Join-Path $WsDir '.devcontainer\host-m2-settings.xml.resolved') -Content "<settings>`n  <localRepository>$M2RepoContainer</localRepository>`n</settings>"
+    Write-Output 'note: no ~/.m2/settings.xml on host -- wrote a minimal one pinning localRepository'
 }
 
 # ============================================================================
@@ -2098,7 +2141,14 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
         "source=__SOURCE_WS_HOST__/.claude/skills,target=__WORKSPACE_PATH__/.claude/skills,type=bind",
 
         "source=__HOME_HOST__/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
-        "source=__HOME_HOST__/.m2,target=/home/vscode/.m2,type=bind",
+        // Only the repository (dependency cache) is bind-mounted, so every story
+        // container shares one download cache. settings.xml is deliberately NOT
+        // mounted: spawn resolves it into host-m2-settings.resolved with
+        // <localRepository> pinned to this in-container path, and post-create.sh
+        // installs that. A raw bind of the host settings.xml would carry its
+        // ${user.home}/.m2/repository, which IntelliJ's Gateway frontend expands
+        // to the WINDOWS home (C:\Users\...) and then breaks inside Linux.
+        "source=__HOME_HOST__/.m2/repository,target=/home/vscode/.m2/repository,type=bind",
         // Nested dockerd's OWN registry credential store (~/.docker/config.json
         // inside the container), NOT the host's Docker Desktop config -- those
         // are two entirely separate daemons with separate logins (Docker
@@ -2426,6 +2476,22 @@ if [[ -f "${RESOLVED_GIT_CREDENTIALS}" ]]; then
     git config --global credential.helper store
     echo "git-credentials installed from ${RESOLVED_GIT_CREDENTIALS}"
 fi
+
+# Install the resolved Maven config files (the M2 whitelist in spawn-workspace.ps1;
+# each has its <localRepository> pinned to the in-container path). Only
+# ~/.m2/repository is bind-mounted, so Docker created ~/.m2 as root when it
+# materialised that submount -- take ownership of the directory itself first
+# (NON-recursive: never chown the mounted repository/, which is huge and
+# host-owned). These files may hold plaintext credentials, hence mode 600.
+sudo mkdir -p /home/vscode/.m2
+sudo chown vscode:vscode /home/vscode/.m2
+for _m2f in settings.xml settings-security.xml toolchains.xml; do
+    _m2_res=__WORKSPACE_PATH__/.devcontainer/host-m2-${_m2f}.resolved
+    if [[ -f "${_m2_res}" ]]; then
+        install -m 600 "${_m2_res}" /home/vscode/.m2/${_m2f}
+        echo "m2 ${_m2f} installed from ${_m2_res}"
+    fi
+done
 
 # __CLAUDE_CODE_BLOCK_START__
 # install Claude Code globally â€” via login shell so npm/node from the Node feature
