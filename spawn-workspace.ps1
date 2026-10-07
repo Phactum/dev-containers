@@ -677,6 +677,19 @@ if (-not [string]::IsNullOrWhiteSpace($VmRamSize)) {
     Write-Output "container memory cap: --memory=$VmRamSize$swapNote"
 }
 
+# Optional --shm-size (shmSize in devcontainers-config.json), emitted into runArgs.
+# Docker's default /dev/shm is 64m, too small for ffmpeg / headless Chrome and the
+# like. Omitting it leaves $ShmRunArgs empty and runArgs byte-identical to before.
+$ShmSize = $cfg.ShmSize
+$ShmRunArgs = ''
+if (-not [string]::IsNullOrWhiteSpace($ShmSize)) {
+    if ($ShmSize -notmatch '^[0-9]+[bBkKmMgG]?$') {
+        Fail "ERROR: shmSize must be a docker size like 1g / 512m / 2048k, got '$ShmSize'"
+    }
+    $ShmRunArgs = "`"--shm-size=$ShmSize`", "
+    Write-Output "container shm size: --shm-size=$ShmSize"
+}
+
 # SSH_HOST_PORT: host-side port for the container's sshd (2222 + offset).
 # FIRST_REPO: first repo name, used as an example in the README's shortcut docs.
 $SshHostPort = 2222 + $PortOffset
@@ -1121,6 +1134,253 @@ if (Test-Path -LiteralPath (Join-Path $SourceWs '.claude')) {
 New-Item -ItemType Directory -Path (Join-Path $SourceWs '.claude\skills') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $WsDir '.claude\skills') -Force | Out-Null
 
+# Claude plugins are shared PER PROJECT, not globally: the generated devcontainer.json
+# binds <SourceWs>/.claude/plugins onto /home/vscode/.claude/plugins in every story
+# container. Pre-create the bind source so Docker doesn't materialise it as a
+# root-owned dir on first mount.
+New-Item -ItemType Directory -Path (Join-Path $SourceWs '.claude\plugins') -Force | Out-Null
+
+# ============================================================================
+# Adopt selected host Claude plugins/skills into <workspace>/.claude
+# ----------------------------------------------------------------------------
+# Mirror of the Bash spawn-workspace.sh logic, using native JSON (no jq on
+# Windows). Which host plugins/skills to carry is a per-project choice; the live
+# selection + a snapshot of the full host set (for change detection) live in a
+# sidecar next to devcontainers-config.json (.claude-assets.state.json, git-
+# ignored, per machine). The "claudeAssets" config key seeds the first run and is
+# the non-interactive fallback. When the host set differs from the snapshot (or on
+# first run) we re-prompt, defaulting to the stored selection; unchanged = silent;
+# -y / no console never prompts. Vendoring is ADDITIVE: it ensures each selected
+# plugin is present at the host version but never removes anything, so plugins
+# installed INSIDE a container survive later spawns.
+# ============================================================================
+$ClaudeAssetsSidecar  = Join-Path $ConfigDir '.claude-assets.state.json'
+$HostPluginsDir       = Join-Path $HomeDir '.claude\plugins'
+$HostPluginsJson      = Join-Path $HostPluginsDir 'installed_plugins.json'
+$HostMarketplacesJson = Join-Path $HostPluginsDir 'known_marketplaces.json'
+$HostSettingsJson     = Join-Path $HomeDir '.claude\settings.json'
+$HostSkillsDir        = Join-Path $HomeDir '.claude\skills'
+$DstPlugins           = Join-Path $SourceWs '.claude\plugins'
+$DstIpJson            = Join-Path $DstPlugins 'installed_plugins.json'
+$ClaudeInteractive    = (-not $AssumeYes)
+
+function Get-PathLeaf { param([string]$P) if (-not $P) { return '' }; return (@($P -split '[\\/]' | Where-Object { $_ -ne '' }))[-1] }
+
+function ConvertTo-JsonStringArray {
+    param([string[]]$Items)
+    if (-not $Items -or $Items.Count -eq 0) { return '[]' }
+    return '[' + (($Items | ForEach-Object { $_ | ConvertTo-Json }) -join ',') + ']'
+}
+
+function Get-PluginVersion {
+    # First user-scope install record's version (the installPath leaf), or ''.
+    param($IpObj, [string]$Key)
+    if (-not $IpObj -or -not $IpObj.plugins) { return '' }
+    if (-not ($IpObj.plugins.PSObject.Properties.Name -contains $Key)) { return '' }
+    $recs = @($IpObj.plugins.$Key)
+    $rec = @($recs | Where-Object { $_.scope -eq 'user' })
+    if ($rec.Count -eq 0) { $rec = $recs }
+    if ($rec.Count -eq 0) { return '' }
+    return (Get-PathLeaf $rec[0].installPath)
+}
+
+function Resolve-ClaudeAssetType {
+    # Returns @{ Selected=[string[]]; Snapshot=[string[]] }. All status output goes
+    # to Write-Host so it never pollutes the returned object (PS merges stdout).
+    param([string]$Key, [string]$Label, [string[]]$HostItems, [string[]]$SeedItems, $Sidecar, [bool]$Interactive)
+    $hasState = $false; $storedSel = @(); $storedSnap = @()
+    if ($Sidecar -and ($Sidecar.PSObject.Properties.Name -contains $Key) -and $Sidecar.$Key) {
+        $hasState = $true
+        if ($Sidecar.$Key.selected)     { $storedSel  = @($Sidecar.$Key.selected     | ForEach-Object { [string]$_ }) }
+        if ($Sidecar.$Key.hostSnapshot) { $storedSnap = @($Sidecar.$Key.hostSnapshot | ForEach-Object { [string]$_ }) }
+    }
+    $defaults = if ($hasState) { $storedSel } else { $SeedItems }
+    $changed = (-not $hasState)
+    if ((@($storedSnap | Sort-Object) -join "`n") -ne (@($HostItems | Sort-Object) -join "`n")) { $changed = $true }
+
+    $selected = @()
+    $snapshot = @($HostItems)
+    if ($HostItems.Count -eq 0) { return @{ Selected = @(); Snapshot = @() } }
+    if ($changed -and $Interactive) {
+        Write-Host ''
+        Write-Host "Host ${Label}s changed (or first run) -- choose which to adopt into this project:"
+        foreach ($it in $HostItems) {
+            $def = if ($defaults -contains $it) { 'Y' } else { 'n' }
+            $other = if ($def -eq 'Y') { 'n' } else { 'Y' }
+            $ans = Read-Host "  include $Label '$it'? [$def/$other]"
+            if ([string]::IsNullOrWhiteSpace($ans)) { $ans = $def }
+            if ($ans -match '^[Yy]') { $selected += $it }
+        }
+    } else {
+        foreach ($it in $HostItems) { if ($defaults -contains $it) { $selected += $it } }
+        if ($changed -and $hasState) {
+            # don't advance the snapshot non-interactively, so a later interactive spawn re-prompts
+            $snapshot = @($storedSnap)
+            Write-Host "note: host $Label set changed but running non-interactively -> kept stored $Label selection; re-run interactively to update."
+        }
+    }
+    return @{ Selected = @($selected); Snapshot = @($snapshot) }
+}
+
+# Enumerate host user-scope plugins + host skills.
+$ipHost = $null
+$HostPlugins = @()
+if (Test-Path -LiteralPath $HostPluginsJson) {
+    try { $ipHost = Get-Content -LiteralPath $HostPluginsJson -Raw | ConvertFrom-Json } catch { $ipHost = $null }
+    if ($ipHost -and $ipHost.plugins) {
+        foreach ($prop in $ipHost.plugins.PSObject.Properties) {
+            if (@($prop.Value | Where-Object { $_.scope -eq 'user' }).Count -gt 0) { $HostPlugins += $prop.Name }
+        }
+    }
+}
+$HostPlugins = @($HostPlugins | Sort-Object)
+$HostSkills = @()
+if (Test-Path -LiteralPath $HostSkillsDir) {
+    foreach ($d in (Get-ChildItem -LiteralPath $HostSkillsDir -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -eq 'synced' -or $d.Name.StartsWith('.')) { continue }
+        if ((Test-Path -LiteralPath (Join-Path $d.FullName 'SKILL.md')) -or (Test-Path -LiteralPath (Join-Path $d.FullName 'skill.md'))) { $HostSkills += $d.Name }
+    }
+}
+$HostSkills = @($HostSkills | Sort-Object)
+
+# Load the sidecar, resolve each asset type, persist the sidecar.
+$sidecar = $null
+if (Test-Path -LiteralPath $ClaudeAssetsSidecar) {
+    try { $sidecar = Get-Content -LiteralPath $ClaudeAssetsSidecar -Raw | ConvertFrom-Json } catch { $sidecar = $null }
+}
+$pluginRes = Resolve-ClaudeAssetType -Key 'plugins' -Label 'plugin' -HostItems $HostPlugins -SeedItems $cfg.ClaudeSeedPlugins -Sidecar $sidecar -Interactive $ClaudeInteractive
+$SelectedPlugins = @($pluginRes.Selected); $SnapPlugins = @($pluginRes.Snapshot)
+$skillRes = Resolve-ClaudeAssetType -Key 'skills' -Label 'skill' -HostItems $HostSkills -SeedItems $cfg.ClaudeSeedSkills -Sidecar $sidecar -Interactive $ClaudeInteractive
+$SelectedSkills = @($skillRes.Selected); $SnapSkills = @($skillRes.Snapshot)
+
+$sidecarContent = @"
+{
+  "plugins": { "selected": $(ConvertTo-JsonStringArray $SelectedPlugins), "hostSnapshot": $(ConvertTo-JsonStringArray $SnapPlugins) },
+  "skills": { "selected": $(ConvertTo-JsonStringArray $SelectedSkills), "hostSnapshot": $(ConvertTo-JsonStringArray $SnapSkills) }
+}
+"@
+Write-LfFile -Path $ClaudeAssetsSidecar -Content $sidecarContent
+
+# Vendor selected plugins ADDITIVELY: copy only what's missing/outdated, never remove.
+New-Item -ItemType Directory -Path $DstPlugins -Force | Out-Null
+$wantSig = @($SelectedPlugins | ForEach-Object { "$($_):$(Get-PluginVersion $ipHost $_)" } | Sort-Object)
+$dstIp = $null
+if (Test-Path -LiteralPath $DstIpJson) { try { $dstIp = Get-Content -LiteralPath $DstIpJson -Raw | ConvertFrom-Json } catch { $dstIp = $null } }
+$haveSig = @()
+if ($dstIp -and $dstIp.plugins) {
+    foreach ($p in $dstIp.plugins.PSObject.Properties) { $haveSig += "$($p.Name):$(Get-PathLeaf @($p.Value)[0].installPath)" }
+}
+$haveSig = @($haveSig | Sort-Object)
+$missing = @($wantSig | Where-Object { $haveSig -notcontains $_ })
+$ClaudePluginsCopied = $false
+if ($missing.Count -gt 0) {
+    foreach ($sel in $SelectedPlugins) {
+        $parts = $sel -split '@', 2; $pName = $parts[0]; $pMp = $parts[1]
+        $ver = Get-PluginVersion $ipHost $sel
+        if (-not $ver) { Write-Output "warn: cannot resolve version for plugin '$sel', skipping"; continue }
+        $srcCache = Join-Path $HostPluginsDir "cache\$pMp\$pName\$ver"
+        $dstCacheParent = Join-Path $DstPlugins "cache\$pMp\$pName"
+        if ((-not (Test-Path -LiteralPath (Join-Path $dstCacheParent $ver))) -and (Test-Path -LiteralPath $srcCache)) {
+            New-Item -ItemType Directory -Path $dstCacheParent -Force | Out-Null
+            Copy-Item -LiteralPath $srcCache -Destination $dstCacheParent -Recurse -Force
+        }
+        $srcMkt = Join-Path $HostPluginsDir "marketplaces\$pMp"
+        $dstMkt = Join-Path $DstPlugins "marketplaces\$pMp"
+        if ((-not (Test-Path -LiteralPath $dstMkt)) -and (Test-Path -LiteralPath $srcMkt)) {
+            New-Item -ItemType Directory -Path (Join-Path $DstPlugins 'marketplaces') -Force | Out-Null
+            Copy-Item -LiteralPath $srcMkt -Destination (Join-Path $DstPlugins 'marketplaces') -Recurse -Force
+            $mktGit = Join-Path $dstMkt '.git'
+            if (Test-Path -LiteralPath $mktGit) { Remove-Item -LiteralPath $mktGit -Recurse -Force }
+        }
+        $srcData = Join-Path $HostPluginsDir "data\$pMp-$pName"
+        $dstDataRoot = Join-Path $DstPlugins 'data'
+        if ((-not (Test-Path -LiteralPath (Join-Path $dstDataRoot "$pMp-$pName"))) -and (Test-Path -LiteralPath $srcData)) {
+            New-Item -ItemType Directory -Path $dstDataRoot -Force | Out-Null
+            Copy-Item -LiteralPath $srcData -Destination $dstDataRoot -Recurse -Force
+        }
+    }
+    # Merge installed_plugins.json as a UNION (preserve container-installed entries;
+    # refresh selected keys with container-path-rewritten host records). Built as a
+    # string because PS 5.1 ConvertTo-Json unwraps single-element arrays.
+    $pluginsMap = [ordered]@{}
+    if ($dstIp -and $dstIp.plugins) { foreach ($p in $dstIp.plugins.PSObject.Properties) { $pluginsMap[$p.Name] = @($p.Value) } }
+    foreach ($sel in $SelectedPlugins) {
+        if (-not $ipHost -or -not ($ipHost.plugins.PSObject.Properties.Name -contains $sel)) { continue }
+        $parts = $sel -split '@', 2; $pName = $parts[0]; $pMp = $parts[1]
+        $recs = @($ipHost.plugins.$sel | ForEach-Object {
+            $clone = $_ | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+            $leaf = Get-PathLeaf $_.installPath
+            $clone.installPath = "/home/vscode/.claude/plugins/cache/$pMp/$pName/$leaf"
+            $clone
+        })
+        $pluginsMap[$sel] = @($recs)
+    }
+    $ipEntries = foreach ($k in $pluginsMap.Keys) {
+        $recJsons = @($pluginsMap[$k] | ForEach-Object { $_ | ConvertTo-Json -Depth 10 -Compress })
+        '    ' + ($k | ConvertTo-Json) + ': [' + ($recJsons -join ',') + ']'
+    }
+    $ipContent = "{`n  `"version`": 2,`n  `"plugins`": {`n" + ($ipEntries -join ",`n") + "`n  }`n}"
+    Write-LfFile -Path $DstIpJson -Content $ipContent
+    if (Test-Path -LiteralPath $HostMarketplacesJson) {
+        $kmHost = $null
+        try { $kmHost = Get-Content -LiteralPath $HostMarketplacesJson -Raw | ConvertFrom-Json } catch { $kmHost = $null }
+        $mktMap = [ordered]@{}
+        $DstKmJson = Join-Path $DstPlugins 'known_marketplaces.json'
+        if (Test-Path -LiteralPath $DstKmJson) {
+            try { $kmDst = Get-Content -LiteralPath $DstKmJson -Raw | ConvertFrom-Json; foreach ($m in $kmDst.PSObject.Properties) { $mktMap[$m.Name] = $m.Value } } catch { }
+        }
+        $selMps = @($SelectedPlugins | ForEach-Object { ($_ -split '@', 2)[1] } | Sort-Object -Unique)
+        foreach ($mpName in $selMps) {
+            if ($kmHost -and ($kmHost.PSObject.Properties.Name -contains $mpName)) {
+                $entry = $kmHost.$mpName | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+                $entry | Add-Member -NotePropertyName installLocation -NotePropertyValue "/home/vscode/.claude/plugins/marketplaces/$mpName" -Force
+                $mktMap[$mpName] = $entry
+            }
+        }
+        $kmEntries = foreach ($k in $mktMap.Keys) { '  ' + ($k | ConvertTo-Json) + ': ' + ($mktMap[$k] | ConvertTo-Json -Depth 10 -Compress) }
+        $kmContent = "{`n" + ($kmEntries -join ",`n") + "`n}"
+        Write-LfFile -Path $DstKmJson -Content $kmContent
+    }
+    $ClaudePluginsCopied = $true
+}
+
+# Enable the selected plugins in the project's settings.json; a host-global-enabled
+# plugin that is NOT selected AND NOT present in the project is set false (so the
+# read-only global settings don't reference a plugin that isn't there). Plugins
+# present in the project (incl. container-installed) are never force-disabled.
+New-Item -ItemType Directory -Path (Join-Path $WsDir '.claude') -Force | Out-Null
+$hostEnabled = @()
+if (Test-Path -LiteralPath $HostSettingsJson) {
+    try { $hs = Get-Content -LiteralPath $HostSettingsJson -Raw | ConvertFrom-Json; if ($hs.enabledPlugins) { $hostEnabled = @($hs.enabledPlugins.PSObject.Properties.Name) } } catch { }
+}
+$dstKeys = @()
+if (Test-Path -LiteralPath $DstIpJson) {
+    try { $d = Get-Content -LiteralPath $DstIpJson -Raw | ConvertFrom-Json; if ($d.plugins) { $dstKeys = @($d.plugins.PSObject.Properties.Name) } } catch { }
+}
+$wsSettingsPath = Join-Path $WsDir '.claude\settings.json'
+$wsObj = $null
+if (Test-Path -LiteralPath $wsSettingsPath) { try { $wsObj = Get-Content -LiteralPath $wsSettingsPath -Raw | ConvertFrom-Json } catch { $wsObj = $null } }
+$mergedEp = [ordered]@{}
+if ($wsObj -and $wsObj.enabledPlugins) { foreach ($p in $wsObj.enabledPlugins.PSObject.Properties) { $mergedEp[$p.Name] = [bool]$p.Value } }
+foreach ($s in $SelectedPlugins) { $mergedEp[$s] = $true }
+foreach ($h in $hostEnabled) { if (($SelectedPlugins -notcontains $h) -and ($dstKeys -notcontains $h)) { $mergedEp[$h] = $false } }
+if (-not $wsObj) { $wsObj = [pscustomobject]@{} }
+$wsObj | Add-Member -NotePropertyName enabledPlugins -NotePropertyValue ([pscustomobject]$mergedEp) -Force
+Write-LfFile -Path $wsSettingsPath -Content ($wsObj | ConvertTo-Json -Depth 20)
+
+# Copy selected host skills into the project's skills dir (don't wipe: it may also
+# hold skills authored inside a container, shared the same way).
+if ($SelectedSkills.Count -gt 0) {
+    New-Item -ItemType Directory -Path (Join-Path $SourceWs '.claude\skills') -Force | Out-Null
+    foreach ($sk in $SelectedSkills) {
+        $srcSk = Join-Path $HostSkillsDir $sk
+        if (Test-Path -LiteralPath $srcSk) { Copy-Item -LiteralPath $srcSk -Destination (Join-Path $SourceWs '.claude\skills') -Recurse -Force }
+    }
+}
+
+$copyNote = if ($ClaudePluginsCopied) { 'copied' } else { 'unchanged, copy skipped' }
+Write-Output ("claude assets: plugins [" + ($SelectedPlugins -join ' ') + "] skills [" + ($SelectedSkills -join ' ') + "] ($copyNote; state: $ClaudeAssetsSidecar)")
+
 # Project-local Claude Code overrides that ONLY apply inside this devcontainer.
 # permissions.defaultMode=bypassPermissions skips approval prompts: the container
 # is a sandbox and all tool calls go through it, so loosening permissions here
@@ -1302,7 +1562,7 @@ foreach ($rcFile in $cfg.RunConfigs) {
 # command would run through cmd.exe, so we prepare everything here instead.
 $SharedMemoryDir = Join-Path $HomeDir ".claude\projects\$SharedMemoryKey\memory"
 foreach ($d in (Join-Path $HomeDir '.m2\repository'), (Join-Path $HomeDir '.ssh'),
-                (Join-Path $HomeDir '.claude'), $SharedMemoryDir,
+                (Join-Path $HomeDir '.claude'), (Join-Path $HomeDir '.claude\hooks'), $SharedMemoryDir,
                 (Join-Path $HomeDir '.copilot\skills'), (Join-Path $HomeDir '.copilot\instructions'),
                 (Join-Path $HomeDir '.copilot\prompts'), (Join-Path $HomeDir '.dind-docker')) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
@@ -1314,8 +1574,23 @@ foreach ($d in (Join-Path $HomeDir '.m2\repository'), (Join-Path $HomeDir '.ssh'
 # fail to start (see KNOWN-ISSUE-container-start-memory-mount.md).
 $MemoryKeep = Join-Path $SharedMemoryDir '.keep'
 if (-not (Test-Path -LiteralPath $MemoryKeep)) { New-Item -ItemType File -Path $MemoryKeep -Force | Out-Null }
-$ClaudeJson = Join-Path $HomeDir '.claude.json'
-if (-not (Test-Path -LiteralPath $ClaudeJson)) { New-Item -ItemType File -Path $ClaudeJson -Force | Out-Null }
+
+# The generated devcontainer.json overlays a handful of global Claude config files
+# read-only from the host into each container's ~/.claude volume (CLAUDE.md,
+# settings.json, statusline.sh, keybindings.json, hooks/). A bind whose SOURCE is
+# missing makes Docker materialise it as a ROOT-OWNED DIRECTORY, which breaks Claude
+# Code -- so make sure each source exists as the right kind of node. JSON files are
+# seeded with "{}" so an empty overlay is still valid JSON; scripts as empty files.
+foreach ($jsonCfg in 'settings.json', 'keybindings.json') {
+    $p = Join-Path $HomeDir ".claude\$jsonCfg"
+    if (-not (Test-Path -LiteralPath $p)) { Write-LfFile -Path $p -Content '{}' }
+}
+foreach ($fileCfg in 'statusline.sh', 'CLAUDE.md') {
+    $p = Join-Path $HomeDir ".claude\$fileCfg"
+    if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType File -Path $p -Force | Out-Null }
+}
+# ~/.claude.json is NO LONGER bind-mounted (it lives in the per-container volume),
+# so nothing to create here for it.
 
 # glab is written in Go and uses os.UserConfigDir(), which returns a different
 # path per OS: %AppData%\glab-cli on Windows, ~/Library/Application Support/
@@ -2049,6 +2324,12 @@ RUN set -eux; \
     rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gh_arch}"; \
     /usr/local/bin/gh --version
 # __GH_BLOCK_END__
+
+# Project-specific extra build steps from devcontainers-config.json "dockerfileSnippet"
+# (e.g. apt-get install ffmpeg). Injected verbatim by spawn-workspace.ps1; the
+# placeholder line is removed when the list is empty. Appended last so the standard
+# tooling layers above stay cache-stable.
+__CUSTOM_DOCKERFILE__
 '@
 
 Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content @'
@@ -2083,6 +2364,7 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
         "--privileged", "--init",
         // __RPM_BLOCK_END__
         __VM_MEM_RUNARGS__
+        __SHM_RUNARGS__
         __PORT_RUNARGS__
     ],
 
@@ -2117,9 +2399,10 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
 
     // Mount order matters: deeper paths must come AFTER their parents so they take
     // precedence. The layering is:
-    //   1. ~/.claude               -> shared by default (login, agents, commands, ...)
-    //   2. named volume per story  -> overrides per-project state (history, todos)
-    //   3. shared memory bind      -> overrides only the memory/ subfolder back to shared
+    //   1. ~/.claude volume        -> per-container base: login + all writable state, isolated
+    //   2. ro config binds         -> global user config (settings/statusline/hooks/...) read-only
+    //   3. plugins bind            -> plugins per project, from <workspace>/.claude
+    //   4. shared memory bind      -> overrides only the memory/ subfolder back to shared
     "mounts": [
         // __WORKTREE_MOUNT_BLOCK_START__
         // Source workspace. A worktree's .git file points at
@@ -2188,14 +2471,44 @@ Write-LfFile -Path (Join-Path $WsDir '.devcontainer\devcontainer.json') -Content
         // Windows "OpenSSH Authentication Agent" service is running.
         "source=__SSH_AGENT_SRC__,target=/ssh-agent,type=bind",
         // __SSHAGENT_BLOCK_END__
-        "source=__HOME_HOST__/.claude.json,target=/home/vscode/.claude.json,type=bind",
-        "source=__HOME_HOST__/.claude,target=/home/vscode/.claude,type=bind",
-        "source=__PROJECT_SHORT__-claude-project-${devcontainerId},target=/home/vscode/.claude/projects/__MEMORY_KEY__,type=volume",
-        // Memory lives in ONE host folder keyed by the PROJECT (not the story),
-        // mounted onto this story's project key. Result: memory is shared across
-        // all story containers -- including ones spawned from macOS/Linux, which
-        // use the very same host folder -- while the conversation history in the
-        // named volume above stays per-story.
+        // Base: per-container named volume for the WHOLE ~/.claude. Everything
+        // writable and account-bound -- login (.credentials.json), the .claude.json
+        // account/cache file, daemon/, sessions/, history.jsonl, policy-limits*,
+        // stats-cache -- lives here, isolated per container. So each container has
+        // its own /login (last /login no longer clobbers the others) and there are
+        // no shared daemon.lock / machineID / session-file races across the host
+        // and parallel story containers. Survives rebuilds; removed on dispose
+        // (dispose-workspace.ps1 discovers attached volumes from the container).
+        "source=__PROJECT_SHORT__-claude-home-${devcontainerId},target=/home/vscode/.claude,type=volume",
+        // Global, account-INDEPENDENT user config overlaid READ-ONLY from the host
+        // (deeper path wins over the volume). These are your personal prefs/scripts,
+        // so they stay identical in every container and on the host -- edit them on
+        // the host. CLAUDE.md, statusline.sh and hooks/ are NEVER rewritten by Claude
+        // Code, so a read-only bind is safe for them.
+        // NOTE: settings.json and keybindings.json are deliberately NOT bound here --
+        // Claude Code rewrites them (/effort, /config, /plugin, keybinding edits) via
+        // write-temp + rename, and a rename OVER a bind-mount point fails with EBUSY
+        // (same single-file-bind trap as ~/.gitconfig). They are instead SEEDED from
+        // the host into the per-container volume by post-create.sh (see the .claude-seed
+        // mounts below), so they are writable inside the container; edits persist in
+        // the volume and do not propagate to the host or other containers.
+        "source=__HOME_HOST__/.claude/CLAUDE.md,target=/home/vscode/.claude/CLAUDE.md,type=bind,readonly",
+        "source=__HOME_HOST__/.claude/statusline.sh,target=/home/vscode/.claude/statusline.sh,type=bind,readonly",
+        "source=__HOME_HOST__/.claude/hooks,target=/home/vscode/.claude/hooks,type=bind,readonly",
+        // Seed sources for the two writable config files (read-only; post-create.sh
+        // copies them into the volume's ~/.claude on first create if absent).
+        "source=__HOME_HOST__/.claude/settings.json,target=/home/vscode/.claude-seed/settings.json,type=bind,readonly",
+        "source=__HOME_HOST__/.claude/keybindings.json,target=/home/vscode/.claude-seed/keybindings.json,type=bind,readonly",
+        // Plugins PER PROJECT, not global: sourced from the project workspace's
+        // .claude on the host (shared across this project's story containers, the
+        // same way skills/ is), NOT from the global ~/.claude/plugins. Writable so
+        // plugins can also be installed inside the container (any /plugin scope works
+        // now that settings.json is writable too).
+        "source=__SOURCE_WS_HOST__/.claude/plugins,target=/home/vscode/.claude/plugins,type=bind",
+        // Shared project memory: ONE host folder keyed by the PROJECT (not the
+        // story), overlaid on this story's project key -- shared across all story
+        // containers (incl. ones spawned from macOS/Linux, same host folder) and
+        // persistent across rebuilds. Deeper than the base volume, so it wins.
         "source=__HOME_HOST__/.claude/projects/__SHARED_MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind",
         // GitHub Copilot CLI equivalent of the ~/.claude sharing above. Only the
         // "content" subfolders are bind-mounted (skills, custom instructions,
@@ -2547,8 +2860,28 @@ if ! bash -lc "npm install -g bpmn-to-image"; then
 fi
 # __CHROMIUM_BLOCK_END__
 
-# named volume for per-story Claude project state is owned by root after first mount
+# The per-container ~/.claude base is a fresh named volume -> it (and the nested
+# mountpoint dirs Docker auto-creates for the deeper binds) is owned by root after
+# first mount, so vscode can't write .credentials.json, daemon/, etc. chown the
+# volume root NON-recursively (never recurse into the read-only config overlays or
+# the host-bound plugins/ + memory/), then the per-project state subtree.
+sudo chown vscode:vscode /home/vscode/.claude || true
+sudo chown vscode:vscode /home/vscode/.claude/projects || true
 sudo chown -R vscode:vscode /home/vscode/.claude/projects/__MEMORY_KEY__ || true
+
+# Seed the two config files Claude Code REWRITES (settings.json via /effort, /config,
+# /plugin; keybindings.json via the keybindings editor) into the volume, so they are
+# real files on the volume fs -- Claude Code's write-temp+rename then works. They
+# CANNOT be bind-mounted: a rename over a bind-mount point fails with EBUSY. Copy
+# only when absent, so edits made inside the container persist across rebuilds. The
+# sources are the read-only .claude-seed binds; the other config (CLAUDE.md,
+# statusline.sh, hooks/) stays a live read-only bind from the host.
+for _cfg in settings.json keybindings.json; do
+    if [ ! -f "/home/vscode/.claude/${_cfg}" ] && [ -f "/home/vscode/.claude-seed/${_cfg}" ]; then
+        cp "/home/vscode/.claude-seed/${_cfg}" "/home/vscode/.claude/${_cfg}"
+    fi
+done
+sudo chown vscode:vscode /home/vscode/.claude/settings.json /home/vscode/.claude/keybindings.json 2>/dev/null || true
 
 # Docker auto-creates missing bind-mount parent directories as root:root before
 # the mount happens. ~/.copilot/{skills,instructions,prompts} are bind-mounted
@@ -3275,6 +3608,7 @@ $Tokens = [ordered]@{
     '__PROJECT_SHORT__'        = $ProjectShort
     '__PORT_RUNARGS__'         = $PortRunArgs
     '__VM_MEM_RUNARGS__'       = $VmMemRunArgs
+    '__SHM_RUNARGS__'          = $ShmRunArgs
     '__WORKSPACE_PATH__'       = $WorkspacePath
     '__SOURCE_WS__'            = $SourceWsContainer
     '__WS_DIR_HOST__'          = (ConvertTo-DockerPath $WsDir)
@@ -3392,6 +3726,19 @@ Update-Placeholders -Path (Join-Path $WsDir '.devcontainer\post-start.sh')
 Update-Placeholders -Path (Join-Path $WsDir 'README.md')
 Get-ChildItem -LiteralPath (Join-Path $WsDir '.idea\runConfigurations') -Filter '*.xml' -ErrorAction SilentlyContinue |
     ForEach-Object { Update-Placeholders -Path $_.FullName }
+
+# Inject the project's extra Dockerfile lines in place of __CUSTOM_DOCKERFILE__
+# (multi-line; Update-Placeholders above leaves this token alone). Empty list ->
+# the placeholder line is removed. Runs BEFORE the base-image hash below, so a
+# changed snippet busts the cache and rebuilds the base image.
+$dfPath = Join-Path $WsDir '.devcontainer\Dockerfile'
+$dfLines = (Read-TextFile $dfPath) -split "`n"
+$dfOut = foreach ($line in $dfLines) {
+    if ($line -match '__CUSTOM_DOCKERFILE__') {
+        if ($cfg.DockerfileSnippet.Count -gt 0) { $cfg.DockerfileSnippet -join "`n" }
+    } else { $line }
+}
+Write-LfFile -Path $dfPath -Content ($dfOut -join "`n")
 
 # ============================================================================
 # Base-image caching

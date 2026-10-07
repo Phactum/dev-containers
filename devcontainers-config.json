@@ -36,7 +36,7 @@
     // Short project label. Used for:
     //   - Docker container name:                 "<projectShort>-<leaf>"
     //   - IntelliJ project name in .idea/.name:  "<projectShort> <leaf>"
-    //   - per-story Claude named volume prefix:  "<projectShort>-claude-project-*"
+    //   - per-container Claude home volume prefix: "<projectShort>-claude-home-*"
     //   - env var for the workspaces root:       "<PROJECTSHORT>_WORKSPACES_ROOT"
     // Keep it short and shell-safe (letters + digits + dashes).
     "projectShort": "DC",
@@ -164,6 +164,12 @@
     // "vmRamSize": "16g",
     // "vmSwapSize": "2g",
 
+    // OPTIONAL shared-memory size, passed to `docker run` as --shm-size via runArgs.
+    // Docker's default /dev/shm is only 64m, which overflows for ffmpeg, headless
+    // Chrome/Puppeteer and similar. A docker size string (e.g. "1g", "512m"); omit
+    // (or null / "") to leave runArgs untouched.
+    // "shmSize": "1g",
+
     // OPTIONAL. Login shell IntelliJ's built-in terminal opens inside the
     // container. Omit it (or set null / "") and the shell is left unset in
     // .idea/workspace.xml, so JetBrains auto-detects one -- and it prefers zsh
@@ -205,6 +211,23 @@
     // values: "claude-code", "copilot". Anything else is rejected as a typo.
     //   "aiTools": [ "claude-code", "copilot" ],
 
+    // Which host-installed Claude plugins/skills to adopt into THIS project's
+    // <workspace>/.claude (plugins and skills are shared per project, not via the
+    // global ~/.claude -- see the README section "Per-container login vs. shared
+    // config"). This key is only the DECLARATIVE SEED: on first spawn it pre-selects
+    // the prompt, and in non-interactive runs (--yes / no TTY) it IS the selection.
+    // The live selection and a snapshot of the full host set (for change detection)
+    // are written by spawn-workspace.sh to a git-ignored sidecar next to this file,
+    // ".claude-assets.state.json". When the host set changes, the next interactive
+    // spawn re-prompts, defaulting to the last chosen set.
+    //   - plugins: "name@marketplace" keys (as in ~/.claude/plugins/installed_plugins.json)
+    //   - skills:  skill directory names (as in ~/.claude/skills/<name>/)
+    // Omit the key to start from an empty selection and be prompted on first spawn.
+    //   "claudeAssets": {
+    //       "plugins": [ "caveman@caveman" ],
+    //       "skills":  [ ]
+    //   },
+
     // --- DevContainer image & tooling versions ------------------------------
 
     // Package-manager family of the base image. Everything distro-specific in
@@ -230,6 +253,17 @@
     // Maven on top); on "rocky" a plain distro image is enough -- the Dockerfile
     // installs the JDK.
     "baseImage": "mcr.microsoft.com/devcontainers/java:1-21-bookworm",
+
+    // OPTIONAL extra Dockerfile lines, appended near the END of the generated image
+    // build (after the standard tooling, so those layers stay cache-stable). Each
+    // array entry is ONE raw Dockerfile line, emitted verbatim -- use a trailing "\"
+    // to continue a RUN across entries. Distro-specific content is YOUR responsibility
+    // (this base is Debian -> apt-get). Changing it rebuilds the cached base image.
+    // Omit (or set []) to leave the Dockerfile unchanged. Example (install ffmpeg):
+    //   "dockerfileSnippet": [
+    //       "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg \\",
+    //       "    && rm -rf /var/lib/apt/lists/*"
+    //   ],
 
     // Rocky only: JDK major version (dnf package java-<n>-openjdk-devel) and the
     // Apache Maven release fetched from dlcdn/archive.apache.org. Ignored on

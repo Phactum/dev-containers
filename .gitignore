@@ -1,6 +1,12 @@
 .idea
 *.iml
 
+# Spawn-managed state: the live Claude plugin/skill selection + host snapshot used
+# for change detection. Per-machine (each host has a different installed set), so it
+# is NOT shared -- the shareable, declarative intent lives in devcontainers-config.json
+# ("claudeAssets"). Consuming projects should ignore this in their dev-containers/ too.
+.claude-assets.state.json
+
 # initialize.sh is a per-project, opt-in hook. This clone must NOT ship one:
 # it lives in SCRIPT_DIR and would become the config_asset fallback for every
 # project that lacks its own, leaking one project's setup into all others.

@@ -135,15 +135,21 @@
 #    git in the container can't read worktree metadata and reports every
 #    repo as "not a git repository").
 #
-# 8. Layered Claude state: shared memory, isolated history
-#    Three mounts stack on /home/vscode/.claude (deeper paths win):
-#      a. bind   ~/.claude                                                  -> share login, user agents, slash commands
-#      b. volume <PROJECT_SHORT>-claude-project-${devcontainerId} on .../projects/<key> -> isolate per-project state (history, todos, sessions)
-#      c. bind   ~/.claude/projects/<key>/memory                            -> bring memory/ back to a single shared host folder
-#    Effect: persistent memory across container rebuilds AND shared between
-#    parallel story containers, but conversation history stays per-story.
-#    ~/.claude.json is bind-mounted as a sibling so the API/auth config is
-#    shared too.
+# 8. Layered Claude state: isolated login/runtime, shared memory + global config
+#    The base of /home/vscode/.claude is a PER-CONTAINER named volume, and a few
+#    things are overlaid on top (deeper paths win):
+#      a. volume <PROJECT_SHORT>-claude-home-${devcontainerId} on ~/.claude      -> everything writable + account-bound, ISOLATED per container
+#      b. bind   ~/.claude/{CLAUDE.md,settings.json,statusline.sh,keybindings.json,hooks} (ro) -> global, account-independent user config, shared read-only from the host
+#      c. bind   <SOURCE_WS>/.claude/plugins on ~/.claude/plugins             -> plugins PER PROJECT (from the project workspace), not global
+#      d. bind   ~/.claude/projects/<key>/memory                             -> bring memory/ back to a single shared host folder
+#    Effect: each container has its OWN login (.credentials.json / .claude.json
+#    live in the volume), no shared daemon.lock / machineID / sessions / history
+#    races across host + parallel story containers, your global prefs mirrored
+#    read-only everywhere, and project memory persistent + shared per project.
+#    Rationale for dropping the old wholesale ~/.claude bind: a shared login was
+#    the original goal, but every new container needs its own /login anyway
+#    (device/session binding), so there was nothing to gain and plenty to lose
+#    (last /login clobbered the others; the daemon/session files raced).
 #
 # 9. Host integration mounts (read-only where appropriate)
 #    ~/.ssh is mounted readonly so git finds keys out of the box. Only
@@ -204,9 +210,11 @@
 #    run configs so that browser-side OAuth flows still match.
 #
 # 11. initializeCommand prepares host-side bind targets
-#     Creates ~/.m2, ~/.ssh, ~/.claude, the shared memory directory, and
-#     touches ~/.claude.json so Docker doesn't create them as root-owned
-#     dirs on first mount.
+#     Creates ~/.m2, ~/.ssh, ~/.claude, ~/.claude/hooks and the shared memory
+#     directory so Docker doesn't materialise them as root-owned dirs on first
+#     mount. The read-only ~/.claude config overlays (settings.json, statusline.sh,
+#     ...) are ensured to exist in spawn-workspace.sh itself (see the seeding block
+#     near SHARED_MEMORY_DIR), not here.
 #
 # 12. postCreateCommand warms the build (and waitFor blocks the IDE on it)
 #     Installs Claude Code globally, fixes ownership on the per-story Claude
@@ -940,6 +948,20 @@ if [[ -n "${VM_RAM_SIZE}" ]]; then
     echo "container memory cap: --memory=${VM_RAM_SIZE}${VM_SWAP_SIZE:+ + swap ${VM_SWAP_SIZE}}"
 fi
 
+# Optional --shm-size (shmSize in devcontainers-config.json), emitted into runArgs.
+# Docker's default /dev/shm is 64m, too small for ffmpeg / headless Chrome and the
+# like. Omitting it leaves __SHM_RUNARGS__ empty and runArgs byte-identical to before.
+SHM_SIZE="${SHM_SIZE:-}"
+SHM_RUNARGS=""
+if [[ -n "${SHM_SIZE}" ]]; then
+    if ! [[ "${SHM_SIZE}" =~ ^[0-9]+[bBkKmMgG]?$ ]]; then
+        echo "ERROR: shmSize must be a docker size like 1g / 512m / 2048k, got '${SHM_SIZE}'" >&2
+        exit 1
+    fi
+    SHM_RUNARGS="\"--shm-size=${SHM_SIZE}\", "
+    echo "container shm size: --shm-size=${SHM_SIZE}"
+fi
+
 # Pre-compute README template values that substitute_placeholders needs.
 # SSH_HOST_PORT: host-side port for the container's sshd (port 2222 + offset).
 # FIRST_REPO: first repo name, used as an example in the tab-completion docs.
@@ -1462,6 +1484,237 @@ fi
 mkdir -p "${SOURCE_WS}/.claude/skills"
 mkdir -p "${WS_DIR}/.claude/skills"
 
+# Claude plugins/skills are shared PER PROJECT, not globally: the generated
+# devcontainer.json binds ${SOURCE_WS}/.claude/{plugins,skills} into every story
+# container (see the mounts array). Pre-create the bind sources so Docker doesn't
+# materialise them as root-owned dirs on first mount.
+mkdir -p "${SOURCE_WS}/.claude/plugins"
+
+# ---------------------------------------------------------------------------
+# Adopt selected host Claude plugins/skills into this project's <workspace>/.claude
+#
+# Which host plugins/skills to carry is a per-project choice. The live selection
+# plus a snapshot of the FULL host set (for change detection) live in a sidecar
+# next to devcontainers-config.json (.claude-assets.state.json, git-ignored,
+# per machine). The optional "claudeAssets" config key seeds the first run and is
+# the non-interactive fallback. When the host set differs from the snapshot (or on
+# first run) we re-prompt interactively, defaulting to the stored selection; an
+# unchanged set is applied silently; --yes / no TTY never prompts.
+# ---------------------------------------------------------------------------
+CLAUDE_ASSETS_SIDECAR="${CONFIG_DIR}/.claude-assets.state.json"
+_HOST_PLUGINS_JSON="${HOME}/.claude/plugins/installed_plugins.json"
+_HOST_MARKETPLACES_JSON="${HOME}/.claude/plugins/known_marketplaces.json"
+_HOST_SETTINGS_JSON="${HOME}/.claude/settings.json"
+
+_claude_interactive=1
+{ (( ASSUME_YES == 1 )) || [[ ! -t 0 ]]; } && _claude_interactive=0
+
+_in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
+_arr_json() { if (( $# == 0 )); then printf '[]'; else printf '%s\n' "$@" | jq -R -s 'split("\n")|map(select(length>0))'; fi; }
+
+# Enumerate host, user-scope plugins ("name@marketplace"), sorted.
+HOST_PLUGINS=()
+if [[ -f "${_HOST_PLUGINS_JSON}" ]]; then
+    while IFS= read -r _k; do [[ -n "${_k}" ]] && HOST_PLUGINS+=("${_k}"); done < <(
+        jq -r '.plugins // {} | to_entries[] | select(any(.value[]?; .scope=="user")) | .key' \
+           "${_HOST_PLUGINS_JSON}" 2>/dev/null | sort || true)
+fi
+# Enumerate host user skills (a dir with SKILL.md; skip CC's "synced" buckets and dotdirs).
+HOST_SKILLS=()
+if [[ -d "${HOME}/.claude/skills" ]]; then
+    while IFS= read -r _d; do
+        _b="$(basename "${_d}")"
+        [[ "${_b}" == "synced" || "${_b}" == .* ]] && continue
+        { [[ -f "${_d}/SKILL.md" ]] || [[ -f "${_d}/skill.md" ]]; } && HOST_SKILLS+=("${_b}")
+    done < <(find "${HOME}/.claude/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort || true)
+fi
+
+# Resolve one asset type. Reads globals HOST_ITEMS[] + SEED_ITEMS[]; sets
+# SELECTED_ITEMS[] (to copy) and SNAPSHOT_ITEMS[] (to persist as the new snapshot).
+_resolve_asset_type() {
+    local key="$1" label="$2"
+    local stored_sel=() stored_snap=() has_state=0
+    if [[ -f "${CLAUDE_ASSETS_SIDECAR}" ]] && jq -e --arg k "${key}" 'has($k)' "${CLAUDE_ASSETS_SIDECAR}" >/dev/null 2>&1; then
+        has_state=1
+        while IFS= read -r _x; do [[ -n "${_x}" ]] && stored_sel+=("${_x}"); done < <(jq -r --arg k "${key}" '(.[$k].selected // [])[]' "${CLAUDE_ASSETS_SIDECAR}" 2>/dev/null || true)
+        while IFS= read -r _x; do [[ -n "${_x}" ]] && stored_snap+=("${_x}"); done < <(jq -r --arg k "${key}" '(.[$k].hostSnapshot // [])[]' "${CLAUDE_ASSETS_SIDECAR}" 2>/dev/null || true)
+    fi
+    local defaults=()
+    if (( has_state )); then
+        defaults=(${stored_sel[@]+"${stored_sel[@]}"})
+    else
+        defaults=(${SEED_ITEMS[@]+"${SEED_ITEMS[@]}"})
+    fi
+    # changed? first run, or host set differs from the stored snapshot
+    local changed=0
+    (( has_state )) || changed=1
+    local snap_str host_str
+    snap_str="$( (( ${#stored_snap[@]} )) && printf '%s\n' "${stored_snap[@]}" | sort || true)"
+    host_str="$( (( ${#HOST_ITEMS[@]} )) && printf '%s\n' "${HOST_ITEMS[@]}" | sort || true)"
+    [[ "${snap_str}" != "${host_str}" ]] && changed=1
+
+    SELECTED_ITEMS=()
+    SNAPSHOT_ITEMS=(${HOST_ITEMS[@]+"${HOST_ITEMS[@]}"})
+    if (( ${#HOST_ITEMS[@]} == 0 )); then
+        return 0
+    fi
+    if (( changed )) && (( _claude_interactive )); then
+        echo >&2
+        echo "Host ${label}s changed (or first run) -- choose which to adopt into this project:" >&2
+        local it ans def other
+        for it in "${HOST_ITEMS[@]}"; do
+            if _in_list "${it}" ${defaults[@]+"${defaults[@]}"}; then def="Y"; other="n"; else def="n"; other="Y"; fi
+            read -r -p "  include ${label} '${it}'? [${def}/${other}] " ans || ans=""
+            ans="${ans:-$def}"
+            case "${ans}" in [Yy]*) SELECTED_ITEMS+=("${it}");; esac
+        done
+    else
+        # unchanged, or non-interactive: keep the default selection, intersected with host
+        local it
+        for it in "${HOST_ITEMS[@]}"; do
+            if _in_list "${it}" ${defaults[@]+"${defaults[@]}"}; then SELECTED_ITEMS+=("${it}"); fi
+        done
+        if (( changed )) && (( has_state )); then
+            # a genuine prior selection exists but we can't re-prompt now: keep the OLD
+            # snapshot (don't advance it) so a later interactive spawn re-prompts the change.
+            # First run (no prior state) falls through and blesses the host set as snapshot.
+            SNAPSHOT_ITEMS=(${stored_snap[@]+"${stored_snap[@]}"})
+            echo "note: host ${label} set changed but running non-interactively -> kept stored ${label} selection; re-run interactively to update." >&2
+        fi
+    fi
+}
+
+SEED_ITEMS=(${CLAUDE_SEED_PLUGINS[@]+"${CLAUDE_SEED_PLUGINS[@]}"}); HOST_ITEMS=(${HOST_PLUGINS[@]+"${HOST_PLUGINS[@]}"})
+_resolve_asset_type "plugins" "plugin"
+SELECTED_PLUGINS=(${SELECTED_ITEMS[@]+"${SELECTED_ITEMS[@]}"}); SNAP_PLUGINS=(${SNAPSHOT_ITEMS[@]+"${SNAPSHOT_ITEMS[@]}"})
+
+SEED_ITEMS=(${CLAUDE_SEED_SKILLS[@]+"${CLAUDE_SEED_SKILLS[@]}"}); HOST_ITEMS=(${HOST_SKILLS[@]+"${HOST_SKILLS[@]}"})
+_resolve_asset_type "skills" "skill"
+SELECTED_SKILLS=(${SELECTED_ITEMS[@]+"${SELECTED_ITEMS[@]}"}); SNAP_SKILLS=(${SNAPSHOT_ITEMS[@]+"${SNAPSHOT_ITEMS[@]}"})
+
+# Persist the sidecar (live selection + host snapshot per type).
+jq -n \
+    --argjson ps "$(_arr_json ${SELECTED_PLUGINS[@]+"${SELECTED_PLUGINS[@]}"})" \
+    --argjson pn "$(_arr_json ${SNAP_PLUGINS[@]+"${SNAP_PLUGINS[@]}"})" \
+    --argjson ss "$(_arr_json ${SELECTED_SKILLS[@]+"${SELECTED_SKILLS[@]}"})" \
+    --argjson sn "$(_arr_json ${SNAP_SKILLS[@]+"${SNAP_SKILLS[@]}"})" \
+    '{plugins:{selected:$ps,hostSnapshot:$pn},skills:{selected:$ss,hostSnapshot:$sn}}' \
+    > "${CLAUDE_ASSETS_SIDECAR}"
+
+# Vendor the selected host plugins into the project workspace. ADDITIVE and
+# idempotent: it ensures each selected plugin is present at the host's current
+# version, but NEVER removes anything -- so plugins a user installs INSIDE a
+# container (which land in this same shared ${SOURCE_WS}/.claude/plugins dir)
+# survive every later spawn. The copy (caveman & co. are large repos -> cp -R is
+# slow on macOS) only runs when a selected plugin is missing or its version
+# changed on the host; since the dir is shared across a project's stories, a
+# steady-state spawn skips it entirely. installPath/installLocation are rewritten
+# to the CONTAINER path the bind exposes (/home/vscode/.claude/plugins).
+_DST_PLUGINS="${SOURCE_WS}/.claude/plugins"
+mkdir -p "${_DST_PLUGINS}"
+# Desired signature (selection + each plugin's host version), sorted.
+_want_sig=""
+if (( ${#SELECTED_PLUGINS[@]} )); then
+    _want_sig="$(for _sel in "${SELECTED_PLUGINS[@]}"; do
+        _v="$(jq -r --arg k "${_sel}" 'first(.plugins[$k][]? | select(.scope=="user") | .installPath) // empty' "${_HOST_PLUGINS_JSON}" 2>/dev/null || true)"
+        echo "${_sel}:$(basename "${_v}")"
+    done | sort)"
+fi
+# Already-vendored signature (from the current manifest), sorted. May include
+# plugins installed inside a container -- those must NOT trigger anything here.
+_have_sig=""
+if [[ -f "${_DST_PLUGINS}/installed_plugins.json" ]]; then
+    _have_sig="$(jq -r '.plugins // {} | to_entries[] | "\(.key):\(.value[0].installPath | split("/") | last)"' "${_DST_PLUGINS}/installed_plugins.json" 2>/dev/null | sort || true)"
+fi
+# Copy only when a selected plugin is missing/outdated (want NOT a subset of have).
+_claude_plugins_copied=0
+_missing=""
+[[ -n "${_want_sig}" ]] && _missing="$(comm -23 <(printf '%s\n' "${_want_sig}") <(printf '%s\n' "${_have_sig}") 2>/dev/null || true)"
+if [[ -n "${_missing}" ]]; then
+    for _sel in "${SELECTED_PLUGINS[@]}"; do
+        _name="${_sel%@*}"; _mp="${_sel#*@}"
+        _ver="$(jq -r --arg k "${_sel}" 'first(.plugins[$k][]? | select(.scope=="user") | .installPath) // empty' "${_HOST_PLUGINS_JSON}" 2>/dev/null || true)"
+        _ver="$(basename "${_ver}")"
+        [[ -z "${_ver}" || "${_ver}" == "." ]] && { echo "warn: cannot resolve version for plugin '${_sel}', skipping" >&2; continue; }
+        # cache: copy only if this exact version isn't already vendored
+        if [[ ! -d "${_DST_PLUGINS}/cache/${_mp}/${_name}/${_ver}" && -d "${HOME}/.claude/plugins/cache/${_mp}/${_name}/${_ver}" ]]; then
+            mkdir -p "${_DST_PLUGINS}/cache/${_mp}/${_name}"
+            cp -R "${HOME}/.claude/plugins/cache/${_mp}/${_name}/${_ver}" "${_DST_PLUGINS}/cache/${_mp}/${_name}/"
+        fi
+        # marketplace: copy once (kept so plugins can also be managed/installed inside
+        # the container). Strip the .git clone to avoid bloating the workspace.
+        if [[ ! -d "${_DST_PLUGINS}/marketplaces/${_mp}" && -d "${HOME}/.claude/plugins/marketplaces/${_mp}" ]]; then
+            mkdir -p "${_DST_PLUGINS}/marketplaces"
+            cp -R "${HOME}/.claude/plugins/marketplaces/${_mp}" "${_DST_PLUGINS}/marketplaces/"
+            rm -rf "${_DST_PLUGINS}/marketplaces/${_mp}/.git"
+        fi
+        if [[ ! -d "${_DST_PLUGINS}/data/${_mp}-${_name}" && -d "${HOME}/.claude/plugins/data/${_mp}-${_name}" ]]; then
+            mkdir -p "${_DST_PLUGINS}/data"
+            cp -R "${HOME}/.claude/plugins/data/${_mp}-${_name}" "${_DST_PLUGINS}/data/"
+        fi
+    done
+    # Merge the selected host entries INTO the existing manifests (union) so a
+    # container-installed plugin's entry is preserved; selected keys are refreshed.
+    _sel_json="$(_arr_json "${SELECTED_PLUGINS[@]}")"
+    _sel_entries="$(jq --argjson sel "${_sel_json}" '
+        { plugins: ( .plugins | to_entries
+            | map(select(.key as $k | $sel | index($k)))
+            | map( (.key | split("@")) as $p
+                 | .value |= map(
+                     (.installPath | split("/") | last) as $ver
+                     | .installPath = "/home/vscode/.claude/plugins/cache/\($p[1])/\($p[0])/\($ver)" ) )
+            | from_entries ) }' "${_HOST_PLUGINS_JSON}" 2>/dev/null || echo '{"plugins":{}}')"
+    _existing_ip="$([[ -f "${_DST_PLUGINS}/installed_plugins.json" ]] && cat "${_DST_PLUGINS}/installed_plugins.json" || echo '{"version":2,"plugins":{}}')"
+    jq -n --argjson a "${_existing_ip}" --argjson b "${_sel_entries}" \
+        '{version: ($a.version // 2), plugins: (($a.plugins // {}) + ($b.plugins // {}))}' \
+        > "${_DST_PLUGINS}/installed_plugins.json"
+    if [[ -f "${_HOST_MARKETPLACES_JSON}" ]]; then
+        _mps_json="$(printf '%s\n' "${SELECTED_PLUGINS[@]}" | sed 's/.*@//' | sort -u | jq -R -s 'split("\n")|map(select(length>0))')"
+        _sel_mkts="$(jq --argjson mps "${_mps_json}" '
+            to_entries | map(select(.key as $k | $mps | index($k)))
+            | map(.value.installLocation = "/home/vscode/.claude/plugins/marketplaces/\(.key)")
+            | from_entries' "${_HOST_MARKETPLACES_JSON}" 2>/dev/null || echo '{}')"
+        _existing_km="$([[ -f "${_DST_PLUGINS}/known_marketplaces.json" ]] && cat "${_DST_PLUGINS}/known_marketplaces.json" || echo '{}')"
+        jq -n --argjson a "${_existing_km}" --argjson b "${_sel_mkts}" '$a + $b' \
+            > "${_DST_PLUGINS}/known_marketplaces.json"
+    fi
+    _claude_plugins_copied=1
+fi
+
+# Enable exactly the selected plugins in the project's settings.json (a host plugin
+# enabled globally but NOT selected AND NOT present in the project is set false, so
+# the read-only global settings don't reference a plugin that isn't there. Plugins
+# present in the project dir (selected-vendored OR installed inside a container) are
+# never force-disabled, and the merge below preserves enable state written in the
+# container -- so container-side `/plugin` installs persist.
+mkdir -p "${WS_DIR}/.claude"
+_host_enabled_json="$(jq '(.enabledPlugins // {})' "${_HOST_SETTINGS_JSON}" 2>/dev/null || echo '{}')"
+_dst_keys_json="$([[ -f "${_DST_PLUGINS}/installed_plugins.json" ]] && jq '(.plugins // {}) | keys' "${_DST_PLUGINS}/installed_plugins.json" 2>/dev/null || echo '[]')"
+_ep_json="$(jq -n \
+    --argjson sel "$(_arr_json ${SELECTED_PLUGINS[@]+"${SELECTED_PLUGINS[@]}"})" \
+    --argjson he "${_host_enabled_json}" \
+    --argjson dst "${_dst_keys_json}" '
+    ( $sel | map({key: ., value: true}) | from_entries )
+    + ( (($he | keys) - $sel - $dst) | map({key: ., value: false}) | from_entries )')"
+_ws_settings="${WS_DIR}/.claude/settings.json"
+if [[ -f "${_ws_settings}" ]]; then
+    jq --argjson ep "${_ep_json}" '.enabledPlugins = ((.enabledPlugins // {}) + $ep)' "${_ws_settings}" > "${_ws_settings}.tmp" \
+        && mv "${_ws_settings}.tmp" "${_ws_settings}"
+else
+    jq -n --argjson ep "${_ep_json}" '{enabledPlugins: $ep}' > "${_ws_settings}"
+fi
+
+# Copy selected host skills into the project's skills dir (don't wipe: the dir may
+# also hold skills authored inside a container, which are shared the same way).
+if (( ${#SELECTED_SKILLS[@]} )); then
+    mkdir -p "${SOURCE_WS}/.claude/skills"
+    for _sk in "${SELECTED_SKILLS[@]}"; do
+        [[ -d "${HOME}/.claude/skills/${_sk}" ]] && cp -R "${HOME}/.claude/skills/${_sk}" "${SOURCE_WS}/.claude/skills/"
+    done
+fi
+
+echo "claude assets: plugins [$( (( ${#SELECTED_PLUGINS[@]} )) && printf '%s ' "${SELECTED_PLUGINS[@]}")] skills [$( (( ${#SELECTED_SKILLS[@]} )) && printf '%s ' "${SELECTED_SKILLS[@]}")] ($( (( _claude_plugins_copied )) && echo 'copied' || echo 'unchanged, copy skipped'); state: ${CLAUDE_ASSETS_SIDECAR})"
+
 # Project-local Claude Code overrides that ONLY apply inside this devcontainer.
 # - permissions.defaultMode=bypassPermissions: skip approval prompts. Container
 #   is a sandbox, all tool calls go through it; loosening permissions here
@@ -1721,6 +1974,21 @@ fi
 SHARED_MEMORY_DIR="${HOME}/.claude/projects/${MEMORY_KEY}/memory"
 mkdir -p "${SHARED_MEMORY_DIR}"
 [[ -e "${SHARED_MEMORY_DIR}/.keep" ]] || touch "${SHARED_MEMORY_DIR}/.keep"
+
+# The generated devcontainer.json overlays a handful of global Claude config
+# files read-only from the host into each container's ~/.claude volume
+# (CLAUDE.md, settings.json, statusline.sh, keybindings.json, hooks/). A bind
+# whose SOURCE is missing makes Docker materialise it as a ROOT-OWNED DIRECTORY
+# at that path, which then breaks Claude Code -- so make sure each source exists
+# as the right kind of node before the container starts. JSON files are seeded
+# with "{}" so an empty overlay is still valid JSON; the shell scripts as empty
+# files (harmless if unused).
+mkdir -p "${HOME}/.claude/hooks"
+for _cfg in settings.json keybindings.json; do
+    [[ -e "${HOME}/.claude/${_cfg}" ]] || printf '{}' > "${HOME}/.claude/${_cfg}"
+done
+[[ -e "${HOME}/.claude/statusline.sh" ]] || : > "${HOME}/.claude/statusline.sh"
+[[ -e "${HOME}/.claude/CLAUDE.md" ]]     || : > "${HOME}/.claude/CLAUDE.md"
 
 # Same idea for the GitHub Copilot CLI's ~/.copilot -- only skills/instructions/
 # prompts get shared (see the mounts block below for the full rationale).
@@ -2510,6 +2778,12 @@ RUN set -eux; \
     rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gh_arch}"; \
     /usr/local/bin/gh --version
 # __GH_BLOCK_END__
+
+# Project-specific extra build steps from devcontainers-config.json "dockerfileSnippet"
+# (e.g. apt-get install ffmpeg). Injected verbatim by spawn-workspace.sh; the
+# placeholder line is removed when the list is empty. Appended last so the standard
+# tooling layers above stay cache-stable.
+__CUSTOM_DOCKERFILE__
 DOCKERFILE
 
 cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
@@ -2544,6 +2818,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         "--privileged", "--init",
         // __RPM_BLOCK_END__
         __VM_MEM_RUNARGS__
+        __SHM_RUNARGS__
         __PORT_RUNARGS__
     ],
 
@@ -2573,13 +2848,14 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
     // glab-cli's source dir is resolved by spawn-workspace.sh (macOS uses
     // ~/Library/Application Support/glab-cli, Linux uses ~/.config/glab-cli)
     // and pre-created there, so no mkdir needed here.
-    "initializeCommand": "mkdir -p ~/.m2/repository ~/.ssh ~/.claude ~/.claude/projects/__MEMORY_KEY__/memory && touch ~/.claude.json",
+    "initializeCommand": "mkdir -p ~/.m2/repository ~/.ssh ~/.claude ~/.claude/hooks ~/.claude/projects/__MEMORY_KEY__/memory",
 
     // Mount order matters: deeper paths must come AFTER their parents so they take
     // precedence. The layering is:
-    //   1. ~/.claude               -> shared by default (login, agents, commands, ...)
-    //   2. named volume per story  -> overrides per-project state (history, todos)
-    //   3. shared memory bind      -> overrides only the memory/ subfolder back to shared
+    //   1. ~/.claude volume        -> per-container base: login + all writable state, isolated
+    //   2. ro config binds         -> global user config (settings/statusline/hooks/...) read-only
+    //   3. plugins bind            -> plugins per project, from <workspace>/.claude
+    //   4. shared memory bind      -> overrides only the memory/ subfolder back to shared
     "mounts": [
         // Worktree path resolution: a worktree's .git file says
         //   "gitdir: <host-path>/<repo>/.git/worktrees/<name>"
@@ -2659,9 +2935,44 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         //  - Linux: $SSH_AUTH_SOCK from the host
         // SSH_AUTH_SOCK env var (containerEnv below) points ssh at this socket.
         "source=__SSH_AGENT_SRC__,target=/ssh-agent,type=bind",
-        "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind",
-        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
-        "source=__PROJECT_SHORT__-claude-project-${devcontainerId},target=/home/vscode/.claude/projects/__MEMORY_KEY__,type=volume",
+        // Base: per-container named volume for the WHOLE ~/.claude. Everything
+        // writable and account-bound -- login (.credentials.json), the .claude.json
+        // account/cache file, daemon/, sessions/, history.jsonl, policy-limits*,
+        // stats-cache -- lives here, isolated per container. So each container has
+        // its own /login (last /login no longer clobbers the others) and there are
+        // no shared daemon.lock / machineID / session-file races across the host
+        // and parallel story containers. Survives rebuilds; removed on dispose
+        // (dispose-workspace.sh discovers attached volumes from the container).
+        "source=__PROJECT_SHORT__-claude-home-${devcontainerId},target=/home/vscode/.claude,type=volume",
+        // Global, account-INDEPENDENT user config overlaid READ-ONLY from the host
+        // (deeper path wins over the volume). These are your personal prefs/scripts,
+        // so they stay identical in every container and on the host -- edit them on
+        // the host. CLAUDE.md, statusline.sh and hooks/ are NEVER rewritten by Claude
+        // Code, so a read-only bind is safe for them.
+        // NOTE: settings.json and keybindings.json are deliberately NOT bound here --
+        // Claude Code rewrites them (/effort, /config, /plugin, keybinding edits) via
+        // write-temp + rename, and a rename OVER a bind-mount point fails with EBUSY
+        // (same single-file-bind trap as ~/.gitconfig). They are instead SEEDED from
+        // the host into the per-container volume by post-create.sh (see the .claude-seed
+        // mounts below), so they are writable inside the container; edits persist in
+        // the volume and do not propagate to the host or other containers.
+        "source=${localEnv:HOME}/.claude/CLAUDE.md,target=/home/vscode/.claude/CLAUDE.md,type=bind,readonly",
+        "source=${localEnv:HOME}/.claude/statusline.sh,target=/home/vscode/.claude/statusline.sh,type=bind,readonly",
+        "source=${localEnv:HOME}/.claude/hooks,target=/home/vscode/.claude/hooks,type=bind,readonly",
+        // Seed sources for the two writable config files (read-only; post-create.sh
+        // copies them into the volume's ~/.claude on first create if absent).
+        "source=${localEnv:HOME}/.claude/settings.json,target=/home/vscode/.claude-seed/settings.json,type=bind,readonly",
+        "source=${localEnv:HOME}/.claude/keybindings.json,target=/home/vscode/.claude-seed/keybindings.json,type=bind,readonly",
+        // Plugins PER PROJECT, not global: sourced from the project workspace's
+        // .claude on the host (shared across this project's story containers, the
+        // same way skills/ is), NOT from the global ~/.claude/plugins. Writable, so
+        // plugins can also be installed inside the container (any /plugin scope works
+        // now that settings.json is writable too).
+        "source=__SOURCE_WS__/.claude/plugins,target=/home/vscode/.claude/plugins,type=bind",
+        // Shared project memory: overlays memory/ back to a single host folder so it
+        // persists across rebuilds AND is shared between parallel story containers --
+        // the one piece of per-project Claude state worth sharing. Deeper than the
+        // base volume, so it wins.
         "source=${localEnv:HOME}/.claude/projects/__MEMORY_KEY__/memory,target=/home/vscode/.claude/projects/__MEMORY_KEY__/memory,type=bind",
         // GitHub Copilot CLI equivalent of the ~/.claude sharing above. Only the
         // "content" subfolders are bind-mounted (skills, custom instructions,
@@ -2914,6 +3225,7 @@ substitute_placeholders() {
         "${PORT_SED_ARGS[@]}" \
         -e "s|__PORT_RUNARGS__|${PORT_RUNARGS}|g" \
         -e "s|__VM_MEM_RUNARGS__|${VM_MEM_RUNARGS}|g" \
+        -e "s|__SHM_RUNARGS__|${SHM_RUNARGS}|g" \
         -e "s/__PROJECT_NAME__/${PROJECT_NAME}/g" \
         -e "s/__PROJECT_SHORT__/${PROJECT_SHORT}/g" \
         -e "s|__WORKSPACE_PATH__|${WORKSPACE_PATH}|g" \
@@ -3248,8 +3560,29 @@ if ! bash -lc "npm install -g bpmn-to-image"; then
 fi
 # __CHROMIUM_BLOCK_END__
 
-# named volume for per-story Claude project state is owned by root after first mount
+# The per-container ~/.claude base is a fresh named volume -> it (and any nested
+# mountpoint dirs Docker auto-creates for the deeper binds) is owned by root after
+# first mount, so the vscode user can't write .credentials.json, daemon/, etc.
+# chown the volume root NON-recursively (never recurse: the read-only config
+# overlays and the host-bound plugins/ + memory/ must not be touched), then the
+# per-project state subtree (where the shared memory bind lives) as before.
+sudo chown vscode:vscode /home/vscode/.claude || true
+sudo chown vscode:vscode /home/vscode/.claude/projects || true
 sudo chown -R vscode:vscode /home/vscode/.claude/projects/__MEMORY_KEY__ || true
+
+# Seed the two config files Claude Code REWRITES (settings.json via /effort, /config,
+# /plugin; keybindings.json via the keybindings editor) into the volume, so they are
+# real files on the volume fs -- Claude Code's write-temp+rename then works. They
+# CANNOT be bind-mounted: a rename over a bind-mount point fails with EBUSY. Copy
+# only when absent, so edits made inside the container persist across rebuilds. The
+# sources are the read-only .claude-seed binds; the other config (CLAUDE.md,
+# statusline.sh, hooks/) stays a live read-only bind from the host.
+for _cfg in settings.json keybindings.json; do
+    if [ ! -f "/home/vscode/.claude/${_cfg}" ] && [ -f "/home/vscode/.claude-seed/${_cfg}" ]; then
+        cp "/home/vscode/.claude-seed/${_cfg}" "/home/vscode/.claude/${_cfg}"
+    fi
+done
+sudo chown vscode:vscode /home/vscode/.claude/settings.json /home/vscode/.claude/keybindings.json 2>/dev/null || true
 
 # Docker auto-creates missing bind-mount parent directories as root:root before
 # the mount happens. ~/.copilot/{skills,instructions,prompts} are bind-mounted
@@ -3949,6 +4282,24 @@ chmod +x "${WS_DIR}/.devcontainer/post-start.sh"
 substitute_placeholders "${WS_DIR}/.devcontainer/Dockerfile"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-create.sh"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-start.sh"
+
+# Substitute __CUSTOM_DOCKERFILE__ with the project's extra Dockerfile lines
+# (multi-line; same awk approach as the volume-mount injections in devcontainer.json).
+# Empty list -> the placeholder line is removed. Runs BEFORE the base-image hash
+# below, so changing the snippet busts the cache and rebuilds the base image.
+{
+    _df_tmp="$(mktemp)"
+    if (( ${#DOCKERFILE_SNIPPET[@]} )); then printf '%s\n' "${DOCKERFILE_SNIPPET[@]}" > "${_df_tmp}"; fi
+    awk -v mf="${_df_tmp}" '
+        /__CUSTOM_DOCKERFILE__/ {
+            while ((getline line < mf) > 0) print line
+            next
+        }
+        { print }
+    ' "${WS_DIR}/.devcontainer/Dockerfile" > "${WS_DIR}/.devcontainer/Dockerfile.cd_tmp"
+    mv "${WS_DIR}/.devcontainer/Dockerfile.cd_tmp" "${WS_DIR}/.devcontainer/Dockerfile"
+    rm "${_df_tmp}"
+}
 
 # ============================================================================
 # Base-image caching

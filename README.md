@@ -766,14 +766,22 @@ then only the badge and model name show, which is expected. Every segment
 degrades gracefully: an older Claude Code without `context_window` simply omits
 the Kontext part.
 
-**Why it also works inside every story container:** `spawn-workspace.sh`
-bind-mounts the host `~/.claude` into each container
-(`~/.claude` → `/home/vscode/.claude`), so `settings.json` and the statusline
-script are shared automatically → set it up once on the host and every story
-container inherits it. The one runtime dependency is `jq`, which the
-DevContainer image installs (see the package-install line in the generated
-`Dockerfile`). Rebuild an existing container to pick up `jq`; new spawns have
-it out of the box.
+**Why it also works inside every story container:** `spawn-workspace.sh` brings your
+global Claude config from the host into each container — `CLAUDE.md`, `statusline.sh`
+and `hooks/` as live read-only binds, and `settings.json`/`keybindings.json` seeded
+into the per-container volume (writable, so `/effort`, `/config` etc. work inside
+the container). So you set it up once on the host and every story container inherits
+it, while each container keeps its own login and runtime state (see
+[Per-container login vs. shared config](#per-container-login-vs-shared-config)
+below). The one runtime dependency is `jq`, which the DevContainer image installs
+(see the package-install line in the generated `Dockerfile`). Rebuild an existing
+container to pick up `jq`; new spawns have it out of the box.
+
+> **Caveman badge / plugins:** plugins are shared **per project** from
+> `<workspace>/.claude/plugins`, not from the global `~/.claude/plugins`. On spawn
+> you are asked which host plugins to adopt into the project; `spawn-workspace.sh`
+> then vendors them and enables exactly those in the project settings. See
+> [Adopting host plugins/skills per project](#adopting-host-pluginsskills-per-project).
 
 ### Setup
 
@@ -805,6 +813,95 @@ existing containers need a rebuild for `jq`.
 statusline → there is no per-model field, so a separate weekly Fable limit
 **cannot** be shown here. Use the `/usage` command inside Claude Code to see the
 model-specific weekly limits.
+
+## Per-container login vs. shared config
+
+Each story container has its **own** Claude Code login. `~/.claude` inside a
+container is a per-container Docker named volume (`<projectShort>-claude-home-*`),
+so `.credentials.json`, `.claude.json`, `daemon/`, `sessions/` and `history.jsonl`
+are isolated — a `/login` in one container (even with a different account) never
+clobbers another, and there are no shared `daemon.lock` / `machineID` / session
+races. You run `/login` once per container; the token then persists across
+rebuilds and is removed on `dispose`.
+
+Sharing is deliberately narrowed to what is account-independent or project-scoped:
+
+| What | How | Scope |
+|------|-----|-------|
+| `CLAUDE.md`, `statusline.sh`, `hooks/` | read-only bind from host `~/.claude` | global (all containers) |
+| `settings.json`, `keybindings.json` | **seeded** from host into the volume (writable) | per container after first create |
+| `plugins/` | bind from `<workspace>/.claude/plugins` | **per project** |
+| `skills/` | bind from `<workspace>/.claude/skills` | **per project** |
+| memory (`projects/<key>/memory`) | bind to the shared host folder | **per project**, shared + persistent |
+| login, history, sessions, daemon | per-container volume | **per container** |
+
+`CLAUDE.md`, `statusline.sh` and `hooks/` are read-only binds (Claude Code never
+rewrites them) — edit them on the host and every container picks the change up
+live. `settings.json` and `keybindings.json` are different: Claude Code rewrites
+them (`/effort`, `/config`, `/plugin`, keybinding edits) via write-temp + rename,
+and a rename over a bind-mount point fails with `EBUSY`. So they are **seeded**
+from the host into the per-container volume on first create and are fully writable
+inside the container; edits persist across rebuilds but stay per-container (change
+the host copy to reset new containers). Project-specific settings still go in
+`<workspace>/.claude/settings.json` (checked in) or `settings.local.json`, which
+travel with the workspace and override the user settings.
+
+> **Note:** the original motivation for sharing `~/.claude` was to avoid logging
+> in per container — but a new container needs its own `/login` regardless
+> (device/session binding), so nothing was gained by sharing credentials and the
+> shared files only caused clobbering and races.
+
+## Adopting host plugins/skills per project
+
+Because plugins/skills are per project (not global), `spawn-workspace.sh` can
+vendor a chosen subset of your **host-installed** Claude plugins/skills into the
+project's `<workspace>/.claude`. It is interactive and change-aware:
+
+- On spawn it enumerates host plugins (`~/.claude/plugins/installed_plugins.json`,
+  user scope) and host skills (`~/.claude/skills/<name>/SKILL.md`).
+- It compares them against a snapshot of the last-seen host set. **First run, or
+  whenever that set changed**, it prompts per item (`include plugin 'x'? [Y/n]`),
+  defaulting to your previous choice. An unchanged set is applied silently.
+- Selected plugins are copied (cache + marketplace without `.git` + data), their
+  manifests are rewritten to the in-container path, and **exactly** the selected
+  plugins are enabled in `<workspace>/.claude/settings.json` (host-enabled but
+  unselected ones are set `false`, so nothing references a plugin that isn't there).
+- `--yes` / no TTY never prompts: it uses the stored selection (or the config
+  seed) and leaves the snapshot unadvanced on a change, so a later interactive
+  spawn re-prompts.
+
+State lives in two places:
+
+| | Where | Committed? |
+|---|---|---|
+| Declarative seed / override | `claudeAssets` in `devcontainers-config.json` | yes (team-shared intent) |
+| Live selection + host snapshot | `dev-containers/.claude-assets.state.json` | no (git-ignored, per machine) |
+
+Set `claudeAssets` to pin a selection for CI / first run:
+
+```jsonc
+"claudeAssets": {
+    "plugins": [ "caveman@caveman" ],
+    "skills":  [ ]
+}
+```
+
+To adopt a plugin you don't have on the host yet, install it there first
+(`/plugin` in Claude Code), then spawn — it will appear in the prompt.
+
+### Installing plugins inside a container
+
+You can also install plugins directly inside a running container (`/plugin`). The
+plugin files and the marketplace clone land in `~/.claude/plugins/`, which is the
+writable, project-shared bind (`<workspace>/.claude/plugins`) — so an install there
+persists and, thanks to the **additive** vendoring, survives every later spawn (the
+spawn step never removes plugins it didn't put there).
+
+`/plugin` writes the *enable* state to the settings file of the scope you pick.
+All scopes work: **user** scope writes `~/.claude/settings.json` (writable, seeded
+into the volume — see above), **project**/**local** write the workspace
+`.claude/settings*.json`. User-scope enables are per-container; project/local travel
+with the workspace.
 
 ## Troubleshooting
 

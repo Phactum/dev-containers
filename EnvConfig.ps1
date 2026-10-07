@@ -19,12 +19,15 @@
 
         ProjectName, ProjectShort, BaseImage, NodeFeatureVersion,
         GlabVersion, GlabHostname, GhVersion, PortOffsetStep, InitialPortOffset, TerminalShell
-        VmRamSize, VmSwapSize
+        VmRamSize, VmSwapSize, ShmSize
         Distro, RepoMode
         Repos             [ @{ Name; BaseRef } ]
         HostPorts         [ @{ Port; Label } ]
         RunConfigs        [ string ]
         ForwardedEnvVars  [ string ]
+        ClaudeSeedPlugins [ string ]   seed for the plugin/skill adoption feature
+        ClaudeSeedSkills  [ string ]
+        DockerfileSnippet [ string ]   extra raw Dockerfile lines
         Builds            [ @{ Repo; Type; Value } ]   Type = 'mvn' | 'cmd'
         BuildsDefined     bool -- whether the "builds" key was present
         ClaudeCodeEnabled bool -- install Claude Code in post-create.sh
@@ -240,6 +243,9 @@ function Get-DevContainerConfig {
         # to vmRamSize.
         VmRamSize          = & $str 'vmRamSize'
         VmSwapSize         = & $str 'vmSwapSize'
+        # Optional --shm-size (docker run) for /dev/shm. The 64m default is too
+        # small for ffmpeg, headless Chrome, etc. Empty leaves runArgs untouched.
+        ShmSize            = & $str 'shmSize'
         ProxyHttp          = ''
         ProxyHttps         = ''
         ProxyNoProxy       = ''
@@ -255,6 +261,15 @@ function Get-DevContainerConfig {
         HostPorts          = @()
         RunConfigs         = @()
         ForwardedEnvVars   = @()
+        # Claude assets seed: which host plugins/skills to adopt into a project's
+        # <workspace>/.claude. Only the DECLARATIVE default -- the live selection
+        # and host snapshot for change detection live in the spawn-managed sidecar
+        # (.claude-assets.state.json next to this config).
+        ClaudeSeedPlugins  = @()
+        ClaudeSeedSkills   = @()
+        # Extra raw Dockerfile lines appended near the end of the image build
+        # (e.g. install ffmpeg). Each entry is one verbatim Dockerfile line.
+        DockerfileSnippet  = @()
         Builds             = @()
         BuildsDefined      = $false
         # Which AI coding assistant CLIs post-create.sh installs. Both default
@@ -318,6 +333,23 @@ function Get-DevContainerConfig {
 
     if ((& $has 'forwardedEnvVars') -and $null -ne $json.forwardedEnvVars) {
         $cfg.ForwardedEnvVars = @($json.forwardedEnvVars | ForEach-Object { [string]$_ })
+    }
+
+    # Claude assets seed (plugins = "name@marketplace" keys, skills = dir names).
+    if ((& $has 'claudeAssets') -and $null -ne $json.claudeAssets) {
+        $ca = $json.claudeAssets
+        $caHas = { param($n) $ca.PSObject.Properties.Name -contains $n }
+        if ((& $caHas 'plugins') -and $null -ne $ca.plugins) {
+            $cfg.ClaudeSeedPlugins = @($ca.plugins | ForEach-Object { [string]$_ })
+        }
+        if ((& $caHas 'skills') -and $null -ne $ca.skills) {
+            $cfg.ClaudeSeedSkills = @($ca.skills | ForEach-Object { [string]$_ })
+        }
+    }
+
+    # Extra Dockerfile lines (one raw line per array entry).
+    if ((& $has 'dockerfileSnippet') -and $null -ne $json.dockerfileSnippet) {
+        $cfg.DockerfileSnippet = @($json.dockerfileSnippet | ForEach-Object { [string]$_ })
     }
 
     # Build list: a single "builds" array whose entries each carry exactly one of

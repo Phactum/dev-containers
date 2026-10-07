@@ -99,6 +99,9 @@ INITIAL_PORT_OFFSET="$(_env_scalar '.initialPortOffset // 10000')"
 # --memory-swap (which is the TOTAL of memory+swap) by adding it to vmRamSize.
 VM_RAM_SIZE="$(_env_scalar '.vmRamSize')"
 VM_SWAP_SIZE="$(_env_scalar '.vmSwapSize')"
+# Optional --shm-size (docker run) for /dev/shm. The 64m default is too small for
+# ffmpeg, headless Chrome, etc. Empty (the default) leaves runArgs untouched.
+SHM_SIZE="$(_env_scalar '.shmSize')"
 TERMINAL_SHELL="$(_env_scalar '.terminalShell')"
 WORKSPACES_ROOT_CONFIG="$(_env_scalar '.workspacesRoot')"
 
@@ -192,6 +195,31 @@ FORWARDED_ENV_VARS=()
 while IFS= read -r -d '' _rec; do
     FORWARDED_ENV_VARS+=("${_rec}")
 done < <(_env_records '(.forwardedEnvVars // [])[]')
+
+# Claude assets seed: which host plugins / skills to adopt into a project's
+# <workspace>/.claude. This is only the DECLARATIVE default -- the live selection
+# and the host snapshot used for change detection live in the spawn-managed
+# sidecar (.claude-assets.state.json next to this config). spawn-workspace.sh
+# seeds from these on first run and uses them as the non-interactive fallback.
+# Each entry is a plugin key "name@marketplace" or a skill directory name.
+CLAUDE_SEED_PLUGINS=()
+while IFS= read -r -d '' _rec; do
+    CLAUDE_SEED_PLUGINS+=("${_rec}")
+done < <(_env_records '(.claudeAssets.plugins // [])[]')
+
+CLAUDE_SEED_SKILLS=()
+while IFS= read -r -d '' _rec; do
+    CLAUDE_SEED_SKILLS+=("${_rec}")
+done < <(_env_records '(.claudeAssets.skills // [])[]')
+
+# Extra Dockerfile lines appended near the end of the generated image build
+# (e.g. "RUN apt-get install -y ffmpeg"). Each array entry is ONE raw Dockerfile
+# line, emitted verbatim; distro-specific content is the project's responsibility.
+# Empty (the default) leaves the Dockerfile unchanged.
+DOCKERFILE_SNIPPET=()
+while IFS= read -r -d '' _rec; do
+    DOCKERFILE_SNIPPET+=("${_rec}")
+done < <(_env_records '(.dockerfileSnippet // [])[]')
 
 # CA certificates to install into the image (paths, relative to the config dir).
 PROXY_CA_CERTS=()
