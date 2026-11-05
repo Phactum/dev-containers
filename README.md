@@ -626,8 +626,8 @@ Both scripts (and their `.ps1` counterparts) pick the workspaces root in this pr
    If no such directory is found, the fallback is two levels above the config.
 
 Each invocation prints the resolved target directory and asks for
-confirmation before doing anything. Press Enter to accept, type `n` to
-abort. Pass `--yes` (or `-y`) to skip the prompt in scripted runs.
+confirmation before doing anything. Type `y` to proceed; Enter or any other
+answer aborts. Pass `--yes` (or `-y`) to skip the prompt in scripted runs.
 
 ## Usage
 
@@ -684,8 +684,8 @@ What it does:
 1. Locates `devcontainers-config.json` (`--config` → `./dev-containers/devcontainers-config.json` →
    `./devcontainers-config.json`), then
    resolves the workspaces root (CLI flag → env var → auto-detect), prints the
-   target directory and prompts for confirmation. Aborts if you answer `n` or
-   if the target already exists.
+   target directory and prompts for confirmation. Aborts unless you answer `y`,
+   or if the target already exists.
 2. Computes the branch leaf (strips `feature/` etc.) → workspace name
    `<PROJECT_NAME>-<leaf>`.
 3. Probes host ports and picks the lowest free

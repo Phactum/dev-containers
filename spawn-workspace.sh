@@ -794,21 +794,21 @@ README_TPL_SRC="$(config_asset README.md.tpl)" || {
 }
 # ---------------------------------------------------------------------------
 
-# Confirmation prompt. Default is Yes (Enter accepts), so the prompt mostly
-# costs one keystroke per spawn. --yes / -y skips it for batch use.
+# Confirmation prompt. Default is No: only an explicit y/yes proceeds, so a
+# stray Enter can't create a workspace in the wrong place. --yes / -y skips it
+# for batch use.
 echo "About to create story workspace:"
 echo "  target:  ${WS_DIR}"
 echo "  branch:  ${BRANCH}"
 echo "  source:  ${SOURCE_WS}"
 if (( ASSUME_YES == 0 )); then
-    read -r -p "Proceed? [Y/n] " reply
-    case "${reply}" in
-        [Nn]*)
-            echo "aborted. Pass --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}" >&2
-            echo "to point the script at a different workspaces directory." >&2
-            exit 0
-            ;;
-    esac
+    # Only an explicit y/yes proceeds; Enter, anything else or EOF aborts.
+    read -r -p "Proceed? [y/N] " reply || reply=""
+    if [[ ! "${reply}" =~ ^[Yy] ]]; then
+        echo "aborted. Pass --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}" >&2
+        echo "to point the script at a different workspaces directory." >&2
+        exit 0
+    fi
 fi
 
 # Pick a port offset (multiple of 10000) where ALL forwarded ports are free

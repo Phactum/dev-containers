@@ -565,8 +565,9 @@ Write-Output "  target:  $WsDir"
 Write-Output "  branch:  $Branch"
 Write-Output "  source:  $SourceWs"
 if (-not $AssumeYes) {
-    $reply = Read-Host 'Proceed? [Y/n]'
-    if ($reply -match '^[Nn]') {
+    # Only an explicit y/yes proceeds; Enter or anything else aborts.
+    $reply = Read-Host 'Proceed? [y/N]'
+    if ($reply -notmatch '^[Yy]') {
         Write-Err "aborted. Pass --workspaces-root <path> or set `$env:$EnvVarWorkspacesRoot"
         Write-Err 'to point the script at a different workspaces directory.'
         exit 0

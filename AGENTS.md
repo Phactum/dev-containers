@@ -511,7 +511,8 @@ function names in `PascalCase-Verb` form, so the two read side by side:
 ## Running / testing changes
 
 There is no dry-run. All four scripts print the resolved target directory and
-prompt for confirmation before doing anything (Enter to accept, `n` to abort);
+prompt for confirmation before doing anything (`y` to proceed, Enter or anything
+else aborts);
 pass `--yes`/`-y` to skip in scripted runs. Prefer testing spawn against a
 throwaway branch, then dispose it (add `--delete-branch` to also remove the
 local branch).

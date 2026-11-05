@@ -230,8 +230,8 @@ if [[ "${WS_DIR}" == "${SOURCE_WS}" ]]; then
     exit 1
 fi
 
-# Confirmation prompt. Default Y, so a quick Enter accepts; --yes / -y
-# skips entirely for scripted use.
+# Confirmation prompt. Default is No: only an explicit y/yes proceeds, so a
+# stray Enter can't delete anything; --yes / -y skips it for scripted use.
 echo "About to dispose story workspace:"
 echo "  target:        ${WS_DIR}"
 echo "  delete-branch: $((DELETE_BRANCH))"
@@ -239,14 +239,13 @@ echo "  force:         $((FORCE))"
 echo "  keep-container:$((KEEP_CONTAINER))"
 echo "  keep-image:    $((KEEP_IMAGE))"
 if (( ASSUME_YES == 0 )); then
-    read -r -p "Proceed? [Y/n] " reply
-    case "${reply}" in
-        [Nn]*)
-            echo "aborted. Pass --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}" >&2
-            echo "to point the script at a different workspaces directory." >&2
-            exit 0
-            ;;
-    esac
+    # Only an explicit y/yes proceeds; Enter, anything else or EOF aborts.
+    read -r -p "Proceed? [y/N] " reply || reply=""
+    if [[ ! "${reply}" =~ ^[Yy] ]]; then
+        echo "aborted. Pass --workspaces-root <path> or set \$${ENV_VAR_WORKSPACES_ROOT}" >&2
+        echo "to point the script at a different workspaces directory." >&2
+        exit 0
+    fi
 fi
 
 # REPOS in devcontainers-config.json is a "<name>:<base-ref>" map. Dispose only needs the
