@@ -2668,9 +2668,21 @@ RUN set -eux; \
 # The global prefix is moved to /usr/local and handed to the vscode user, so
 # `npm install -g` in post-create.sh works without sudo -- exactly like it does
 # on the Debian path where the node feature owns its nvm directory.
+#
+# Security note: this is NodeSource's own officially documented RPM install
+# method (curl | bash as root) -- there is currently no vendor-published
+# checksum/signature for the setup script itself to verify against (only the
+# resulting RPM *packages* are GPG-signed and checked by dnf). The transfer is
+# at least pinned to HTTPS (TLS) and `curl -f` fails closed on any HTTP error,
+# and the "-s" check below additionally refuses to execute a response that
+# came back empty/truncated. Residual supply-chain risk (a compromise of
+# rpm.nodesource.com or a TLS-intercepting proxy on the build host) is
+# accepted here because there is no safer vendor-supported alternative; if one
+# becomes available, prefer it over this block.
 ARG NODE_MAJOR=__NODE_FEATURE_VERSION__
 RUN set -eux; \
     ( curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/nodesource.sh \
+      && [ -s /tmp/nodesource.sh ] \
       && bash /tmp/nodesource.sh \
       && dnf -y install nodejs ) \
     || ( echo "note: NodeSource unavailable -- falling back to the AppStream module" >&2; \

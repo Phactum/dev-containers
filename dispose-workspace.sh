@@ -190,7 +190,16 @@ fi
 # workspace was never found. So we build the candidates in order of specificity
 # and pick the first one that actually exists on disk; if none does, the
 # unstripped form drives the error message.
+# Defense in depth: the leaf ends up in a filesystem path (rm -rf), a docker
+# container name and git worktree paths, all derived from the user-supplied
+# <target> argument. Reject anything outside a conservative, path/shell-safe
+# character set up front (mirrors the branch-name validation in
+# spawn-workspace.sh and the same check in dispose-workspace.ps1).
 _RAW_LEAF="${ARG##*/}"                  # strip optional branch prefix like feature/
+if [[ ! "${_RAW_LEAF}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "invalid target: '${ARG}' (leaf component must match [A-Za-z0-9._-]+)" >&2
+    exit 1
+fi
 LEAF_CANDIDATES=("${_RAW_LEAF}")
 [[ "${_RAW_LEAF}" != "${_RAW_LEAF#"${PROJECT_NAME}"-}" ]] && LEAF_CANDIDATES+=("${_RAW_LEAF#"${PROJECT_NAME}"-}")
 [[ "${_RAW_LEAF}" != "${_RAW_LEAF#"${PROJECT_SHORT}"-}" ]] && LEAF_CANDIDATES+=("${_RAW_LEAF#"${PROJECT_SHORT}"-}")

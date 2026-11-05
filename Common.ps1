@@ -89,7 +89,7 @@ function Get-RelativePosixPath {
 }
 
 # Recursive delete that copes with the read-only/hidden bits git sets inside
-# .git and with the odd locked handle, falling back to cmd's rd.
+# .git and with the odd locked handle.
 #
 # Docker Desktop returns from `docker rm`/`docker volume rm` before its
 # file-sharing layer has actually released the per-module node_modules named
@@ -99,6 +99,16 @@ function Get-RelativePosixPath {
 # of times before giving up. By default (spawn's callers) a final failure still
 # throws; pass -AllowFailure to get $true/$false back instead, so a caller in a
 # loop (dispose) can warn and continue rather than abort.
+#
+# Security note: this used to shell out to `cmd.exe /c "attrib ... & rd ..."`
+# with $Path string-concatenated into the command line. Because callers (e.g.
+# dispose-workspace.ps1) can derive $Path from a user-supplied CLI argument
+# (a workspace directory name), an attacker-controlled path containing
+# cmd.exe metacharacters (&, |, etc.) could have resulted in arbitrary command
+# execution. All attribute-clearing and deletion below is now done via native
+# .NET/PowerShell APIs that take $Path as a literal value, never as part of a
+# parsed command line, so no such injection is possible regardless of its
+# contents.
 function Remove-TreeForce {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -109,11 +119,15 @@ function Remove-TreeForce {
         $removed = $true
     } else {
         for ($attempt = 1; $attempt -le 6; $attempt++) {
-            & cmd.exe /c "attrib -R -H -S `"$Path\*`" /S /D" 2>&1 | Out-Null
             try {
+                Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        try { $_.Attributes = [System.IO.FileAttributes]::Normal } catch { }
+                    }
+                try { (Get-Item -LiteralPath $Path -Force).Attributes = [System.IO.FileAttributes]::Normal } catch { }
                 Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
             } catch {
-                & cmd.exe /c "rd /s /q `"$Path`"" 2>&1 | Out-Null
+                try { [System.IO.Directory]::Delete($Path, $true) } catch { }
             }
             if (-not (Test-Path -LiteralPath $Path)) { $removed = $true; break }
             Start-Sleep -Seconds 2

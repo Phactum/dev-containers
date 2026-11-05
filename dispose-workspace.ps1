@@ -188,7 +188,16 @@ if ($Target -match '^[0-9a-f]{12,}$' -and $DockerAvailable) {
 # workspace was never found. So we build the candidates in order of specificity
 # and pick the first one that actually exists on disk; if none does, the
 # unstripped form drives the error message.
+# Defense in depth: $RawLeaf ends up in a filesystem path ($WsDir, passed to
+# Remove-TreeForce), a docker container name ($Container) and git worktree
+# paths, all derived from the user-supplied <target> CLI argument. Reject
+# anything outside a conservative, path/shell-safe character set up front
+# (mirrors the branch-name validation in spawn-workspace.ps1) rather than
+# relying solely on downstream code never mis-using it as a command string.
 $RawLeaf = ($Target -split '/')[-1]
+if ($RawLeaf -cnotmatch '^[A-Za-z0-9._-]+$') {
+    Fail "invalid target: '$Target' (leaf component must match [A-Za-z0-9._-]+)"
+}
 $LeafCandidates = @($RawLeaf)
 if ($RawLeaf.StartsWith("$ProjectName-")) { $LeafCandidates += $RawLeaf.Substring("$ProjectName-".Length) }
 if ($RawLeaf.StartsWith("$ProjectShort-")) { $LeafCandidates += $RawLeaf.Substring("$ProjectShort-".Length) }
