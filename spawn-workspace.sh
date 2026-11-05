@@ -10,6 +10,11 @@
 #    Input branch "feature/FLOW-4711_example" yields workspace
 #    <workspaces-root>/<PROJECT_NAME>-FLOW-4711_example/. The branch-path
 #    prefix (feature/, bugfix/, ...) is stripped; the leaf becomes the suffix.
+#    The branch name is validated up front against an allow-list
+#    ([A-Za-z0-9._/-], no leading '-') plus `git check-ref-format --branch`:
+#    it ends up in directory/container names, git argv and -- in container
+#    mode -- in the generated post-create.sh, so shell metacharacters must
+#    never get through (command injection inside the container).
 #
 # 2. Git worktrees instead of fresh clones
 #    For each source repo under <workspaces-root>/<PROJECT_NAME>/<repo> (REPOS
@@ -379,6 +384,17 @@ done
 
 if [[ -z "${BRANCH}" ]]; then
     echo "usage: $0 [--config <path>] [--workspaces-root <path>] [--yes] <branch-name>" >&2
+    exit 2
+fi
+
+# The branch name flows into directory and container names, git argv and the
+# generated post-create.sh (container mode), so only allow characters that are
+# inert in all of them. Leading '-' would be read as a git option. The
+# allow-list is stricter than git's own refname rules, hence both checks.
+if [[ ! "${BRANCH}" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] \
+        || ! git check-ref-format --branch "${BRANCH}" >/dev/null 2>&1; then
+    echo "invalid branch name: '${BRANCH}'" >&2
+    echo "  allowed: letters, digits, '.', '_', '-', '/' (no leading '-'), and a valid git branch name" >&2
     exit 2
 fi
 
@@ -1857,14 +1873,18 @@ MAVEN_BUILD_COMMANDS="${MAVEN_BUILD_COMMANDS%$'\n'}"
 
 # container mode: the clone calls post-create.sh runs INSIDE the container, one
 # per git repo, from the upstream URL captured above. The story branch (BRANCH)
-# is the same for all; the base ref is per repo. Single-quoted so URLs with '&'
-# etc. survive the splice; git URLs never contain a single quote. Empty in
-# worktree / clone mode -> the placeholder line is removed.
+# is the same for all; the base ref is per repo. Every argument goes through
+# sh_quote: the branch is validated above, but URL, repo name and base ref come
+# from the config / git remote and must not be able to break out of the quotes
+# either. Empty in worktree / clone mode -> the placeholder line is removed.
+sh_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 CONTAINER_CLONE_COMMANDS=""
 if (( IS_CONTAINER_MODE == 1 )) && (( ${#CONTAINER_REPOS[@]} > 0 )); then
     _i=0
     while (( _i < ${#CONTAINER_REPOS[@]} )); do
-        CONTAINER_CLONE_COMMANDS+="clone_repo_bg '${CONTAINER_REPOS[$_i]}' '${CONTAINER_URLS[$_i]}' '${BRANCH}' '${CONTAINER_BASES[$_i]}'"$'\n'
+        CONTAINER_CLONE_COMMANDS+="clone_repo_bg $(sh_quote "${CONTAINER_REPOS[$_i]}") $(sh_quote "${CONTAINER_URLS[$_i]}") $(sh_quote "${BRANCH}") $(sh_quote "${CONTAINER_BASES[$_i]}")"$'\n'
         _i=$(( _i + 1 ))
     done
 fi

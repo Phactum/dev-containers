@@ -277,6 +277,17 @@ if (-not $Branch) {
     exit 2
 }
 
+# The branch name flows into directory and container names, git argv and the
+# generated post-create.sh (container mode), so only allow characters that are
+# inert in all of them. Leading '-' would be read as a git option. The
+# allow-list is stricter than git's own refname rules, hence both checks.
+if ($Branch -cnotmatch '^[A-Za-z0-9._/][A-Za-z0-9._/-]*$' -or
+        -not (Test-GitSucceeded -GitArgs @('check-ref-format', '--branch', $Branch))) {
+    Write-Err "invalid branch name: '$Branch'"
+    Write-Err "  allowed: letters, digits, '.', '_', '-', '/' (no leading '-'), and a valid git branch name"
+    exit 2
+}
+
 # ============================================================================
 # Project configuration
 # ============================================================================
@@ -1495,12 +1506,16 @@ $MavenBuildCommands = $MavenBuildCommands.TrimEnd("`n")
 
 # container mode: the clone calls post-create.sh runs INSIDE the container, one
 # per git repo, from the upstream URL captured in the repo loop. The story branch
-# ($Branch) is the same for all; the base ref is per repo. Single-quoted so URLs
-# survive the splice. Empty in worktree / clone mode -> placeholder line removed.
+# ($Branch) is the same for all; the base ref is per repo. Every argument goes
+# through ConvertTo-ShQuoted: the branch is validated above, but URL, repo name
+# and base ref come from the config / git remote and must not be able to break
+# out of the quotes either. Empty in worktree / clone mode -> placeholder line
+# removed.
+function ConvertTo-ShQuoted { param([string]$S) return "'" + $S.Replace("'", "'\''") + "'" }
 $ContainerCloneCommands = ''
 if ($IsContainerMode) {
     foreach ($cr in $ContainerRepos) {
-        $ContainerCloneCommands += "clone_repo_bg '$($cr.Name)' '$($cr.Url)' '$Branch' '$($cr.BaseRef)'`n"
+        $ContainerCloneCommands += "clone_repo_bg $(ConvertTo-ShQuoted $cr.Name) $(ConvertTo-ShQuoted $cr.Url) $(ConvertTo-ShQuoted $Branch) $(ConvertTo-ShQuoted $cr.BaseRef)`n"
     }
 }
 $ContainerCloneCommands = $ContainerCloneCommands.TrimEnd("`n")
