@@ -19,6 +19,7 @@
 
         ProjectName, ProjectShort, BaseImage, NodeFeatureVersion,
         GlabVersion, GlabHostname, GhVersion, PortOffsetStep, InitialPortOffset, TerminalShell
+        GlabImage, GlabImagePath, GlabBinary, GhImage, GhImagePath, GhBinary
         VmRamSize, VmSwapSize, ShmSize
         Distro, RepoMode
         Repos             [ @{ Name; BaseRef } ]
@@ -229,6 +230,15 @@ function Get-DevContainerConfig {
         GlabVersion        = & $str 'glabVersion'
         GlabHostname       = & $str 'glabHostname'
         GhVersion          = & $str 'ghVersion'
+        # Alternative install sources for glab / gh (instead of the *Version
+        # download): a container image to copy the binary out of, or a local
+        # binary/tarball. spawn-workspace.ps1 enforces at most one source per tool.
+        GlabImage          = & $str 'glabImage'
+        GlabImagePath      = & $str 'glabImagePath'
+        GlabBinary         = & $str 'glabBinary'
+        GhImage            = & $str 'ghImage'
+        GhImagePath        = & $str 'ghImagePath'
+        GhBinary           = & $str 'ghBinary'
         # Optional login shell for IntelliJ's built-in terminal. Empty (the
         # default) leaves myShellPath unset in .idea/workspace.xml, so JetBrains
         # auto-detects a shell -- and it prefers the zsh the base image ships

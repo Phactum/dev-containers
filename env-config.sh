@@ -18,6 +18,7 @@
 #   PROJECT_NAME PROJECT_SHORT BASE_IMAGE NODE_FEATURE_VERSION
 #   DISTRO JAVA_VERSION MAVEN_VERSION REPO_MODE
 #   GLAB_VERSION GLAB_HOSTNAME GH_VERSION PORT_OFFSET_STEP INITIAL_PORT_OFFSET
+#   GLAB_IMAGE GLAB_IMAGE_PATH GLAB_BINARY GH_IMAGE GH_IMAGE_PATH GH_BINARY
 #   TERMINAL_SHELL
 #   REPOS[]              "<name>:<baseRef>"
 #   HOST_PORTS[]         port numbers
@@ -91,6 +92,15 @@ NODE_FEATURE_VERSION="$(_env_scalar '.nodeFeatureVersion')"
 GLAB_VERSION="$(_env_scalar '.glabVersion')"
 GLAB_HOSTNAME="$(_env_scalar '.glabHostname')"
 GH_VERSION="$(_env_scalar '.ghVersion')"
+# Alternative install sources for glab / gh (instead of the *Version download):
+# a container image to copy the binary out of, or a local binary/tarball.
+# spawn-workspace.sh enforces that at most one source per tool is set.
+GLAB_IMAGE="$(_env_scalar '.glabImage')"
+GLAB_IMAGE_PATH="$(_env_scalar '.glabImagePath')"
+GLAB_BINARY="$(_env_scalar '.glabBinary')"
+GH_IMAGE="$(_env_scalar '.ghImage')"
+GH_IMAGE_PATH="$(_env_scalar '.ghImagePath')"
+GH_BINARY="$(_env_scalar '.ghBinary')"
 PORT_OFFSET_STEP="$(_env_scalar '.portOffsetStep // 10000')"
 INITIAL_PORT_OFFSET="$(_env_scalar '.initialPortOffset // 10000')"
 # Optional per-container memory cap, mapped to `docker run --memory` /

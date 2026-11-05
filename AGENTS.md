@@ -45,9 +45,11 @@ just the markers (feature on) or the markers **and** everything between them
 
 | Marker | Driven by |
 |---|---|
-| `__GLAB_BLOCK_*__` | `glabHostname` + `glabVersion` |
+| `__GLAB_BLOCK_*__` | `glabHostname` + one of `glabVersion` / `glabImage` / `glabBinary` |
+| `__GLAB_DL_BLOCK_*__` / `__GLAB_IMAGE_BLOCK_*__` / `__GLAB_BIN_BLOCK_*__` | which of the three glab install sources is set (nested in `__GLAB_BLOCK_*__`, resolved after it) |
 | `__WORKTREE_MOUNT_BLOCK_*__` | `repoMode` != `container` (the source-workspace self-bind(s) that let a worktree's absolute-path gitdir resolve inside the container; dropped when there is no host checkout) |
-| `__GH_BLOCK_*__` | `ghVersion` |
+| `__GH_BLOCK_*__` | one of `ghVersion` / `ghImage` / `ghBinary` |
+| `__GH_DL_BLOCK_*__` / `__GH_IMAGE_BLOCK_*__` / `__GH_BIN_BLOCK_*__` | which of the three gh install sources is set (nested in `__GH_BLOCK_*__`, resolved after it) |
 | `__SSHAGENT_BLOCK_*__` | PowerShell only: the Windows `ssh-agent` service is running |
 | `__PROXY_BLOCK_*__` | `proxy.http` / `proxy.https` |
 | `__CA_BLOCK_*__` | `proxy.caCertificates` |
@@ -346,8 +348,16 @@ virtual path a real JVM/shell can't resolve.
 
 ## Optional GitLab integration
 
-Active only when **both** `glabHostname` and `glabVersion` are non-empty in
-`devcontainers-config.json` (sets `GLAB_ENABLED=1` at the top of the spawn script). The
+Active only when `glabHostname` **and** an install source are non-empty in
+`devcontainers-config.json` (sets `GLAB_ENABLED=1` at the top of the spawn script).
+The install source is exactly one of `glabVersion` (download), `glabImage`
+(+ `glabImagePath`: binary taken out of an image via `COPY --from`, for
+networks that only offer the CLI as an image in an internal registry) or
+`glabBinary` (local binary/tarball, copied into `.devcontainer/tools/` and
+removed again after the base-image build). gh has the same three keys.
+More than one source per tool is a hard error (`_cli_source` /
+`Get-CliSource`). Running the CLI via `docker run` per call is deliberately
+not supported: the credential helper calls glab on every git fetch/push. The
 `__GLAB_BLOCK_START__`/`__GLAB_BLOCK_END__` marker pairs in the heredoc
 templates wrap glab-only content: when enabled only the marker lines are
 stripped; when disabled the markers **and** everything between them are dropped.

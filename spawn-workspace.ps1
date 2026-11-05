@@ -317,13 +317,56 @@ function Get-ConfigAsset {
 # (uppercased) so different projects don't fight for the same name.
 $EnvVarWorkspacesRoot = ($ProjectShort -replace '[^A-Za-z0-9]', '_').ToUpperInvariant() + '_WORKSPACES_ROOT'
 
-# GitLab integration is optional; it only kicks in when BOTH glabHostname and
-# glabVersion are set. GitHub integration needs only ghVersion (gh always
-# targets github.com). The conditional blocks in the generated files are
-# stripped via __GLAB_BLOCK_*__ / __GH_BLOCK_*__ markers.
-$GlabEnabled = (-not [string]::IsNullOrWhiteSpace($cfg.GlabHostname)) -and
-               (-not [string]::IsNullOrWhiteSpace($cfg.GlabVersion))
-$GhEnabled = -not [string]::IsNullOrWhiteSpace($cfg.GhVersion)
+# Where the glab / gh binary comes from. Each tool has three mutually exclusive
+# sources in devcontainers-config.json:
+#   <tool>Version -- 'dl':    release tarball downloaded from gitlab.com/github.com
+#   <tool>Image   -- 'image': binary copied out of a container image at build
+#                             time (COPY --from=<image>), for networks where the
+#                             CLI is only published as an image in an internal
+#                             registry. <tool>ImagePath names the binary inside
+#                             it (default /usr/bin/<tool>).
+#   <tool>Binary  -- 'bin':   a local Linux binary or .tar.gz (relative paths are
+#                             resolved against $ConfigDir), copied into the build
+#                             context as tools/<tool>.
+# Running the CLI as `docker run <image>` per call was rejected: the credential
+# helper invokes glab on every git fetch/push, and a container start per call
+# costs far more than the call itself.
+# Returns the source key ('dl' | 'image' | 'bin', '' when none is set) and
+# fails on a conflicting config.
+function Get-CliSource {
+    param([string] $Key, [string] $Version, [string] $Image, [string] $ImagePath, [string] $Binary)
+    $sources = @()
+    if (-not [string]::IsNullOrWhiteSpace($Version)) { $sources += 'dl' }
+    if (-not [string]::IsNullOrWhiteSpace($Image))   { $sources += 'image' }
+    if (-not [string]::IsNullOrWhiteSpace($Binary))  { $sources += 'bin' }
+    if ($sources.Count -gt 1) {
+        Fail "set only one of `"${Key}Version`", `"${Key}Image`" and `"${Key}Binary`" in $($cfg.Path)"
+    }
+    if ((-not [string]::IsNullOrWhiteSpace($ImagePath)) -and [string]::IsNullOrWhiteSpace($Image)) {
+        Fail "`"${Key}ImagePath`" requires `"${Key}Image`" in $($cfg.Path)"
+    }
+    if ($sources.Count -eq 0) { return '' }
+    return $sources[0]
+}
+$GlabSource = Get-CliSource 'glab' $cfg.GlabVersion $cfg.GlabImage $cfg.GlabImagePath $cfg.GlabBinary
+$GhSource   = Get-CliSource 'gh' $cfg.GhVersion $cfg.GhImage $cfg.GhImagePath $cfg.GhBinary
+$GlabImagePath = if ([string]::IsNullOrWhiteSpace($cfg.GlabImagePath)) { '/usr/bin/glab' } else { $cfg.GlabImagePath }
+$GhImagePath   = if ([string]::IsNullOrWhiteSpace($cfg.GhImagePath)) { '/usr/bin/gh' } else { $cfg.GhImagePath }
+
+# GitLab integration is optional; it only kicks in when BOTH glabHostname and a
+# glab install source (see above) are set. GitHub integration needs only a gh
+# install source (gh always targets github.com). The conditional blocks in the
+# generated files are stripped via __GLAB_BLOCK_*__ / __GH_BLOCK_*__ markers;
+# the install source picks one of the __<TOOL>_DL/IMAGE/BIN_BLOCK_*__ pairs
+# nested inside.
+$GlabEnabled = (-not [string]::IsNullOrWhiteSpace($cfg.GlabHostname)) -and ($GlabSource -ne '')
+$GhEnabled = $GhSource -ne ''
+$GlabDlEnabled    = $GlabEnabled -and $GlabSource -eq 'dl'
+$GlabImageEnabled = $GlabEnabled -and $GlabSource -eq 'image'
+$GlabBinEnabled   = $GlabEnabled -and $GlabSource -eq 'bin'
+$GhDlEnabled      = $GhEnabled -and $GhSource -eq 'dl'
+$GhImageEnabled   = $GhEnabled -and $GhSource -eq 'image'
+$GhBinEnabled     = $GhEnabled -and $GhSource -eq 'bin'
 
 # Corporate proxy / TLS interception. Three independent switches, each driving a
 # conditional block in the generated Dockerfile / devcontainer.json. All default
@@ -487,6 +530,27 @@ if ($CaEnabled) {
             Write-Err "CA certificate not found: $caSrc"
             Fail "Check `"proxy.caCertificates`" in $($cfg.Path)."
         }
+    }
+}
+
+# Local glab / gh binaries (glabBinary / ghBinary). Resolved here, before any
+# mutation, and copied into the build context by the tools/ block far below.
+$GlabBinarySrc = ''
+$GhBinarySrc = ''
+if ($GlabBinEnabled) {
+    $GlabBinarySrc = $cfg.GlabBinary
+    if (-not [System.IO.Path]::IsPathRooted($GlabBinarySrc)) { $GlabBinarySrc = Join-Path $ConfigDir $GlabBinarySrc }
+    if (-not (Test-Path -LiteralPath $GlabBinarySrc -PathType Leaf)) {
+        Write-Err "glab binary not found: $GlabBinarySrc"
+        Fail "Check `"glabBinary`" in $($cfg.Path)."
+    }
+}
+if ($GhBinEnabled) {
+    $GhBinarySrc = $cfg.GhBinary
+    if (-not [System.IO.Path]::IsPathRooted($GhBinarySrc)) { $GhBinarySrc = Join-Path $ConfigDir $GhBinarySrc }
+    if (-not (Test-Path -LiteralPath $GhBinarySrc -PathType Leaf)) {
+        Write-Err "gh binary not found: $GhBinarySrc"
+        Fail "Check `"ghBinary`" in $($cfg.Path)."
     }
 }
 
@@ -1627,8 +1691,13 @@ if ($GlabEnabled) {
         Write-Output "      run 'glab auth login --hostname $($cfg.GlabHostname)' (host or container) to populate"
     }
     Write-Output "glab config source: $GlabConfigSrc"
+    switch ($GlabSource) {
+        'dl'    { Write-Output "glab install:      download v$($cfg.GlabVersion)" }
+        'image' { Write-Output "glab install:      $GlabImagePath from image $($cfg.GlabImage)" }
+        'bin'   { Write-Output "glab install:      local $GlabBinarySrc" }
+    }
 } else {
-    Write-Output 'glab integration: disabled (glabHostname and/or glabVersion empty in devcontainers-config.json)'
+    Write-Output 'glab integration: disabled (glabHostname and/or glabVersion|glabImage|glabBinary empty in devcontainers-config.json)'
 }
 
 # gh (GitHub CLI) stores hosts.yml (the github.com auth token) in
@@ -1647,8 +1716,13 @@ if ($GhEnabled) {
         Write-Output "      run 'gh auth login' (host or container) to populate"
     }
     Write-Output "gh config source: $GhConfigSrc"
+    switch ($GhSource) {
+        'dl'    { Write-Output "gh install:        download v$($cfg.GhVersion)" }
+        'image' { Write-Output "gh install:        $GhImagePath from image $($cfg.GhImage)" }
+        'bin'   { Write-Output "gh install:        local $GhBinarySrc" }
+    }
 } else {
-    Write-Output 'gh integration: disabled (ghVersion empty in devcontainers-config.json)'
+    Write-Output 'gh integration: disabled (ghVersion|ghImage|ghBinary empty in devcontainers-config.json)'
 }
 
 # SSH-agent forwarding so key-based remotes (git@<host>:...) don't prompt for the
@@ -1702,6 +1776,18 @@ if ($CaEnabled) {
         Copy-Item -LiteralPath $caSrc -Destination (Join-Path $certDir (Split-Path -Leaf $caSrc)) -Force
         Write-Output "ca certificate: $(Split-Path -Leaf $caSrc)"
     }
+}
+
+# Local glab / gh binaries (glabBinary / ghBinary) go into the build context as
+# tools/<tool> -- like certs/ above, because a Docker build context cannot
+# reference anything outside its own directory. The Dockerfile's
+# __GLAB_BIN_BLOCK__ / __GH_BIN_BLOCK__ accept either a bare binary or a .tar.gz.
+# Existence was validated up-front.
+if ($GlabBinEnabled -or $GhBinEnabled) {
+    $toolDir = Join-Path $WsDir '.devcontainer\tools'
+    New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
+    if ($GlabBinEnabled) { Copy-Item -LiteralPath $GlabBinarySrc -Destination (Join-Path $toolDir 'glab') -Force }
+    if ($GhBinEnabled) { Copy-Item -LiteralPath $GhBinarySrc -Destination (Join-Path $toolDir 'gh') -Force }
 }
 
 # Rocky only: yum repo files pointing at the internal repos.ads.dmz mirror
@@ -2304,7 +2390,12 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true \
 # __CHROMIUM_BLOCK_END__
 
 # __GLAB_BLOCK_START__
-# glab (GitLab CLI). Pinned to a known-good version; bump glabVersion in devcontainers-config.json.
+# glab (GitLab CLI). Exactly one install source survives, picked by
+# devcontainers-config.json: glabVersion (download), glabImage (copy out of an
+# image) or glabBinary (local binary/tarball). glab is a static Go binary, so
+# any Linux amd64/arm64 build matching the host runs on either distro.
+# __GLAB_DL_BLOCK_START__
+# Pinned to a known-good version; bump glabVersion in devcontainers-config.json.
 # Release URL pattern: gitlab.com/gitlab-org/cli/-/releases/v<v>/downloads/glab_<v>_linux_<arch>.tar.gz
 ARG GLAB_VERSION=__GLAB_VERSION__
 RUN set -eux; \
@@ -2319,10 +2410,43 @@ RUN set -eux; \
     install -m 0755 /tmp/bin/glab /usr/local/bin/glab; \
     rm -rf /tmp/glab.tgz /tmp/bin; \
     /usr/local/bin/glab --version
+# __GLAB_DL_BLOCK_END__
+# __GLAB_IMAGE_BLOCK_START__
+# Binary copied straight out of the image's filesystem (nothing in it runs).
+# The host's docker daemon pulls the image, so a private registry only needs a
+# 'docker login' on the host. A moved tag is NOT noticed by the base-image
+# cache -- use --rebuild-base-image after the registry publishes a new glab.
+COPY --from=__GLAB_IMAGE__ __GLAB_IMAGE_PATH__ /usr/local/bin/glab
+RUN /usr/local/bin/glab --version
+# __GLAB_IMAGE_BLOCK_END__
+# __GLAB_BIN_BLOCK_START__
+# tools/glab is the local glabBinary, copied into the build context by
+# spawn. Either the bare binary or a release .tar.gz (bin/glab inside, with or
+# without a top-level directory).
+COPY tools/glab /tmp/glab-src
+RUN set -eux; \
+    src=/tmp/glab-src; \
+    if tar -tzf /tmp/glab-src >/dev/null 2>&1; then \
+        mkdir /tmp/glab-x; \
+        tar -xzf /tmp/glab-src -C /tmp/glab-x; \
+        src=""; \
+        for c in /tmp/glab-x/bin/glab /tmp/glab-x/*/bin/glab /tmp/glab-x/glab /tmp/glab-x/*/glab; do \
+            if [ -f "$c" ]; then src="$c"; break; fi; \
+        done; \
+        if [ -z "$src" ]; then echo "glabBinary: no glab binary in the archive" >&2; exit 1; fi; \
+    fi; \
+    install -m 0755 "$src" /usr/local/bin/glab; \
+    rm -rf /tmp/glab-src /tmp/glab-x; \
+    /usr/local/bin/glab --version
+# __GLAB_BIN_BLOCK_END__
 # __GLAB_BLOCK_END__
 
 # __GH_BLOCK_START__
-# gh (GitHub CLI). Pinned to a known-good version; bump ghVersion in devcontainers-config.json.
+# gh (GitHub CLI). Exactly one install source survives, picked by
+# devcontainers-config.json: ghVersion (download), ghImage (copy out of an image)
+# or ghBinary (local binary/tarball) -- same mechanics as glab above.
+# __GH_DL_BLOCK_START__
+# Pinned to a known-good version; bump ghVersion in devcontainers-config.json.
 # Release URL pattern: github.com/cli/cli/releases/download/v<v>/gh_<v>_linux_<arch>.tar.gz
 # The tarball extracts to gh_<v>_linux_<arch>/bin/gh.
 ARG GH_VERSION=__GH_VERSION__
@@ -2338,6 +2462,28 @@ RUN set -eux; \
     install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /usr/local/bin/gh; \
     rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gh_arch}"; \
     /usr/local/bin/gh --version
+# __GH_DL_BLOCK_END__
+# __GH_IMAGE_BLOCK_START__
+COPY --from=__GH_IMAGE__ __GH_IMAGE_PATH__ /usr/local/bin/gh
+RUN /usr/local/bin/gh --version
+# __GH_IMAGE_BLOCK_END__
+# __GH_BIN_BLOCK_START__
+COPY tools/gh /tmp/gh-src
+RUN set -eux; \
+    src=/tmp/gh-src; \
+    if tar -tzf /tmp/gh-src >/dev/null 2>&1; then \
+        mkdir /tmp/gh-x; \
+        tar -xzf /tmp/gh-src -C /tmp/gh-x; \
+        src=""; \
+        for c in /tmp/gh-x/bin/gh /tmp/gh-x/*/bin/gh /tmp/gh-x/gh /tmp/gh-x/*/gh; do \
+            if [ -f "$c" ]; then src="$c"; break; fi; \
+        done; \
+        if [ -z "$src" ]; then echo "ghBinary: no gh binary in the archive" >&2; exit 1; fi; \
+    fi; \
+    install -m 0755 "$src" /usr/local/bin/gh; \
+    rm -rf /tmp/gh-src /tmp/gh-x; \
+    /usr/local/bin/gh --version
+# __GH_BIN_BLOCK_END__
 # __GH_BLOCK_END__
 
 # Project-specific extra build steps from devcontainers-config.json "dockerfileSnippet"
@@ -3643,6 +3789,10 @@ $Tokens = [ordered]@{
     '__PORTS_ATTRS__'          = $PortsAttrs
     '__GLAB_CONFIG_SRC__'      = (ConvertTo-DockerPath $GlabConfigSrc)
     '__GH_CONFIG_SRC__'        = (ConvertTo-DockerPath $GhConfigSrc)
+    '__GLAB_IMAGE__'           = $cfg.GlabImage
+    '__GLAB_IMAGE_PATH__'      = $GlabImagePath
+    '__GH_IMAGE__'             = $cfg.GhImage
+    '__GH_IMAGE_PATH__'        = $GhImagePath
     '__SSH_AGENT_SRC__'        = $SshAgentSrc
     '__HOST_TZ__'              = $HostTz
     '__PORT_OFFSET__'          = "$PortOffset"
@@ -3703,6 +3853,15 @@ function Update-Placeholders {
     $text = Remove-ConditionalBlock -Text $text -Name 'APT_PKGS' -Enabled $AptPkgsEnabled
     $text = Remove-ConditionalBlock -Text $text -Name 'RECENT_GIT' -Enabled $RecentGitEnabled
     $text = Remove-ConditionalBlock -Text $text -Name 'CHROMIUM' -Enabled $ChromiumEnabled
+    # glab / gh install source. Nested INSIDE GLAB / GH, which are resolved
+    # above, so a disabled tool has already taken these markers with it; for an
+    # enabled one exactly one of the three survives.
+    $text = Remove-ConditionalBlock -Text $text -Name 'GLAB_DL' -Enabled $GlabDlEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'GLAB_IMAGE' -Enabled $GlabImageEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'GLAB_BIN' -Enabled $GlabBinEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'GH_DL' -Enabled $GhDlEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'GH_IMAGE' -Enabled $GhImageEnabled
+    $text = Remove-ConditionalBlock -Text $text -Name 'GH_BIN' -Enabled $GhBinEnabled
     # Worktree self-bind: kept in worktree/clone mode, dropped in container mode
     # (no host checkout to resolve). Not nested in any other block.
     $text = Remove-ConditionalBlock -Text $text -Name 'WORKTREE_MOUNT' -Enabled (-not $IsContainerMode)
@@ -3771,6 +3930,7 @@ Write-LfFile -Path $dfPath -Content ($dfOut -join "`n")
 $DockerfilePath = Join-Path $WsDir '.devcontainer\Dockerfile'
 $CertsDir       = Join-Path $WsDir '.devcontainer\certs'
 $RockyRepoDir   = Join-Path $WsDir '.devcontainer\rocky-repos'
+$ToolsDir       = Join-Path $WsDir '.devcontainer\tools'
 $DockerfileText = Read-TextFile $DockerfilePath
 
 $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -3783,6 +3943,14 @@ try {
                 [void]$sb.Append("|file:$($_.Name)|")
                 [void]$sb.Append((Read-TextFile $_.FullName))
             }
+        }
+    }
+    # tools/ holds binaries (glabBinary / ghBinary): hashed by digest, not read
+    # as text. Lowercase hex, matching the Bash port's sha256sum.
+    if (Test-Path -LiteralPath $ToolsDir) {
+        Get-ChildItem -LiteralPath $ToolsDir -File | Sort-Object Name | ForEach-Object {
+            [void]$sb.Append("|tool:$($_.Name)|")
+            [void]$sb.Append((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())
         }
     }
     $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))
@@ -3853,6 +4021,10 @@ if ($RebuildBaseImage -or -not $baseExists) {
 } else {
     Write-Output "base image cache hit: $BaseImageTag (skipping the dnf/JDK/Maven/Node/Docker-CE install)"
 }
+# The binaries are baked into the base image now and the collapsed Dockerfile
+# below no longer COPYs them; dropping them keeps tens of MB out of the build
+# context the IDE uploads on every container (re)build.
+if (Test-Path -LiteralPath $ToolsDir) { Remove-Item -LiteralPath $ToolsDir -Recurse -Force }
 
 Write-LfFile -Path $DockerfilePath -Content @"
 # Cached base image -- collapsed from the full Rocky/Debian setup Dockerfile

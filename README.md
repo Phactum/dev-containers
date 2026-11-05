@@ -318,9 +318,19 @@ prune-base-images.sh --yes      # same, no prompt (e.g. for a cron job)
 
 ### GitLab integration is optional
 
-GitLab integration kicks in only when **both** `glabHostname` **and**
-`glabVersion` are non-empty in `devcontainers-config.json`. With either left empty the
-spawn script:
+GitLab integration kicks in only when **both** `glabHostname` **and** a glab
+install source are non-empty in `devcontainers-config.json`. The install source is exactly
+one of:
+
+- `glabVersion` -- the release is downloaded from gitlab.com,
+- `glabImage` (+ optional `glabImagePath`, default `/usr/bin/glab`) -- the
+  binary is copied out of a container image, e.g. when glab is only available
+  as an image in an internal registry (a `docker login` on the host suffices),
+- `glabBinary` -- a local Linux binary or release `.tar.gz`.
+
+The GitHub CLI takes the same three keys (`ghVersion` / `ghImage` /
+`ghImagePath` / `ghBinary`). With the hostname or the install source left
+empty the spawn script:
 
 - skips the `glab` install in the Dockerfile,
 - skips the bind-mount of the host's glab-cli config,

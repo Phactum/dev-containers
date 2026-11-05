@@ -379,21 +379,45 @@
 
     // --- GitLab integration (optional) --------------------------------------
 
-    // Both keys must be non-empty to enable glab. Omit either (or set it to "")
-    // and the container is built without glab, without the bind-mounted glab
-    // config, and without the git credential helper for that host.
+    // glab is enabled when "glabHostname" AND one install source are set. Omit
+    // either (or set it to "") and the container is built without glab,
+    // without the bind-mounted glab config, and without the git credential
+    // helper for that host.
+    //
+    // Install source -- set exactly ONE of:
+    //   "glabVersion"  release downloaded from gitlab.com at image build time.
+    //   "glabImage"    container image the binary is copied out of
+    //                  (COPY --from=<image>), e.g. a mirror in an internal
+    //                  registry when gitlab.com is not reachable. The image is
+    //                  pulled by the HOST's docker, so "docker login <registry>"
+    //                  on the host is all it needs; nothing in the image runs.
+    //                  "glabImagePath" is the binary's path inside the image
+    //                  (default "/usr/bin/glab"). A tag that is moved to a new
+    //                  glab release is not noticed by the base-image cache:
+    //                  spawn with --rebuild-base-image to pick it up.
+    //   "glabBinary"   local Linux glab binary or release .tar.gz (absolute, or
+    //                  relative to this file), copied into the image.
+    // The binary must match the container's architecture (amd64 on Windows /
+    // Intel, arm64 on Apple Silicon).
     //
     // "glabVersion":  "1.99.0",
+    // "glabImage":    "nexus.example.com:8443/tools/glab:1.99.0",
+    // "glabImagePath": "/usr/bin/glab",
+    // "glabBinary":   "tools/glab_1.99.0_linux_amd64.tar.gz",
     // "glabHostname": "gitlab.example.com",
 
     // --- GitHub integration (optional) --------------------------------------
 
-    // gh (GitHub CLI) version installed by the Dockerfile. Omit (or "") to
-    // disable the gh install, the bind-mounted gh config and the gh git
+    // gh (GitHub CLI) install source -- set exactly ONE of "ghVersion",
+    // "ghImage" (+ optional "ghImagePath", default "/usr/bin/gh") or
+    // "ghBinary"; same semantics as the glab keys above. Omit all three (or
+    // "") to disable the gh install, the bind-mounted gh config and the gh git
     // credential helper. gh always targets github.com, so no hostname is
     // needed. See https://github.com/cli/cli/releases for versions.
     //
     // "ghVersion": "2.97.0",
+    // "ghImage":   "nexus.example.com:8443/tools/gh:2.97.0",
+    // "ghBinary":  "tools/gh_2.97.0_linux_amd64.tar.gz",
 
     // --- IntelliJ run configurations ----------------------------------------
 
