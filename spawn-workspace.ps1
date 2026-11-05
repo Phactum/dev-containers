@@ -3134,10 +3134,18 @@ chmod +x /home/vscode/glab-creds.sh
 # invoke BOTH helpers and the first prompt-style one would still pop up.
 # Prerequisite: the user must have run 'glab auth login --hostname <host>'
 # on the host at least once (or once inside any container -- the config is
-# shared via the bind mount).
-git config --global --unset-all "credential.https://__GLAB_HOSTNAME__.helper" 2>/dev/null || true
-git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" ""
-git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" "!/home/vscode/glab-creds.sh"
+# shared via the bind mount). Without that login the helper is NOT wired: the
+# empty-helper reset would otherwise also hide the snapshot HTTPS credential
+# (host-git-credentials.resolved) and the glab wrapper would fail, so clone/
+# fetch would break instead of falling back.
+if glab auth status --hostname "__GLAB_HOSTNAME__" >/dev/null 2>&1; then
+    git config --global --unset-all "credential.https://__GLAB_HOSTNAME__.helper" 2>/dev/null || true
+    git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" ""
+    git config --global --add "credential.https://__GLAB_HOSTNAME__.helper" "!/home/vscode/glab-creds.sh"
+    echo "glab credential helper wired for __GLAB_HOSTNAME__ (glab auth status OK)"
+else
+    echo "note: glab is not authenticated for __GLAB_HOSTNAME__ -- run 'glab auth login --hostname __GLAB_HOSTNAME__' on the host for push support; falling back to the snapshot HTTPS credential for clone/fetch"
+fi
 # __GLAB_BLOCK_END__
 
 # __GH_BLOCK_START__
