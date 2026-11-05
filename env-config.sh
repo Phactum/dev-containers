@@ -206,6 +206,34 @@ while IFS= read -r -d '' _rec; do
     FORWARDED_ENV_VARS+=("${_rec}")
 done < <(_env_records '(.forwardedEnvVars // [])[]')
 
+# Extra containerEnv entries: a flat object of NAME: value pairs appended to
+# devcontainer.json's containerEnv. Normalised here into a ready-to-splice JSON
+# fragment (", \"NAME\": \"value\", ...", JSON-escaped by jq) so the spawn
+# script never has to quote user values itself. Values may be strings, numbers
+# or booleans (all become strings, as env vars are); a null value drops the
+# entry. Anything else, and names that aren't valid env var names, is rejected.
+CONTAINER_ENV_EXTRA=""
+if _env_json_stripped | jq -e 'has("containerEnv") and .containerEnv != null' >/dev/null; then
+    _bad="$(_env_json_stripped | jq -r '
+        if (.containerEnv | type) != "object" then
+            "  \"containerEnv\" must be an object of NAME: value pairs"
+        else
+            .containerEnv | to_entries[]
+            | select((.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not)
+                     or ((.value | type) as $t | ["string", "number", "boolean", "null"] | index($t) | not))
+            | "  \(.key): name must match [A-Za-z_][A-Za-z0-9_]*, value must be a string, number or boolean"
+        end')"
+    if [[ -n "${_bad}" ]]; then
+        echo "ERROR: invalid \"containerEnv\" in ${ENV_JSON}:" >&2
+        printf '%s\n' "${_bad}" >&2
+        exit 1
+    fi
+    CONTAINER_ENV_EXTRA="$(_env_json_stripped | jq -r '
+        .containerEnv | to_entries
+        | map(select(.value != null) | ", " + (.key | tojson) + ": " + (.value | tostring | tojson))
+        | join("")')"
+fi
+
 # Claude assets seed: which host plugins / skills to adopt into a project's
 # <workspace>/.claude. This is only the DECLARATIVE default -- the live selection
 # and the host snapshot used for change detection live in the spawn-managed

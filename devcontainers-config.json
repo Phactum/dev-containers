@@ -433,6 +433,21 @@
         "BlueprintBusinessCockpit.run.xml"
     ],
 
+    // OPTIONAL extra entries for devcontainer.json's "containerEnv", i.e. env
+    // vars set at container creation and seen by every process in the container.
+    // A flat object of NAME: value pairs; values may be strings, numbers or
+    // booleans (all end up as strings), a null value drops the entry. The
+    // entries are appended AFTER the built-in ones, so a name like MAVEN_OPTS
+    // overrides the generated default. devcontainer variables such as
+    // "${localEnv:FOO}" are allowed in values. Note: remoteEnv takes precedence
+    // over containerEnv for IDE-launched processes, so overriding a var that is
+    // also set in remoteEnv (JAVA_HOME, PATH, SHELL, forwardedEnvVars) has no
+    // effect there. Omit the key (or set null / {}) to add nothing.
+    // "containerEnv": {
+    //     "SPRING_PROFILES_ACTIVE": "local",
+    //     "MAVEN_OPTS": "-Xmx4g"
+    // },
+
     // --- Forwarded environment variables ------------------------------------
 
     // Names of env vars on the host that get forwarded into the container via

@@ -2776,7 +2776,7 @@ __CONTAINER_REPO_MOUNTS__
         // written further up): the container is a sandbox and all tool calls go through
         // it, so skipping the interactive confirmation prompt here doesn't loosen
         // anything on the host. Equivalent to always passing --allow-all-tools.
-        "COPILOT_ALLOW_ALL": "true"__SHELL_CONTAINER_ENV____CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
+        "COPILOT_ALLOW_ALL": "true"__SHELL_CONTAINER_ENV____CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV____CONTAINER_ENV_EXTRA__
     },
 
     // remoteEnv has higher precedence than containerEnv (and any feature's
@@ -3914,6 +3914,18 @@ $dcText = (Read-TextFile $dcPath).
 Write-LfFile -Path $dcPath -Content $dcText
 
 Update-Placeholders -Path $dcPath
+
+# Project-defined containerEnv entries ("containerEnv" in devcontainers-config.json),
+# JSON-escaped here and appended after every built-in entry, so a name that
+# matches a built-in one (e.g. MAVEN_OPTS) overrides it. Done after the token
+# pass, mirroring the Bash splice, so user values are never touched by it.
+$ContainerEnvExtra = (@($cfg.ContainerEnv | ForEach-Object {
+    ", $(ConvertTo-Json -InputObject $_.Name): $(ConvertTo-Json -InputObject $_.Value)"
+})) -join ''
+Write-LfFile -Path $dcPath -Content ((Read-TextFile $dcPath).Replace('__CONTAINER_ENV_EXTRA__', $ContainerEnvExtra))
+if ($cfg.ContainerEnv.Count -gt 0) {
+    Write-Output "containerEnv:     $(@($cfg.ContainerEnv | ForEach-Object { $_.Name }) -join ', ')"
+}
 Update-Placeholders -Path (Join-Path $WsDir '.devcontainer\Dockerfile')
 Update-Placeholders -Path (Join-Path $WsDir '.devcontainer\post-create.sh')
 Update-Placeholders -Path (Join-Path $WsDir '.devcontainer\post-start.sh')

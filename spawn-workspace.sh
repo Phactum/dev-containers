@@ -187,6 +187,9 @@
 #    gitconfig itself, and a bind mount on a single file breaks git's atomic
 #    rename ("Device or resource busy"). FORWARDED_ENV_VARS entries are also
 #    forwarded via remoteEnv as a fallback for tools that re-read env at runtime.
+#    Fixed project-specific env vars come from the optional "containerEnv"
+#    object in devcontainers-config.json (CONTAINER_ENV_EXTRA): appended last to
+#    devcontainer.json's containerEnv, so they can override a built-in entry.
 #
 # 10. runArgs: --name <PROJECT_SHORT>-<leaf>
 #    Names the underlying Docker container after the branch leaf so it is
@@ -3250,7 +3253,7 @@ __CONTAINER_REPO_MOUNTS__
         // written further up): the container is a sandbox and all tool calls go through
         // it, so skipping the interactive confirmation prompt here doesn't loosen
         // anything on the host. Equivalent to always passing --allow-all-tools.
-        "COPILOT_ALLOW_ALL": "true"__SHELL_CONTAINER_ENV____CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV__
+        "COPILOT_ALLOW_ALL": "true"__SHELL_CONTAINER_ENV____CONTAINER_ENV_FORWARDED____PROXY_CONTAINER_ENV____CONTAINER_ENV_EXTRA__
     },
 
     // remoteEnv has higher precedence than containerEnv (and any feature's
@@ -3525,6 +3528,14 @@ substitute_placeholders() {
     strip_block RPM "${IS_ROCKY}"
 }
 substitute_placeholders "${WS_DIR}/.devcontainer/devcontainer.json"
+# Project-defined containerEnv entries ("containerEnv" in devcontainers-config.json),
+# already JSON-escaped by env-config.sh. Spliced AFTER the sed pass so arbitrary
+# user values ('|', '&', '\\') pass through byte for byte. They come last in
+# the object, so an entry named like a built-in one (e.g. MAVEN_OPTS) overrides it.
+splice_placeholder "${WS_DIR}/.devcontainer/devcontainer.json" "__CONTAINER_ENV_EXTRA__" "${CONTAINER_ENV_EXTRA}"
+if [[ -n "${CONTAINER_ENV_EXTRA}" ]]; then
+    echo "containerEnv:     $(_env_json_stripped | jq -r '[.containerEnv | to_entries[] | select(.value != null) | .key] | join(", ")')"
+fi
 for rc in "${WS_DIR}"/.idea/runConfigurations/*.xml; do
     [[ -f "${rc}" ]] || continue
     substitute_placeholders "${rc}"

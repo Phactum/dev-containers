@@ -26,6 +26,7 @@
         HostPorts         [ @{ Port; Label } ]
         RunConfigs        [ string ]
         ForwardedEnvVars  [ string ]
+        ContainerEnv      [ @{ Name; Value } ]   extra devcontainer.json containerEnv entries
         ClaudeSeedPlugins [ string ]   seed for the plugin/skill adoption feature
         ClaudeSeedSkills  [ string ]
         DockerfileSnippet [ string ]   extra raw Dockerfile lines
@@ -271,6 +272,7 @@ function Get-DevContainerConfig {
         HostPorts          = @()
         RunConfigs         = @()
         ForwardedEnvVars   = @()
+        ContainerEnv       = @()
         # Claude assets seed: which host plugins/skills to adopt into a project's
         # <workspace>/.claude. Only the DECLARATIVE default -- the live selection
         # and host snapshot for change detection live in the spawn-managed sidecar
@@ -343,6 +345,37 @@ function Get-DevContainerConfig {
 
     if ((& $has 'forwardedEnvVars') -and $null -ne $json.forwardedEnvVars) {
         $cfg.ForwardedEnvVars = @($json.forwardedEnvVars | ForEach-Object { [string]$_ })
+    }
+
+    # Extra containerEnv entries: a flat object of NAME: value pairs appended to
+    # devcontainer.json's containerEnv. Same rules as env-config.sh: strings,
+    # numbers and booleans become strings (booleans lowercase, like jq's
+    # tostring), a null value drops the entry, anything else and invalid env var
+    # names are rejected. Kept as an ordered list (not a hashtable) so the
+    # config's order -- and the case of each name -- survives.
+    if ((& $has 'containerEnv') -and $null -ne $json.containerEnv) {
+        if ($json.containerEnv -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Invalid `"containerEnv`" in $($cfg.Path): must be an object of NAME: value pairs"
+        }
+        $envBad = @()
+        $envList = @()
+        foreach ($prop in $json.containerEnv.PSObject.Properties) {
+            $v = $prop.Value
+            $nameOk = $prop.Name -cmatch '^[A-Za-z_][A-Za-z0-9_]*$'
+            $valueOk = ($null -eq $v) -or ($v -is [string]) -or ($v -is [bool]) -or
+                       ($v -is [int]) -or ($v -is [long]) -or ($v -is [double]) -or ($v -is [decimal])
+            if (-not ($nameOk -and $valueOk)) {
+                $envBad += "  $($prop.Name): name must match [A-Za-z_][A-Za-z0-9_]*, value must be a string, number or boolean"
+                continue
+            }
+            if ($null -eq $v) { continue }
+            $s = if ($v -is [bool]) { ([string]$v).ToLowerInvariant() } else { [string]$v }
+            $envList += [pscustomobject]@{ Name = $prop.Name; Value = $s }
+        }
+        if ($envBad.Count -gt 0) {
+            throw "Invalid `"containerEnv`" in $($cfg.Path):`n$($envBad -join "`n")"
+        }
+        $cfg.ContainerEnv = $envList
     }
 
     # Claude assets seed (plugins = "name@marketplace" keys, skills = dir names).

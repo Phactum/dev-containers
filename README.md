@@ -486,6 +486,29 @@ make sure `~/.npmrc` and `~/.m2/settings.xml` use the internal repository (they
 are carried into the container by these scripts), and have your registry
 administrators add proxy repositories for anything still missing.
 
+### Extra container environment variables (`containerEnv`)
+
+Fixed, project-specific env vars for the container go into an optional
+`containerEnv` object. Its entries are appended to the generated
+`devcontainer.json`'s `containerEnv`, so every process in the container sees
+them:
+
+```jsonc
+"containerEnv": {
+    "SPRING_PROFILES_ACTIVE": "local",
+    "MAVEN_OPTS": "-Xmx4g",
+    "NEXUS_URL": "${localEnv:NEXUS_URL}"
+}
+```
+
+- Values may be strings, numbers or booleans (all become strings); `null` drops
+  an entry. Names must be valid env var names — anything else aborts spawn.
+- The entries come after the built-in ones, so the same name (`MAVEN_OPTS`
+  above) overrides the generated default.
+- `remoteEnv` wins over `containerEnv` for IDE-launched processes, so vars also
+  set there (`JAVA_HOME`, `PATH`, `SHELL`, `forwardedEnvVars`) can't be
+  overridden this way. To pass host values through, prefer `forwardedEnvVars`.
+
 ### Optional image build steps
 
 Three steps of the generated Dockerfile need a distribution package mirror. On a
