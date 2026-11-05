@@ -3403,11 +3403,13 @@ fi
 # '|' as delimiter -- the path contains slashes (always) and may contain
 # spaces ("Library/Application Support/..."), neither of which is safe in
 # the default '/' delimiter form.
+# PORT_SED_ARGS is empty when the project forwards no ports ("hostPorts": []);
+# the ${arr[@]+...} form keeps bash 3.2 + set -u from aborting on that.
 substitute_placeholders() {
     local file="$1"
     sed -i.bak \
         -e "s/__LEAF__/${LEAF}/g" \
-        "${PORT_SED_ARGS[@]}" \
+        ${PORT_SED_ARGS[@]+"${PORT_SED_ARGS[@]}"} \
         -e "s|__PORT_RUNARGS__|${PORT_RUNARGS}|g" \
         -e "s|__VM_MEM_RUNARGS__|${VM_MEM_RUNARGS}|g" \
         -e "s|__SHM_RUNARGS__|${SHM_RUNARGS}|g" \
