@@ -507,6 +507,14 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   needs no special case â€” its worktree/branch loops are already `.git`-guarded
   and skip non-git dirs. Guarded by the mono-repo flag so mono-repo's synthetic
   empty-base-ref entry still builds a worktree.
+- **Missing host-mount dirs.** Right after the confirmation prompt (before
+  anything is created) spawn checks every `repos` entry WITHOUT `baseRef` for
+  `<SOURCE_WS>/<repo>`. If it is missing it asks `[y/N]`; `y` (or `--yes`)
+  creates the empty dir and records it in `CREATED_REPOS` (a space-delimited
+  `" a b "` string, bash 3.2) / `$CreatedRepos`. The repos loop then mounts it
+  through the normal host-mount path, and the build loop skips its `builds`
+  entries (an empty dir would only fail post-create). Anything else exits 1.
+  Entries with a `baseRef` are untouched (still "skip: no git repo").
 
 ## Running / testing changes
 

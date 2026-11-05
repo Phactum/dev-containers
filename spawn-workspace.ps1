@@ -574,6 +574,34 @@ if (-not $AssumeYes) {
     }
 }
 
+# Missing host-mount dirs: a "repos" entry WITHOUT baseRef is a plain directory
+# that gets bind-mounted (see $HostMountRepos below). If that directory does not
+# exist in the source workspace yet, ask whether to create it EMPTY so it can be
+# mounted. Only y/yes proceeds; anything else aborts before the workspace is
+# touched. --yes creates without asking. The new directory lives in the source
+# workspace, so dispose never removes it. Entries WITH a baseRef are git repos
+# and keep their "skip: no git repo" behaviour.
+$CreatedRepos = @()
+if (-not $MonoRepo) {
+    foreach ($repoEntry in $Repos) {
+        if (-not [string]::IsNullOrEmpty($repoEntry.BaseRef)) { continue }
+        $repo = $repoEntry.Name
+        $srcRepo = Join-Path $SourceWs $repo
+        if (Test-Path -LiteralPath $srcRepo) { continue }
+        Write-Err "WARNING: repo '$repo' does not exist at $srcRepo"
+        if (-not $AssumeYes) {
+            $reply = Read-Host '  Create it as an empty directory and mount it into the container? [y/N]'
+            if ($reply -notmatch '^[Yy]') {
+                Write-Err "aborted. Create the directory or fix the `"repos`" entry in $($cfg.Path)."
+                exit 1
+            }
+        }
+        New-Item -ItemType Directory -Path $srcRepo -Force | Out-Null
+        Write-Output "created: $srcRepo (empty, will be bind-mounted)"
+        $CreatedRepos += $repo
+    }
+}
+
 # ============================================================================
 # Port offset
 # ============================================================================
@@ -1551,6 +1579,12 @@ if ($MonoRepo -and -not $BuildsDefined -and (Test-Path -LiteralPath (Join-Path $
 foreach ($entry in $BuildEntries) {
     $r = $entry.Repo
     $val = $entry.Value
+    # A repo created empty above has nothing to build yet; its warmup step would
+    # only fail post-create.sh (and register a pom that isn't there).
+    if ($CreatedRepos -contains $r) {
+        Write-Output "skip build for ${r}: newly created empty directory"
+        continue
+    }
     # Container mode has no host checkout yet (cloned inside the container in
     # post-create), so the pom.xml can't be tested for; emit the root-pom entry
     # for every mvn-goal build instead. worktree / clone keep the existence check.

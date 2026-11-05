@@ -644,12 +644,19 @@ spawn-workspace.ps1 [--config <path>] [--workspaces-root <path>] [--yes] <branch
 Base refs for new branches are not on the CLI → each repo brings its own
 `baseRef` in the `repos` list in `devcontainers-config.json`.
 
-A `repos` entry with an **empty `baseRef`** (e.g.
-`{ "name": "backlog.md", "baseRef": "" }`) is not a
+A `repos` entry with an **empty or missing `baseRef`** (e.g.
+`{ "name": "backlog.md" }`) is not a
 git repo: no worktree is created → the host directory is bind-mounted into the
 workspace at the same path instead. Use it for pre-built artifacts or other
 non-versioned folders that must be visible/buildable in the container. Disposing
 the workspace leaves the host source untouched.
+
+If such a host-mount directory does not exist in the source workspace yet,
+spawn asks `Create it as an empty directory and mount it into the container? [y/N]`.
+`y` creates `<source workspace>/<repo>` and bind-mounts it; its `builds` entries
+are skipped on that spawn because there is nothing to build yet. Any other
+answer aborts before anything is created. `--yes` creates the directory without
+asking. Entries with a `baseRef` are git repos and are not created this way.
 
 Examples:
 

@@ -811,6 +811,34 @@ if (( ASSUME_YES == 0 )); then
     fi
 fi
 
+# Missing host-mount dirs: a "repos" entry WITHOUT baseRef is a plain directory
+# that gets bind-mounted (see HOST_MOUNT_REPOS below). If that directory does not
+# exist in the source workspace yet, ask whether to create it EMPTY so it can be
+# mounted. Only y/yes proceeds; anything else (Enter, EOF) aborts before the
+# workspace is touched. --yes creates without asking. The new directory lives in
+# the source workspace, so dispose never removes it. Entries WITH a baseRef are
+# git repos and keep their "skip: no git repo" behaviour.
+# CREATED_REPOS is a space-delimited " a b " string (bash 3.2: no assoc arrays).
+CREATED_REPOS=" "
+if (( MONO_REPO == 0 )); then
+    for entry in "${REPOS[@]}"; do
+        repo="${entry%%:*}"
+        [[ -n "${entry#*:}" ]] && continue
+        [[ -e "${SOURCE_WS}/${repo}" ]] && continue
+        echo "WARNING: repo '${repo}' does not exist at ${SOURCE_WS}/${repo}" >&2
+        if (( ASSUME_YES == 0 )); then
+            read -r -p "  Create it as an empty directory and mount it into the container? [y/N] " _reply || _reply=""
+            if [[ ! "${_reply}" =~ ^[Yy] ]]; then
+                echo "aborted. Create the directory or fix the \"repos\" entry in ${CONFIG_JSON}." >&2
+                exit 1
+            fi
+        fi
+        mkdir -p "${SOURCE_WS}/${repo}"
+        echo "created: ${SOURCE_WS}/${repo} (empty, will be bind-mounted)"
+        CREATED_REPOS+="${repo} "
+    done
+fi
+
 # Pick a port offset (multiple of 10000) where ALL forwarded ports are free
 # on the host. This lets multiple stories run their containers in parallel
 # without colliding on the standard ports. Offset 0 means original ports.
@@ -1919,6 +1947,12 @@ if (( ${#BUILD_ENTRIES[@]} > 0 )); then
         rest="${entry#*:}"
         btype="${rest%%:*}"
         val="${rest#*:}"
+        # A repo created empty above has nothing to build yet; its warmup step
+        # would only fail post-create.sh (and register a pom that isn't there).
+        if [[ "${CREATED_REPOS}" == *" ${r} "* ]]; then
+            echo "skip build for ${r}: newly created empty directory"
+            continue
+        fi
         # In container mode the repo isn't checked out on the host yet (it is
         # cloned inside the container in post-create.sh), so the -f test can't see
         # its pom.xml. Emit the root-pom entry for every mvn-goal build instead --
