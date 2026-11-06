@@ -965,6 +965,9 @@ State lives in two places:
 | Declarative seed / override | `claudeAssets` in `devcontainers-config.json` | yes (team-shared intent) |
 | Live selection + host snapshot | `dev-containers/.claude-assets.state.json` | no (git-ignored, per machine) |
 
+Without `claude-code` in `aiTools` (e.g. a copilot-only project) none of this
+runs: no prompts, nothing copied, and no state file is written.
+
 Set `claudeAssets` to pin a selection for CI / first run:
 
 ```jsonc

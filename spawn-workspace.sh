@@ -1719,6 +1719,12 @@ if [[ -d "${HOME}/.claude/skills" ]]; then
         { [[ -f "${_d}/SKILL.md" ]] || [[ -f "${_d}/skill.md" ]]; } && HOST_SKILLS+=("${_b}")
     done < <(find "${HOME}/.claude/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort || true)
 fi
+# Without Claude Code in "aiTools" there is nothing to adopt: no prompts, nothing
+# copied, and no sidecar (it would only confuse a copilot-only project).
+if (( CLAUDE_CODE_ENABLED == 0 )); then
+    HOST_PLUGINS=()
+    HOST_SKILLS=()
+fi
 
 # Resolve one asset type. Reads globals HOST_ITEMS[] + SEED_ITEMS[]; sets
 # SELECTED_ITEMS[] (to copy) and SNAPSHOT_ITEMS[] (to persist as the new snapshot).
@@ -1784,7 +1790,7 @@ _resolve_asset_type "skills" "skill"
 SELECTED_SKILLS=(${SELECTED_ITEMS[@]+"${SELECTED_ITEMS[@]}"}); SNAP_SKILLS=(${SNAPSHOT_ITEMS[@]+"${SNAPSHOT_ITEMS[@]}"})
 
 # Persist the sidecar (live selection + host snapshot per type).
-jq -n \
+(( CLAUDE_CODE_ENABLED == 1 )) && jq -n \
     --argjson ps "$(_arr_json ${SELECTED_PLUGINS[@]+"${SELECTED_PLUGINS[@]}"})" \
     --argjson pn "$(_arr_json ${SNAP_PLUGINS[@]+"${SNAP_PLUGINS[@]}"})" \
     --argjson ss "$(_arr_json ${SELECTED_SKILLS[@]+"${SELECTED_SKILLS[@]}"})" \
@@ -1904,7 +1910,7 @@ if (( ${#SELECTED_SKILLS[@]} )); then
     done
 fi
 
-echo "claude assets: plugins [$( (( ${#SELECTED_PLUGINS[@]} )) && printf '%s ' "${SELECTED_PLUGINS[@]}")] skills [$( (( ${#SELECTED_SKILLS[@]} )) && printf '%s ' "${SELECTED_SKILLS[@]}")] ($( (( _claude_plugins_copied )) && echo 'copied' || echo 'unchanged, copy skipped'); state: ${CLAUDE_ASSETS_SIDECAR})"
+(( CLAUDE_CODE_ENABLED == 1 )) && echo "claude assets: plugins [$( (( ${#SELECTED_PLUGINS[@]} )) && printf '%s ' "${SELECTED_PLUGINS[@]}")] skills [$( (( ${#SELECTED_SKILLS[@]} )) && printf '%s ' "${SELECTED_SKILLS[@]}")] ($( (( _claude_plugins_copied )) && echo 'copied' || echo 'unchanged, copy skipped'); state: ${CLAUDE_ASSETS_SIDECAR})"
 
 # Project-local Claude Code overrides that ONLY apply inside this devcontainer.
 # - permissions.defaultMode=bypassPermissions: skip approval prompts. Container

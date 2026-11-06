@@ -1405,6 +1405,12 @@ if (Test-Path -LiteralPath $HostSkillsDir) {
     }
 }
 $HostSkills = @($HostSkills | Sort-Object)
+# Without Claude Code in "aiTools" there is nothing to adopt: no prompts, nothing
+# copied, and no sidecar (it would only confuse a copilot-only project).
+if (-not $ClaudeCodeEnabled) {
+    $HostPlugins = @()
+    $HostSkills = @()
+}
 
 # Load the sidecar, resolve each asset type, persist the sidecar.
 $sidecar = $null
@@ -1422,7 +1428,7 @@ $sidecarContent = @"
   "skills": { "selected": $(ConvertTo-JsonStringArray $SelectedSkills), "hostSnapshot": $(ConvertTo-JsonStringArray $SnapSkills) }
 }
 "@
-Write-LfFile -Path $ClaudeAssetsSidecar -Content $sidecarContent
+if ($ClaudeCodeEnabled) { Write-LfFile -Path $ClaudeAssetsSidecar -Content $sidecarContent }
 
 # Vendor selected plugins ADDITIVELY: copy only what's missing/outdated, never remove.
 New-Item -ItemType Directory -Path $DstPlugins -Force | Out-Null
@@ -1542,7 +1548,7 @@ if ($SelectedSkills.Count -gt 0) {
 }
 
 $copyNote = if ($ClaudePluginsCopied) { 'copied' } else { 'unchanged, copy skipped' }
-Write-Output ("claude assets: plugins [" + ($SelectedPlugins -join ' ') + "] skills [" + ($SelectedSkills -join ' ') + "] ($copyNote; state: $ClaudeAssetsSidecar)")
+if ($ClaudeCodeEnabled) { Write-Output ("claude assets: plugins [" + ($SelectedPlugins -join ' ') + "] skills [" + ($SelectedSkills -join ' ') + "] ($copyNote; state: $ClaudeAssetsSidecar)") }
 
 # Project-local Claude Code overrides that ONLY apply inside this devcontainer.
 # permissions.defaultMode=bypassPermissions skips approval prompts: the container
