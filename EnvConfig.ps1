@@ -111,13 +111,16 @@ function Resolve-DevContainerConfigPath {
         <root>\<PROJECT_NAME>\devcontainers-config.json                  (config in the project root)
     If no such directory is found (the project directory has a different name),
     it falls back to two levels above the config, the historical behaviour.
+    In single-repo mode (-SingleRepoSource, see Get-SingleRepoSource) the
+    auto-detect is simply the parent of that repo, whatever its name.
 #>
 function Resolve-WorkspacesRoot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)] $Config,
         [AllowEmptyString()][string] $Cli = '',
-        [Parameter(Mandatory = $true)][string] $EnvVarName
+        [Parameter(Mandatory = $true)][string] $EnvVarName,
+        [AllowEmptyString()][string] $SingleRepoSource = ''
     )
 
     $candidate = ''
@@ -134,6 +137,8 @@ function Resolve-WorkspacesRoot {
             if (-not [System.IO.Path]::IsPathRooted($candidate)) {
                 $candidate = Join-Path $Config.Dir $candidate
             }
+        } elseif ($SingleRepoSource) {
+            $candidate = Join-Path $SingleRepoSource '..'
         } else {
             $dir = $Config.Dir
             for ($i = 0; $i -lt 3 -and $dir; $i++) {
@@ -158,6 +163,35 @@ function Resolve-WorkspacesRoot {
     # Canonicalise: bind-mount paths in devcontainer.json must be absolute, and
     # path comparisons must not depend on how the user spelled the argument.
     return (Resolve-Path -LiteralPath $candidate).Path.TrimEnd('\')
+}
+
+<#
+.SYNOPSIS
+    Single-repo source, shared by spawn and dispose.
+
+.DESCRIPTION
+    When "repos" has an entry named "." the source repo is the git repo the
+    config lives in -- its directory name need not match projectName
+    (projectName only names the story workspace, container and volumes).
+    The config may sit in the repo root or in its dev-containers\ sub-directory
+    (next to initialize.sh, runConfigurations\, ...); a config directory named
+    dev-containers is skipped explicitly, so this also holds when that
+    directory is a git repo of its own (submodule, nested clone).
+    Returns that repo's absolute top level, or '' (not single-repo, or the
+    config is not inside a git repo; spawn's single-repo validation then
+    reports the missing repo).
+#>
+function Get-SingleRepoSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] $Config)
+
+    if (@($Config.Repos | Where-Object { $_.Name -eq '.' }).Count -eq 0) { return '' }
+    $base = $Config.Dir
+    if ((Split-Path -Leaf $base) -eq 'dev-containers') { $base = Split-Path -Parent $base }
+    $top = Invoke-Git -RepoDir $base -GitArgs @('rev-parse', '--show-toplevel') -AllowFailure -Quiet
+    if ($script:LastGitExitCode -ne 0 -or -not $top) { return '' }
+    # git prints forward slashes (C:/...); normalise to a native path.
+    return [System.IO.Path]::GetFullPath($top.Trim()).TrimEnd('\')
 }
 
 function Get-DevContainerConfig {

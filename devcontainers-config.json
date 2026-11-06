@@ -79,6 +79,17 @@
     // MONO-REPO MODE: set "repos" to [] when the source workspace IS the git
     // repo (no sub-directories per repo).
     //
+    // SINGLE-REPO MODE: an entry named "." (with a baseRef) makes the git repo
+    // this config lives in (any directory name; projectName only names the
+    // story workspace) the source AND the story workspace root -- the worktree/clone
+    // is created at the workspace root itself, and the generated .devcontainer/,
+    // .idea/, .claude/, ... live in its working tree (kept out of git via the
+    // repo's info/exclude; files the repo tracks are never overwritten). Every
+    // other entry must be a directory without baseRef; it is bind-mounted INSIDE
+    // the repo, so list it in the repo's .gitignore. Another entry with a
+    // baseRef, a "." without baseRef or repoMode "container" aborts spawn.
+    //   "repos": [ { "name": ".", "baseRef": "main" }, { "name": "data" } ],
+    //
     // HOST-MOUNT ENTRIES: an entry with an EMPTY baseRef ("") is not treated as
     // a git repo -- no worktree is created. Instead the host directory
     // <workspaces-root>/<projectName>/<name> is bind-mounted into the container

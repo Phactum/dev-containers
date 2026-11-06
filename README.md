@@ -235,6 +235,54 @@ Minimal `devcontainers-config.json` for a mono-repo (fill in the project-specifi
 }
 ```
 
+### Single-repo mode (`"."`)
+
+Mono-repo mode puts the repository in a sub-directory of the story workspace.
+If the repository itself should be the workspace root (the IntelliJ project is
+the repo) and you still want extra directories next to its sources, list it as
+`"."`:
+
+```jsonc
+"repos": [
+    { "name": ".", "baseRef": "main" },   // the repo the config lives in
+    { "name": "data" },                   // a directory, bind-mounted at <repo>/data
+    { "name": "docs" }
+]
+```
+
+- The source is the git repo that contains `devcontainers-config.json`, whatever
+  its directory is called. The config may sit in the repo root or in its
+  `dev-containers/` sub-directory (together with `initialize.sh`,
+  `runConfigurations/`, ...); in the latter case the directory above
+  `dev-containers/` is the repo, even if `dev-containers/` is a repo of its own; `projectName` only names the story workspace,
+  container and volumes. Without `workspacesRoot` the workspaces root is that
+  repo's parent directory.
+- The worktree (or clone) of the source workspace is created directly at
+  `<workspaces-root>/<projectName>-<leaf>/`, so `.devcontainer/`, `.idea/`,
+  `.claude/`, `README.md` etc. land in the repo's working tree.
+- Files the repo already tracks are **never overwritten**: if it has its own
+  `README.md`, `.idea/*.xml` or `.mvn/maven.config`, spawn keeps the repo's
+  version (the welcome README, the generated IntelliJ settings or the Maven
+  config are then missing for that file) and lists them.
+- Everything else spawn generates, plus each mounted directory, is added to the
+  repo's `info/exclude`, so `git status` stays clean without touching
+  `.gitignore`. In `worktree` mode that is the **source repo's**
+  `.git/info/exclude` (shared by all worktrees), so the same paths are hidden
+  there too. The `.claude-assets.state.json` next to the config is excluded in
+  the source repo as well (unless the repo tracks it).
+- The other entries must be directories without `baseRef`. They live inside the
+  repo, so add them to its `.gitignore`. A missing one is offered for creation
+  as usual.
+- Root-level `pom.xml` / `package.json` get their `target/` and `node_modules`
+  on named volumes like any other module; builds use `"repo": "."`.
+- Spawn aborts (before creating anything) if `"."` has no `baseRef`, another
+  entry has a `baseRef`, `repoMode` is `container`, the config is not inside a
+  git repo, or the repo tracks `.devcontainer/`. On Windows, `worktree` mode
+  additionally needs the repo directly in the workspaces root (the worktree
+  link is relative); use `clone` otherwise.
+- Dispose removes the whole workspace with the worktree; `--delete-branch`
+  deletes the branch in the source repo as usual.
+
 ### Rocky Linux / RHEL-family base (`distro`)
 
 The default image family is Debian. Where Debian-based images are not allowed

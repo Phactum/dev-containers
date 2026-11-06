@@ -165,9 +165,12 @@ ENV_VAR_WORKSPACES_ROOT="$(echo "${PROJECT_SHORT}" | tr '[:lower:]' '[:upper:]')
 # Resolve the workspaces root. Priority (see resolve_workspaces_root in
 # env-config.sh): --workspaces-root flag, ${ENV_VAR_WORKSPACES_ROOT} env var,
 # "workspacesRoot" in devcontainers-config.json, then auto-detect from the config location.
+# Single-repo mode ("." in "repos"): the source is the config's own git repo,
+# whatever its directory is called (see single_repo_source in env-config.sh).
+SINGLE_REPO_SOURCE="$(single_repo_source)"
 WORKSPACES_ROOT="$(resolve_workspaces_root "${WORKSPACES_ROOT_CLI}")" || exit 1
 
-SOURCE_WS="${WORKSPACES_ROOT}/${PROJECT_NAME}"
+SOURCE_WS="${SINGLE_REPO_SOURCE:-${WORKSPACES_ROOT}/${PROJECT_NAME}}"
 
 # If ARG is a Docker container ID (hex string ≥12 chars), resolve it to the
 # container name so the leaf extraction below works the same as for a name.
@@ -274,6 +277,8 @@ fi
 DIRTY=()
 for repo in "${REPO_NAMES[@]}"; do
     wt="${WS_DIR}/${repo}"
+    # Single-repo mode ('.'): the workspace root itself is the checkout.
+    [[ "${repo}" == "." ]] && wt="${WS_DIR}"
     [[ -d "${wt}/.git" || -f "${wt}/.git" ]] || continue
     if [[ -n "$(git -C "${wt}" status --porcelain 2>/dev/null || true)" ]]; then
         DIRTY+=("${repo}")
@@ -439,13 +444,16 @@ fi
 BRANCH=""   # remember branch name once we read it from a worktree (all repos share the same name)
 
 for repo in "${REPO_NAMES[@]}"; do
-    # Mono-repo: the git repo lives at SOURCE_WS itself, not in a sub-directory.
-    if (( MONO_REPO == 1 )); then
+    # Mono-/single-repo: the git repo lives at SOURCE_WS itself, not in a
+    # sub-directory. Single-repo ('.') checked it out at the workspace root, so
+    # removing that worktree removes WS_DIR as a whole (step 4 then finds it gone).
+    if (( MONO_REPO == 1 )) || [[ "${repo}" == "." ]]; then
         src="${SOURCE_WS}"
     else
         src="${SOURCE_WS}/${repo}"
     fi
     wt="${WS_DIR}/${repo}"
+    [[ "${repo}" == "." ]] && wt="${WS_DIR}"
     # -e (not -d): submodules carry a .git *file* pointer, not a directory.
     [[ -e "${src}/.git" ]] || continue
 
@@ -533,8 +541,8 @@ if [[ ${DELETE_BRANCH} -eq 1 ]]; then
     else
         _found_branch=0
         for repo in "${REPO_NAMES[@]}"; do
-            # Mono-repo: the git repo lives at SOURCE_WS itself, not in a sub-directory.
-            if (( MONO_REPO == 1 )); then
+            # Mono-/single-repo: the git repo lives at SOURCE_WS itself.
+            if (( MONO_REPO == 1 )) || [[ "${repo}" == "." ]]; then
                 src="${SOURCE_WS}"
             else
                 src="${SOURCE_WS}/${repo}"

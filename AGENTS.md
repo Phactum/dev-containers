@@ -136,6 +136,43 @@ Things that follow from this and must stay in lockstep across both ports:
   source repos. Worktree branches are deleted there; clone/container report that
   the branch lived in the removed clone/container.
 
+### Single-repo mode (`"."` in `repos`)
+
+A `repos` entry named `.` sets `SINGLE_REPO` / `$SingleRepo`: the source
+workspace is the git repo (as in mono-repo mode) **and** it is checked out at the
+workspace root (`WS_DIR`, not `WS_DIR/<repo>`). Things to keep in lockstep:
+
+- **Source location:** `SOURCE_WS` is the git top level of `CONFIG_DIR` (of its
+  parent when `CONFIG_DIR` is named `dev-containers`)
+  (`single_repo_source` / `Get-SingleRepoSource`, shared by spawn and dispose),
+  NOT `<root>/<projectName>` -- the repo's directory name is free, `projectName`
+  only names `WS_DIR`, container and volumes. It is computed before the
+  workspaces root, whose auto-detect (step 4) then is that repo's parent. The
+  PowerShell port mounts the source at `/workspaces/<leaf of SourceWs>` and, in
+  worktree mode, requires the repo directly in the workspaces root (relative
+  worktree link between sibling mounts).
+
+- **Validation** runs right after the workspace-exists check, before anything is
+  created: `.` needs a `baseRef`, may appear once, every other entry must have
+  no `baseRef` (host-mount dirs), `repoMode` must not be `container`, the source
+  config must be inside a git repo that does not track `.devcontainer/`.
+- **Paths:** `.` maps to `SOURCE_WS` / `WS_DIR` (never `.../.` -- `rm -rf dir/.`
+  fails) in `create_worktree` / `create_clone`, the source-repo git config loop
+  and both dispose loops. Mono-repo mode is untouched.
+- **Root modules:** a `pom.xml` / `package.json` at `WS_DIR` is recorded as `.`
+  and gets volumes with slug `root` mounted at `__WORKSPACE_PATH__/target` /
+  `node_modules`; IntelliJ's pom list uses `$PROJECT_DIR$/pom.xml`.
+- **Finalize** (just before "workspace ready"): `git diff --name-only` in the
+  fresh checkout lists tracked files spawn overwrote, which `git checkout -- .`
+  restores (never overwrite tracked files). Then `ls-files --others
+  --exclude-standard --directory` plus each host-mount dir is appended, anchored
+  with `/`, to `git rev-parse --git-path info/exclude` -- in worktree mode the
+  SOURCE repo's shared exclude. The claude-assets state file next to the config
+  lives in the SOURCE repo, so it goes into that repo's exclude (path relative
+  to its top level via `rev-parse --show-prefix`, only if untracked).
+- The generated `branches` helper also reports the workspace root when it has a
+  `.git`.
+
 ## Distro split (`distro`: `debian` | `rocky`)
 
 PowerShell and Bash both support it. `spawn-workspace.ps1` sets `$IsRocky` /
@@ -217,7 +254,8 @@ where a workspace lives. Priority:
 3. `"workspacesRoot"` in `devcontainers-config.json` (relative â†’ resolved against `CONFIG_DIR`)
 4. auto-detect: walk up from `CONFIG_DIR` to the directory named `projectName`
    (the source workspace) and take its parent; fall back to two levels above
-   `CONFIG_DIR` (the historical rule) when no such directory is found
+   `CONFIG_DIR` (the historical rule) when no such directory is found. In
+   single-repo mode the auto-detect is the parent of the config's git repo
 
 The walk-up is what makes both `<root>/<PROJECT>/devcontainers-config.json` and
 `<root>/<PROJECT>/dev-containers/devcontainers-config.json` resolve to `<root>` without any

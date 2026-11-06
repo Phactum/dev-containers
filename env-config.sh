@@ -327,6 +327,8 @@ unset _rec _required
 #     <root>/<PROJECT_NAME>/devcontainers-config.json                  (config in the project root)
 # If no such directory is found (the project directory has a different name),
 # it falls back to two levels above CONFIG_DIR, the historical behaviour.
+# In single-repo mode (SINGLE_REPO_SOURCE set, see single_repo_source below) the
+# auto-detect is simply the parent of that repo, whatever its name.
 #
 # Echoes the resolved absolute path; the caller assigns it.
 # ---------------------------------------------------------------------------
@@ -344,6 +346,8 @@ resolve_workspaces_root() {
         # A relative path in devcontainers-config.json is relative to the config itself, so a
         # project can commit e.g. "workspacesRoot": ".." and stay portable.
         [[ "${candidate}" != /* ]] && candidate="${CONFIG_DIR}/${candidate}"
+    elif [[ -n "${SINGLE_REPO_SOURCE:-}" ]]; then
+        candidate="${SINGLE_REPO_SOURCE}/.."
     else
         local dir="${CONFIG_DIR}"
         local i
@@ -371,4 +375,28 @@ resolve_workspaces_root() {
     # Canonicalise: bind-mount paths in devcontainer.json must be absolute, and
     # path comparisons must not depend on how the user spelled the argument.
     ( cd "${candidate}" && pwd )
+}
+
+# ---------------------------------------------------------------------------
+# Single-repo source, shared by spawn and dispose. When "repos" has an entry
+# named "." the source repo is the git repo the config lives in -- its
+# directory name need not match projectName (projectName only names the story
+# workspace, container and volumes). The config may sit in the repo root or in
+# its dev-containers/ sub-directory (next to initialize.sh, runConfigurations/,
+# ...); a CONFIG_DIR named dev-containers is skipped explicitly, so this also
+# holds when that directory is a git repo of its own (submodule, nested clone).
+# Echoes that repo's absolute top level, or nothing (not single-repo, or the
+# config is not inside a git repo; spawn's single-repo validation then reports
+# the missing repo).
+# ---------------------------------------------------------------------------
+single_repo_source() {
+    local entry base="${CONFIG_DIR}"
+    (( ${#REPOS[@]} > 0 )) || return 0
+    [[ "$(basename "${CONFIG_DIR}")" == "dev-containers" ]] && base="$(dirname "${CONFIG_DIR}")"
+    for entry in "${REPOS[@]}"; do
+        if [[ "${entry%%:*}" == "." ]]; then
+            git -C "${base}" rev-parse --show-toplevel 2>/dev/null || true
+            return 0
+        fi
+    done
 }

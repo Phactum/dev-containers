@@ -35,6 +35,12 @@
 #    For pre-built artifacts / non-versioned folders. Mono-repo's synthetic
 #    "${PROJECT_NAME}:" entry also has an empty value but is a real git repo, so
 #    it is excluded via MONO_REPO.
+#    Single-repo mode (SINGLE_REPO): an entry named "." checks the source
+#    workspace itself out at the workspace ROOT (WS_DIR, not WS_DIR/<repo>);
+#    every other entry must be a host-mount directory, bind-mounted inside the
+#    repo. Not supported in container mode. The generated files then sit in the
+#    repo's working tree: the finalize step before "workspace ready" restores
+#    any tracked file spawn overwrote and adds the rest to info/exclude.
 #
 # 3. Per-repo base ref for new branches
 #    Each entry in REPOS (devcontainers-config.json) is "<repo>:<base-ref>". When the branch
@@ -689,6 +695,18 @@ fi
 BUILD_ENTRIES=()
 (( ${#BUILDS[@]} > 0 )) && BUILD_ENTRIES=("${BUILDS[@]}")
 
+# Resolve the workspaces root. Priority (see resolve_workspaces_root in
+# env-config.sh): --workspaces-root flag, ${ENV_VAR_WORKSPACES_ROOT} env var,
+# "workspacesRoot" in devcontainers-config.json, then auto-detect from the config location.
+# Deliberately derived from the config and NOT from the script, which may sit
+# anywhere on the PATH.
+# Single-repo mode ("." in "repos"): the source is the config's own git repo,
+# whatever its directory is called (see single_repo_source in env-config.sh).
+SINGLE_REPO_SOURCE="$(single_repo_source)"
+WORKSPACES_ROOT="$(resolve_workspaces_root "${WORKSPACES_ROOT_CLI}")" || exit 1
+
+SOURCE_WS="${SINGLE_REPO_SOURCE:-${WORKSPACES_ROOT}/${PROJECT_NAME}}"
+
 # Mono-repo default: when the "builds" key is absent entirely (BUILDS_DEFINED=0,
 # NOT merely an empty list) and a pom.xml exists at the repo root, build the
 # project as a single Maven reactor. An explicit "builds": [] disables warmup
@@ -696,15 +714,6 @@ BUILD_ENTRIES=()
 if (( MONO_REPO == 1 )) && (( BUILDS_DEFINED == 0 )) && [[ -f "${SOURCE_WS}/pom.xml" ]]; then
     BUILD_ENTRIES=("${PROJECT_NAME}:mvn:install")
 fi
-
-# Resolve the workspaces root. Priority (see resolve_workspaces_root in
-# env-config.sh): --workspaces-root flag, ${ENV_VAR_WORKSPACES_ROOT} env var,
-# "workspacesRoot" in devcontainers-config.json, then auto-detect from the config location.
-# Deliberately derived from the config and NOT from the script, which may sit
-# anywhere on the PATH.
-WORKSPACES_ROOT="$(resolve_workspaces_root "${WORKSPACES_ROOT_CLI}")" || exit 1
-
-SOURCE_WS="${WORKSPACES_ROOT}/${PROJECT_NAME}"
 
 LEAF="${BRANCH##*/}"
 WS_NAME="${PROJECT_NAME}-${LEAF}"
@@ -717,6 +726,56 @@ if [[ -e "${WS_DIR}" ]]; then
     echo "Workspace already exists: ${WS_DIR}" >&2
     echo "Dispose it first: dispose-workspace.sh ${BRANCH}" >&2
     exit 1
+fi
+
+# Single-repo mode: a "repos" entry named "." makes the source workspace (the
+# git repo the config lives in, whatever its directory is called) the git repo
+# AND the story workspace root -- the
+# worktree/clone is created directly at WS_DIR instead of WS_DIR/<repo>. Every
+# other entry must be a plain directory (no baseRef); it is bind-mounted INSIDE
+# the repo, so it belongs in the repo's .gitignore. Unlike mono-repo mode
+# ("repos": [], repo at WS_DIR/<PROJECT_NAME>/) the generated files
+# (.devcontainer/, .idea/, .claude/, README.md, ...) then sit in the repo's
+# working tree; the single-repo finalize step at the end keeps them out of git.
+# Validated here, before anything is created.
+SINGLE_REPO=0
+if (( MONO_REPO == 0 )); then
+    for entry in "${REPOS[@]}"; do
+        if [[ "${entry%%:*}" == "." ]]; then SINGLE_REPO=1; fi
+    done
+fi
+if (( SINGLE_REPO == 1 )); then
+    _sr_err=""
+    _sr_dots=0
+    for entry in "${REPOS[@]}"; do
+        _n="${entry%%:*}"
+        _b="${entry#*:}"
+        if [[ "${_n}" == "." ]]; then
+            _sr_dots=$((_sr_dots + 1))
+            if [[ -z "${_b}" ]]; then
+                _sr_err+="  '.' needs a baseRef (it is the git repo of the workspace)"$'\n'
+            fi
+        elif [[ -n "${_b}" ]]; then
+            _sr_err+="  '${_n}' has a baseRef: besides '.' only directories (no baseRef) are allowed"$'\n'
+        fi
+    done
+    if (( _sr_dots > 1 )); then
+        _sr_err+="  '.' is listed more than once"$'\n'
+    fi
+    if (( IS_CONTAINER_MODE == 1 )); then
+        _sr_err+="  repoMode 'container' is not supported with '.' (use worktree or clone)"$'\n'
+    fi
+    if [[ -z "${SINGLE_REPO_SOURCE}" ]]; then
+        _sr_err+="  ${CONFIG_DIR} is not inside a git repo (the config must live in the repo)"$'\n'
+    elif [[ -n "$(git -C "${SOURCE_WS}" ls-files -- .devcontainer)" ]]; then
+        _sr_err+="  the repo tracks .devcontainer/, which spawn has to generate"$'\n'
+    fi
+    if [[ -n "${_sr_err}" ]]; then
+        echo "ERROR: invalid single-repo setup (\"repos\" entry \".\") in ${CONFIG_JSON}:" >&2
+        printf '%s' "${_sr_err}" >&2
+        exit 1
+    fi
+    echo "single-repo mode: ${SOURCE_WS} is the workspace repo"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1163,14 +1222,16 @@ resolve_base() {
 create_worktree() {
     local repo="$1"
     local base_ref="$2"
-    # Mono-repo: the source workspace IS the git repo; no sub-directory.
+    # Mono-repo / single-repo ('.'): the source workspace IS the git repo; no
+    # sub-directory. Single-repo additionally checks it out at the workspace root.
     local src
-    if (( MONO_REPO == 1 )); then
+    if (( MONO_REPO == 1 )) || [[ "${repo}" == "." ]]; then
         src="${SOURCE_WS}"
     else
         src="${SOURCE_WS}/${repo}"
     fi
     local dst="${WS_DIR}/${repo}"
+    [[ "${repo}" == "." ]] && dst="${WS_DIR}"
 
     # Accept both a real .git directory and a .git *file*: git submodules store
     # their metadata under the superproject's .git/modules/<name> and leave only
@@ -1277,12 +1338,13 @@ create_clone() {
     local repo="$1"
     local base_ref="$2"
     local src
-    if (( MONO_REPO == 1 )); then
+    if (( MONO_REPO == 1 )) || [[ "${repo}" == "." ]]; then
         src="${SOURCE_WS}"
     else
         src="${SOURCE_WS}/${repo}"
     fi
     local dst="${WS_DIR}/${repo}"
+    [[ "${repo}" == "." ]] && dst="${WS_DIR}"
 
     if [[ ! -e "${src}/.git" ]]; then
         echo "skip ${repo}: no git repo at ${src}"
@@ -1434,8 +1496,8 @@ done
 # bind-mount workarounds are irrelevant.
 if [[ "${REPO_MODE}" == "worktree" ]]; then
 for repo in "${REPO_NAMES[@]}"; do
-    # Mono-repo: git config lives at SOURCE_WS itself, not in a sub-directory.
-    if (( MONO_REPO == 1 )); then
+    # Mono-/single-repo: git config lives at SOURCE_WS itself, not in a sub-directory.
+    if (( MONO_REPO == 1 )) || [[ "${repo}" == "." ]]; then
         src_repo="${SOURCE_WS}"
     else
         src_repo="${SOURCE_WS}/${repo}"
@@ -1476,6 +1538,11 @@ fi
 NPM_MODULE_DIRS=()
 while IFS= read -r pj; do
     pj_dir="$(dirname "${pj}")"
+    # Single-repo mode: a package.json at the workspace (= repo) root.
+    if [[ "${pj_dir}" == "${WS_DIR}" ]]; then
+        NPM_MODULE_DIRS+=(".")
+        continue
+    fi
     rel="${pj_dir#"${WS_DIR}"/}"
     # Guard: skip if WS_DIR was not a prefix (shouldn't happen)
     [[ "${rel}" == "${pj_dir}" ]] && continue
@@ -1492,8 +1559,10 @@ NPM_NM_VOLUME_MOUNTS=""
 if (( ${#NPM_MODULE_DIRS[@]} > 0 )); then
     for rel_dir in "${NPM_MODULE_DIRS[@]}"; do
         slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
+        _mod="${WORKSPACE_PATH}/${rel_dir}"
+        if [[ "${rel_dir}" == "." ]]; then slug="root"; _mod="${WORKSPACE_PATH}"; fi
         vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-nm"
-        NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/node_modules,type=volume\"\n"
+        NPM_NM_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${_mod}/node_modules,type=volume\"\n"
     done
 fi
 
@@ -1511,6 +1580,11 @@ fi
 MVN_MODULE_DIRS=()
 while IFS= read -r pom; do
     pom_dir="$(dirname "${pom}")"
+    # Single-repo mode: a pom.xml at the workspace (= repo) root.
+    if [[ "${pom_dir}" == "${WS_DIR}" ]]; then
+        MVN_MODULE_DIRS+=(".")
+        continue
+    fi
     rel="${pom_dir#"${WS_DIR}"/}"
     # Guard: skip if WS_DIR was not a prefix (shouldn't happen)
     [[ "${rel}" == "${pom_dir}" ]] && continue
@@ -1524,8 +1598,10 @@ MVN_TARGET_VOLUME_MOUNTS=""
 if (( ${#MVN_MODULE_DIRS[@]} > 0 )); then
     for rel_dir in "${MVN_MODULE_DIRS[@]}"; do
         slug="$(printf '%s' "${rel_dir}" | tr '/' '-' | tr '_' '-')"
+        _mod="${WORKSPACE_PATH}/${rel_dir}"
+        if [[ "${rel_dir}" == "." ]]; then slug="root"; _mod="${WORKSPACE_PATH}"; fi
         vol_name="${PROJECT_SHORT}-${LEAF}-${slug}-target"
-        MVN_TARGET_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${WORKSPACE_PATH}/${rel_dir}/target,type=volume\"\n"
+        MVN_TARGET_VOLUME_MOUNTS+="        ,\"source=${vol_name},target=${_mod}/target,type=volume\"\n"
     done
 fi
 
@@ -1960,7 +2036,9 @@ if (( ${#BUILD_ENTRIES[@]} > 0 )); then
         # clone modes keep the existence check (they have a real host checkout).
         if [[ -f "${WS_DIR}/${r}/pom.xml" ]] \
             || { (( IS_CONTAINER_MODE == 1 )) && [[ "${btype}" == "mvn" ]]; }; then
-            MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${r}/pom.xml\" />"$'\n'
+            _pom="${r}/pom.xml"
+            [[ "${r}" == "." ]] && _pom="pom.xml"
+            MAVEN_POMS_LIST+="                <option value=\"\$PROJECT_DIR\$/${_pom}\" />"$'\n'
         fi
         if [[ "${btype}" == "cmd" ]]; then
             # "command" entry: raw bash, run verbatim inside <repo>. No
@@ -4061,6 +4139,8 @@ ln -sfn __WORKSPACE_PATH__ /home/vscode/ws
 sudo tee /usr/local/bin/branches >/dev/null <<'BRANCHES'
 #!/usr/bin/env bash
 cd __WORKSPACE_PATH__ 2>/dev/null || exit 1
+# Single-repo mode: the workspace root itself is the repo.
+[[ -e .git ]] && printf "  %-30s %s\n" "." "$(git branch --show-current 2>/dev/null || echo '?')"
 for dir in */; do
     [[ -e "${dir}.git" ]] || continue
     printf "  %-30s %s\n" "${dir%/}" "$(git -C "${dir}" branch --show-current 2>/dev/null || echo '?')"
@@ -4652,6 +4732,78 @@ DOCKERFILEBASE
 # as the other templates. PORT_TABLE_ROWS was already spliced in above via bash;
 # substitute_placeholders handles the remaining tokens and GLAB blocks.
 substitute_placeholders "${WS_DIR}/README.md"
+
+# Single-repo mode: every generated file lives in the repo's working tree. Keep
+# them out of git without touching anything the repo tracks:
+#  1. A tracked file spawn overwrote (README.md, .idea/*.xml, .mvn/maven.config,
+#     AGENTS.md, ...) is restored to the repo's version. The checkout is fresh,
+#     so every modification at this point is spawn's own.
+#  2. Every remaining untracked path, plus each bind-mounted directory, goes into
+#     the repo's info/exclude -- in worktree mode the SOURCE repo's shared
+#     .git/info/exclude -- so 'git status' stays clean without a .gitignore edit.
+#  3. The claude-assets state file sits next to the config, i.e. inside the
+#     SOURCE repo, so it goes into the source repo's info/exclude (the same file
+#     as in 2. in worktree mode, a different one in clone mode).
+#
+# Append repo-root-relative paths (stdin, one per line) to <repo>'s
+# info/exclude, anchored with '/', skipping lines already present. Prints how
+# many were added.
+_sr_append_exclude() {
+    local repo="$1" excl p added=0
+    excl="$(git -C "${repo}" rev-parse --git-path info/exclude)"
+    [[ "${excl}" == /* ]] || excl="${repo}/${excl}"
+    mkdir -p "$(dirname "${excl}")"
+    touch "${excl}"
+    while IFS= read -r p; do
+        [[ -n "${p}" ]] || continue
+        grep -qxF "/${p}" "${excl}" && continue
+        if (( added == 0 )); then
+            printf '\n# dev-containers single-repo workspace (written by spawn-workspace)\n' >> "${excl}"
+        fi
+        printf '/%s\n' "${p}" >> "${excl}"
+        added=$((added + 1))
+    done
+    echo "${added}"
+}
+if (( SINGLE_REPO == 1 )); then
+    _sr_kept="$(git -C "${WS_DIR}" diff --name-only)"
+    if [[ -n "${_sr_kept}" ]]; then
+        git -C "${WS_DIR}" checkout --quiet -- .
+        echo "single-repo: kept the repo's own (tracked) version of:"
+        printf '%s\n' "${_sr_kept}" | sed 's/^/  /'
+    fi
+    if (( ${#HOST_MOUNT_REPOS[@]} > 0 )); then
+        for repo in "${HOST_MOUNT_REPOS[@]}"; do
+            if [[ -n "$(git -C "${WS_DIR}" ls-files -- "${repo}")" ]]; then
+                echo "WARNING: '${repo}' is tracked in the repo; its bind mount hides that content in the container." >&2
+            fi
+        done
+    fi
+    _sr_added="$(
+        {
+            git -C "${WS_DIR}" ls-files --others --exclude-standard --directory
+            if (( ${#HOST_MOUNT_REPOS[@]} > 0 )); then printf '%s/\n' "${HOST_MOUNT_REPOS[@]}"; fi
+        } | _sr_append_exclude "${WS_DIR}"
+    )"
+    if (( _sr_added > 0 )); then
+        _sr_excl="$(git -C "${WS_DIR}" rev-parse --git-path info/exclude)"
+        [[ "${_sr_excl}" == /* ]] || _sr_excl="${WS_DIR}/${_sr_excl}"
+        echo "single-repo: excluded ${_sr_added} generated path(s) via ${_sr_excl}"
+    fi
+    # The state file's path relative to the source repo root, via git so that
+    # symlinked prefixes (/tmp vs /private/tmp) can't make a string compare fail.
+    # Skipped when the config does not live inside the source repo at all.
+    if [[ -f "${CLAUDE_ASSETS_SIDECAR}" ]] \
+        && [[ "$(git -C "${CONFIG_DIR}" rev-parse --show-toplevel 2>/dev/null)" == "$(git -C "${SOURCE_WS}" rev-parse --show-toplevel)" ]]; then
+        _sr_state="$(git -C "${CONFIG_DIR}" rev-parse --show-prefix).claude-assets.state.json"
+        if [[ -z "$(git -C "${SOURCE_WS}" ls-files -- "${_sr_state}")" ]]; then
+            _sr_added="$(printf '%s\n' "${_sr_state}" | _sr_append_exclude "${SOURCE_WS}")"
+            if (( _sr_added > 0 )); then
+                echo "single-repo: excluded ${_sr_state} in the source repo"
+            fi
+        fi
+    fi
+fi
 
 cat <<EOF
 

@@ -464,9 +464,12 @@ $BuildEntries = @($cfg.Builds)
 # EnvConfig.ps1): --workspaces-root flag, env var, "workspacesRoot" in
 # devcontainers-config.json, then auto-detect from the config location. Deliberately derived
 # from the config and NOT from the script, which may sit anywhere on the PATH.
-$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot
+# Single-repo mode ("." in "repos"): the source is the config's own git repo,
+# whatever its directory is called (see Get-SingleRepoSource in EnvConfig.ps1).
+$SingleRepoSource = Get-SingleRepoSource -Config $cfg
+$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot -SingleRepoSource $SingleRepoSource
 
-$SourceWs = Join-Path $WorkspacesRoot $ProjectName
+$SourceWs = if ($SingleRepoSource) { $SingleRepoSource } else { Join-Path $WorkspacesRoot $ProjectName }
 $Leaf = ($Branch -split '/')[-1]
 $WsName = "$ProjectName-$Leaf"
 $WsDir = Join-Path $WorkspacesRoot $WsName
@@ -474,7 +477,9 @@ $WsDir = Join-Path $WorkspacesRoot $WsName
 # In-container paths. Both workspaces are mounted as siblings under /workspaces
 # so the relative git worktree links resolve on host and container alike.
 $WorkspacePath = "/workspaces/$WsName"
-$SourceWsContainer = "/workspaces/$ProjectName"
+# (Leaf of $SourceWs, not $ProjectName: in single-repo mode the source repo's
+# directory may be named differently.)
+$SourceWsContainer = "/workspaces/$(Split-Path -Leaf $SourceWs)"
 # Claude Code derives the project key from the cwd.
 $MemoryKey = "-workspaces-$WsName"
 # ... but memory itself stays in ONE host folder shared by every story container
@@ -490,6 +495,52 @@ $HomeDir = $HomeDir.TrimEnd('\')
 if (Test-Path -LiteralPath $WsDir) {
     Write-Err "Workspace already exists: $WsDir"
     Fail "Dispose it first: dispose-workspace.ps1 $Branch"
+}
+
+# Single-repo mode: a "repos" entry named "." makes the source workspace (the
+# git repo the config lives in, whatever its directory is called) the git repo
+# AND the story workspace root -- the
+# worktree/clone is created directly at $WsDir instead of $WsDir\<repo>. Every
+# other entry must be a plain directory (no baseRef); it is bind-mounted INSIDE
+# the repo, so it belongs in the repo's .gitignore. Unlike mono-repo mode
+# ("repos": [], repo at $WsDir\<ProjectName>) the generated files
+# (.devcontainer/, .idea/, .claude/, README.md, ...) then sit in the repo's
+# working tree; the single-repo finalize step at the end keeps them out of git.
+# Validated here, before anything is created.
+$SingleRepo = (-not $MonoRepo) -and (@($Repos | Where-Object { $_.Name -eq '.' }).Count -gt 0)
+if ($SingleRepo) {
+    $srErr = @()
+    $srDots = 0
+    foreach ($srEntry in $Repos) {
+        if ($srEntry.Name -eq '.') {
+            $srDots++
+            if ([string]::IsNullOrEmpty($srEntry.BaseRef)) {
+                $srErr += "  '.' needs a baseRef (it is the git repo of the workspace)"
+            }
+        } elseif (-not [string]::IsNullOrEmpty($srEntry.BaseRef)) {
+            $srErr += "  '$($srEntry.Name)' has a baseRef: besides '.' only directories (no baseRef) are allowed"
+        }
+    }
+    if ($srDots -gt 1) { $srErr += "  '.' is listed more than once" }
+    if ($IsContainerMode) { $srErr += "  repoMode 'container' is not supported with '.' (use worktree or clone)" }
+    if (-not $SingleRepoSource) {
+        $srErr += "  $ConfigDir is not inside a git repo (the config must live in the repo)"
+    } elseif (Invoke-Git -RepoDir $SourceWs -GitArgs @('ls-files', '--', '.devcontainer') -Quiet) {
+        $srErr += '  the repo tracks .devcontainer/, which spawn has to generate'
+    }
+    # The worktree link is rewritten relative (Convert-WorktreeLinkToRelative)
+    # and both workspaces are mounted as siblings under /workspaces, so in
+    # worktree mode the source repo must sit directly in the workspaces root.
+    if ($RepoMode -eq 'worktree' -and $SingleRepoSource -and
+        (Split-Path -Parent $SourceWs).TrimEnd('\') -ne $WorkspacesRoot) {
+        $srErr += "  repoMode 'worktree' needs the repo directly in the workspaces root ($WorkspacesRoot); use clone or move the root"
+    }
+    if ($srErr.Count -gt 0) {
+        Write-Err "ERROR: invalid single-repo setup (`"repos`" entry `".`") in $($cfg.Path):"
+        $srErr | ForEach-Object { Write-Err $_ }
+        exit 1
+    }
+    Write-Output "single-repo mode: $SourceWs is the workspace repo"
 }
 
 # ---------------------------------------------------------------------------
@@ -891,9 +942,10 @@ function New-Worktree {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BaseRef
     )
 
-    # Mono-repo: the source workspace IS the git repo; no sub-directory.
-    $src = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $Repo }
-    $dst = Join-Path $WsDir $Repo
+    # Mono-repo / single-repo ('.'): the source workspace IS the git repo; no
+    # sub-directory. Single-repo additionally checks it out at the workspace root.
+    $src = if ($MonoRepo -or $Repo -eq '.') { $SourceWs } else { Join-Path $SourceWs $Repo }
+    $dst = if ($Repo -eq '.') { $WsDir } else { Join-Path $WsDir $Repo }
 
     # Accept both a real .git directory and a .git *file*: git submodules store
     # their metadata under the superproject's .git/modules/<name> and leave only
@@ -991,8 +1043,8 @@ function New-Clone {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string] $BaseRef
     )
 
-    $src = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $Repo }
-    $dst = Join-Path $WsDir $Repo
+    $src = if ($MonoRepo -or $Repo -eq '.') { $SourceWs } else { Join-Path $SourceWs $Repo }
+    $dst = if ($Repo -eq '.') { $WsDir } else { Join-Path $WsDir $Repo }
 
     if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) {
         Write-Output "skip ${Repo}: no git repo at $src"
@@ -1117,7 +1169,8 @@ foreach ($entry in $Repos) {
 # workarounds are irrelevant.
 if ($RepoMode -eq 'worktree') {
     foreach ($repo in $RepoNames) {
-        $srcRepo = if ($MonoRepo) { $SourceWs } else { Join-Path $SourceWs $repo }
+        # Mono-/single-repo: git config lives at $SourceWs itself.
+        $srcRepo = if ($MonoRepo -or $repo -eq '.') { $SourceWs } else { Join-Path $SourceWs $repo }
         if (-not (Test-Path -LiteralPath (Join-Path $srcRepo '.git'))) { continue }
         Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.fileMode', 'false') | Out-Null
         Invoke-Git -RepoDir $srcRepo -GitArgs @('config', 'core.autocrlf', 'input') | Out-Null
@@ -1151,7 +1204,8 @@ Get-ChildItem -LiteralPath $WsDir -Recurse -File -Filter 'package.json' -Force -
         $rel = $_.DirectoryName.Substring($WsDir.Length).TrimStart('\')
         $relPosix = ($rel -replace '\\', '/')
         if ($relPosix -match '(^|/)node_modules(/|$)' -or $relPosix -match '(^|/)\.git(/|$)') { return }
-        if ($relPosix) { $NpmModuleDirs += $relPosix }
+        # Empty = package.json at the workspace (= repo) root: single-repo mode.
+        if ($relPosix) { $NpmModuleDirs += $relPosix } else { $NpmModuleDirs += '.' }
     }
 
 # JSON fragment appended after the last fixed entry of the mounts array; each
@@ -1159,8 +1213,10 @@ Get-ChildItem -LiteralPath $WsDir -Recurse -File -Filter 'package.json' -Force -
 $NpmVolumeMounts = ''
 foreach ($relDir in $NpmModuleDirs) {
     $slug = ($relDir -replace '[/_]', '-')
+    $mod = "$WorkspacePath/$relDir"
+    if ($relDir -eq '.') { $slug = 'root'; $mod = $WorkspacePath }
     $volName = "$ProjectShort-$Leaf-$slug-nm"
-    $NpmVolumeMounts += "        ,`"source=$volName,target=$WorkspacePath/$relDir/node_modules,type=volume`"`n"
+    $NpmVolumeMounts += "        ,`"source=$volName,target=$mod/node_modules,type=volume`"`n"
 }
 
 # Same discovery for Maven modules -> per-module target/ named volumes. Distinct
@@ -1172,14 +1228,17 @@ Get-ChildItem -LiteralPath $WsDir -Recurse -File -Filter 'pom.xml' -Force -Error
         $rel = $_.DirectoryName.Substring($WsDir.Length).TrimStart('\')
         $relPosix = ($rel -replace '\\', '/')
         if ($relPosix -match '(^|/)target(/|$)' -or $relPosix -match '(^|/)\.git(/|$)') { return }
-        if ($relPosix) { $MvnModuleDirs += $relPosix }
+        # Empty = pom.xml at the workspace (= repo) root: single-repo mode.
+        if ($relPosix) { $MvnModuleDirs += $relPosix } else { $MvnModuleDirs += '.' }
     }
 
 $MvnTargetVolumeMounts = ''
 foreach ($relDir in $MvnModuleDirs) {
     $slug = ($relDir -replace '[/_]', '-')
+    $mod = "$WorkspacePath/$relDir"
+    if ($relDir -eq '.') { $slug = 'root'; $mod = $WorkspacePath }
     $volName = "$ProjectShort-$Leaf-$slug-target"
-    $MvnTargetVolumeMounts += "        ,`"source=$volName,target=$WorkspacePath/$relDir/target,type=volume`"`n"
+    $MvnTargetVolumeMounts += "        ,`"source=$volName,target=$mod/target,type=volume`"`n"
 }
 
 # One bind mount per host-mount repo, from the host source dir to its workspace
@@ -1589,7 +1648,8 @@ foreach ($entry in $BuildEntries) {
     # post-create), so the pom.xml can't be tested for; emit the root-pom entry
     # for every mvn-goal build instead. worktree / clone keep the existence check.
     if ((Test-Path -LiteralPath (Join-Path $WsDir "$r\pom.xml")) -or ($IsContainerMode -and $entry.Type -eq 'mvn')) {
-        $MavenPomsList += "                <option value=`"`$PROJECT_DIR`$/$r/pom.xml`" />`n"
+        $pomRel = if ($r -eq '.') { 'pom.xml' } else { "$r/pom.xml" }
+        $MavenPomsList += "                <option value=`"`$PROJECT_DIR`$/$pomRel`" />`n"
     }
     if ($entry.Type -eq 'cmd') {
         # "command" entry: raw bash, run verbatim inside <repo>. No mvn/MVN_FLAGS
@@ -3320,6 +3380,8 @@ ln -sfn __WORKSPACE_PATH__ /home/vscode/ws
 sudo tee /usr/local/bin/branches >/dev/null <<'BRANCHES'
 #!/usr/bin/env bash
 cd __WORKSPACE_PATH__ 2>/dev/null || exit 1
+# Single-repo mode: the workspace root itself is the repo.
+[[ -e .git ]] && printf "  %-30s %s\n" "." "$(git branch --show-current 2>/dev/null || echo '?')"
 for dir in */; do
     [[ -e "${dir}.git" ]] || continue
     printf "  %-30s %s\n" "${dir%/}" "$(git -C "${dir}" branch --show-current 2>/dev/null || echo '?')"
@@ -4117,6 +4179,77 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 "@
+
+# Single-repo mode: every generated file lives in the repo's working tree. Keep
+# them out of git without touching anything the repo tracks:
+#  1. A tracked file spawn overwrote (README.md, .idea/*.xml, .mvn/maven.config,
+#     AGENTS.md, ...) is restored to the repo's version. The checkout is fresh,
+#     so every modification at this point is spawn's own.
+#  2. Every remaining untracked path, plus each bind-mounted directory, goes into
+#     the repo's info/exclude -- in worktree mode the SOURCE repo's shared
+#     .git/info/exclude -- so 'git status' stays clean without a .gitignore edit.
+#  3. The claude-assets state file sits next to the config, i.e. inside the
+#     SOURCE repo, so it goes into the source repo's info/exclude (the same file
+#     as in 2. in worktree mode, a different one in clone mode).
+#
+# Append repo-root-relative paths to <RepoDir>'s info/exclude, anchored with
+# '/', skipping lines already present. Returns how many were added.
+function Add-SingleRepoExclude {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepoDir,
+        [string[]] $Paths
+    )
+    $excl = Invoke-Git -RepoDir $RepoDir -GitArgs @('rev-parse', '--git-path', 'info/exclude') -Quiet
+    if (-not [System.IO.Path]::IsPathRooted($excl)) { $excl = Join-Path $RepoDir $excl }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $excl) | Out-Null
+    $existing = if (Test-Path -LiteralPath $excl) { @([System.IO.File]::ReadAllLines($excl)) } else { @() }
+    $new = @($Paths | Where-Object { $_ } | ForEach-Object { "/$_" } |
+             Where-Object { $existing -cnotcontains $_ } | Select-Object -Unique)
+    if ($new.Count -gt 0) {
+        $text = "`n# dev-containers single-repo workspace (written by spawn-workspace)`n" + ($new -join "`n") + "`n"
+        [System.IO.File]::AppendAllText($excl, $text, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return $new.Count
+}
+if ($SingleRepo) {
+    $srKept = Invoke-Git -RepoDir $WsDir -GitArgs @('diff', '--name-only') -Quiet
+    if ($srKept) {
+        Invoke-Git -RepoDir $WsDir -GitArgs @('checkout', '--quiet', '--', '.') -Quiet | Out-Null
+        Write-Output "single-repo: kept the repo's own (tracked) version of:"
+        $srKept -split "`n" | ForEach-Object { Write-Output "  $_" }
+    }
+    foreach ($repo in $HostMountRepos) {
+        if (Invoke-Git -RepoDir $WsDir -GitArgs @('ls-files', '--', $repo) -Quiet) {
+            Write-Err "WARNING: '$repo' is tracked in the repo; its bind mount hides that content in the container."
+        }
+    }
+    $srPaths = @()
+    $srOthers = Invoke-Git -RepoDir $WsDir -GitArgs @('ls-files', '--others', '--exclude-standard', '--directory') -Quiet
+    if ($srOthers) { $srPaths += $srOthers -split "`n" }
+    $srPaths += @($HostMountRepos | ForEach-Object { "$_/" })
+    $srAdded = Add-SingleRepoExclude -RepoDir $WsDir -Paths $srPaths
+    if ($srAdded -gt 0) {
+        $srExcl = Invoke-Git -RepoDir $WsDir -GitArgs @('rev-parse', '--git-path', 'info/exclude') -Quiet
+        if (-not [System.IO.Path]::IsPathRooted($srExcl)) { $srExcl = Join-Path $WsDir $srExcl }
+        Write-Output "single-repo: excluded $srAdded generated path(s) via $srExcl"
+    }
+    # The state file's path relative to the source repo root, via git so that
+    # differently spelled prefixes can't make a string compare fail. Skipped
+    # when the config does not live inside the source repo at all.
+    if (Test-Path -LiteralPath $ClaudeAssetsSidecar) {
+        $cfgTop = Invoke-Git -RepoDir $ConfigDir -GitArgs @('rev-parse', '--show-toplevel') -AllowFailure -Quiet
+        $srcTop = Invoke-Git -RepoDir $SourceWs -GitArgs @('rev-parse', '--show-toplevel') -Quiet
+        if ($cfgTop -and $cfgTop -eq $srcTop) {
+            $prefix = Invoke-Git -RepoDir $ConfigDir -GitArgs @('rev-parse', '--show-prefix') -Quiet
+            $srState = "$prefix.claude-assets.state.json"
+            if (-not (Invoke-Git -RepoDir $SourceWs -GitArgs @('ls-files', '--', $srState) -Quiet)) {
+                if ((Add-SingleRepoExclude -RepoDir $SourceWs -Paths @($srState)) -gt 0) {
+                    Write-Output "single-repo: excluded $srState in the source repo"
+                }
+            }
+        }
+    }
+}
 
 # ============================================================================
 # Done

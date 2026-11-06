@@ -160,8 +160,11 @@ $EnvVarWorkspacesRoot = ($ProjectShort -replace '[^A-Za-z0-9]', '_').ToUpperInva
 # Resolve the workspaces root. Priority (see Resolve-WorkspacesRoot in
 # EnvConfig.ps1): --workspaces-root flag, env var, "workspacesRoot" in
 # devcontainers-config.json, then auto-detect from the config location.
-$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot
-$SourceWs = Join-Path $WorkspacesRoot $ProjectName
+# Single-repo mode ("." in "repos"): the source is the config's own git repo,
+# whatever its directory is called (see Get-SingleRepoSource in EnvConfig.ps1).
+$SingleRepoSource = Get-SingleRepoSource -Config $cfg
+$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot -SingleRepoSource $SingleRepoSource
+$SourceWs = if ($SingleRepoSource) { $SingleRepoSource } else { Join-Path $WorkspacesRoot $ProjectName }
 
 $DockerAvailable = $null -ne (Get-Command docker -ErrorAction SilentlyContinue)
 
@@ -250,7 +253,8 @@ $RepoNames = if ($MonoRepo) { @($ProjectName) } else { @($cfg.Repos | ForEach-Ob
 
 function Get-SourceRepoDir {
     param([Parameter(Mandatory = $true)][string] $Repo)
-    if ($MonoRepo) { return $SourceWs }
+    # Mono-/single-repo ('.'): the git repo lives at $SourceWs itself.
+    if ($MonoRepo -or $Repo -eq '.') { return $SourceWs }
     return (Join-Path $SourceWs $Repo)
 }
 
@@ -326,7 +330,8 @@ function Remove-IntellijDevcontainerConfig {
 # realise was there.
 $Dirty = @()
 foreach ($repo in $RepoNames) {
-    $wt = Join-Path $WsDir $repo
+    # Single-repo mode ('.'): the workspace root itself is the checkout.
+    $wt = if ($repo -eq '.') { $WsDir } else { Join-Path $WsDir $repo }
     # -PathType is deliberately unset: a worktree carries a .git *file*, a plain
     # clone a .git directory.
     if (-not (Test-Path -LiteralPath (Join-Path $wt '.git'))) { continue }
@@ -406,7 +411,8 @@ $Branch = ''   # remembered once read from a worktree (all repos share the name)
 
 foreach ($repo in $RepoNames) {
     $src = Get-SourceRepoDir -Repo $repo
-    $wt = Join-Path $WsDir $repo
+    # Single-repo mode ('.'): the workspace root itself is the checkout.
+    $wt = if ($repo -eq '.') { $WsDir } else { Join-Path $WsDir $repo }
     if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { continue }
 
     # Capture the branch name from the expected worktree path (for the optional
