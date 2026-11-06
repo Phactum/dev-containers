@@ -261,9 +261,9 @@ the repo) and you still want extra directories next to its sources, list it as
   `<workspaces-root>/<projectName>-<leaf>/`, so `.devcontainer/`, `.idea/`,
   `.claude/`, `README.md` etc. land in the repo's working tree.
 - Files the repo already tracks are **never overwritten**: if it has its own
-  `README.md`, `.idea/*.xml` or `.mvn/maven.config`, spawn keeps the repo's
-  version (the welcome README, the generated IntelliJ settings or the Maven
-  config are then missing for that file) and lists them.
+  `README.md` or `.idea/*.xml`, spawn keeps the repo's version (the welcome
+  README or the generated IntelliJ settings are then missing for that file) and
+  lists them.
 - Everything else spawn generates, plus each mounted directory, is added to the
   repo's `info/exclude`, so `git status` stays clean without touching
   `.gitignore`. In `worktree` mode that is the **source repo's**

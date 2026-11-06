@@ -2000,17 +2000,6 @@ splice_placeholder "${WS_DIR}/.idea/workspace.xml" "__TERMINAL_SHELL_OPTION__" "
 mkdir -p "${WS_DIR}/.idea"
 echo "${PROJECT_SHORT} ${LEAF}" > "${WS_DIR}/.idea/.name"
 
-# Belt-and-suspenders for Maven's local repository. The resolved settings.xml
-# that post-create.sh installs already pins <localRepository> to the in-container
-# path (see the m2 resolve step further down), which fixes both IntelliJ and the
-# CLI. This .mvn/maven.config adds a -Dmaven.repo.local override that Maven's
-# upward .mvn discovery applies to every repo and the warmup builds, so the CLI
-# stays correct even for a repo that ships its own settings.xml. Both point at
-# /home/vscode/.m2/repository -- the bind-mounted shared host cache. A .mvn dir is
-# not a pom, so it never becomes a false Maven parent.
-mkdir -p "${WS_DIR}/.mvn"
-echo "-Dmaven.repo.local=/home/vscode/.m2/repository" > "${WS_DIR}/.mvn/maven.config"
-
 # Pre-set the project SDK so opening a Java file in IntelliJ doesn't trigger a
 # "Project JDK is not defined" prompt. JDK 21 lives at
 # /usr/lib/jvm/msopenjdk-current in the Microsoft Java base image; IntelliJ's
@@ -2519,34 +2508,39 @@ fi
 #
 # M2_WHITELIST is the set of files Maven evaluates in ~/.m2 (the repository/ cache
 # aside). Each is copied and run through the same resolve step: <localRepository>
-# is rewritten to the absolute in-container path (present only in settings.xml; a
-# no-op in the others), and if settings.xml lacks the element one is injected.
-# Everything else -- servers, mirrors, ${env.TOKEN} placeholders resolved at
-# runtime via the forwarded env vars -- is preserved verbatim. A single-line
-# <localRepository> is assumed (the usual form); a rare multi-line one is left
-# untouched and .mvn/maven.config still covers the CLI. Plaintext credentials may
-# live here, hence 0600 on the resolved copies.
+# is REMOVED (present only in settings.xml; a no-op in the others), so Maven and
+# IntelliJ fall back to the default ~/.m2/repository, which in the container IS
+# the bind-mounted shared cache. Pinning an absolute /home/vscode/... path does
+# not work either: the Windows Gateway frontend turns it into C:\home\vscode\...
+# and appends that to the Linux home. Everything else -- servers, mirrors,
+# ${env.TOKEN} placeholders resolved at runtime via the forwarded env vars -- is
+# preserved verbatim. Plaintext credentials may live here, hence 0600 on the
+# resolved copies.
 #   settings.xml           user settings (servers, mirrors, localRepository)
 #   settings-security.xml  master-password store for encrypted passwords
 #   toolchains.xml         user toolchains -- WARNING: its <jdkHome>/tool paths are
 #                          HOST paths and will NOT resolve inside the container;
 #                          carried for completeness, adjust by hand if you use it
 M2_WHITELIST=(settings.xml settings-security.xml toolchains.xml)
-M2_REPO_CONTAINER="/home/vscode/.m2/repository"
 for _m2f in "${M2_WHITELIST[@]}"; do
     _m2_src="${HOME}/.m2/${_m2f}"
     [[ -f "${_m2_src}" ]] || continue
     _m2_dst="${WS_DIR}/.devcontainer/host-m2-${_m2f}.resolved"
-    # inject a <localRepository> (settings.xml only) before </settings> when none
-    # is present; replace the value of an existing single-line one otherwise.
-    _m2_inject=1
-    grep -q '<localRepository' "${_m2_src}" && _m2_inject=0
-    awk -v repo="${M2_REPO_CONTAINER}" -v inject="${_m2_inject}" '
-        /<localRepository>[^<]*<\/localRepository>/ && !done {
-            sub(/<localRepository>[^<]*<\/localRepository>/, "<localRepository>" repo "</localRepository>"); done=1
+    # Drop every <localRepository> element, also a multi-line one or one sharing
+    # its line with other content; a line left blank by the removal is dropped.
+    awk '
+        skip {
+            if (!/<\/localRepository>/) next
+            sub(/.*<\/localRepository>/, ""); skip = 0
+            if ($0 ~ /^[[:space:]]*$/) next
         }
-        inject == 1 && /<\/settings>/ && !done {
-            print "  <localRepository>" repo "</localRepository>"; done=1
+        /<localRepository>/ {
+            if (/<localRepository>[^<]*<\/localRepository>/) {
+                gsub(/[[:space:]]*<localRepository>[^<]*<\/localRepository>/, "")
+            } else {
+                sub(/[[:space:]]*<localRepository>.*/, ""); skip = 1
+            }
+            if ($0 ~ /^[[:space:]]*$/) next
         }
         { print }
     ' "${_m2_src}" > "${_m2_dst}"
@@ -2555,14 +2549,6 @@ for _m2f in "${M2_WHITELIST[@]}"; do
     [[ "${_m2f}" == "toolchains.xml" ]] && \
         echo "note: toolchains.xml carried verbatim -- its host JDK/tool paths won't resolve in the container" >&2
 done
-# No settings.xml on the host? Still emit a minimal one so IntelliJ never falls
-# back to its own ${user.home} default for the local repository.
-if [[ ! -f "${HOME}/.m2/settings.xml" ]]; then
-    printf '<settings>\n  <localRepository>%s</localRepository>\n</settings>\n' "${M2_REPO_CONTAINER}" \
-        > "${WS_DIR}/.devcontainer/host-m2-settings.xml.resolved"
-    chmod 600 "${WS_DIR}/.devcontainer/host-m2-settings.xml.resolved"
-    echo "note: no ~/.m2/settings.xml on host -- wrote a minimal one pinning localRepository"
-fi
 
 # Custom Dockerfile so we can patch the base image *before* devcontainer features run.
 # The MS Java base image carries an apt source for the Yarn Debian repo whose signing
@@ -3195,7 +3181,7 @@ cat > "${WS_DIR}/.devcontainer/devcontainer.json" <<'JSON'
         // Only the repository (dependency cache) is bind-mounted, so every story
         // container shares one download cache. settings.xml is deliberately NOT
         // mounted: spawn resolves it into host-m2-settings.resolved with
-        // <localRepository> pinned to this in-container path, and post-create.sh
+        // <localRepository> removed (default = this in-container path), and post-create.sh
         // installs that. A raw bind of the host settings.xml would carry its
         // ${user.home}/.m2/repository, which IntelliJ's Gateway frontend expands
         // to the WINDOWS home (C:\Users\...) and then breaks inside Linux.
@@ -3820,7 +3806,7 @@ if [[ -f "${RESOLVED_GIT_CREDENTIALS}" ]]; then
 fi
 
 # Install the resolved Maven config files (the M2_WHITELIST in spawn-workspace.sh;
-# each has its <localRepository> pinned to the in-container path). Only
+# each has its <localRepository> removed, so the default applies). Only
 # ~/.m2/repository is bind-mounted, so Docker created ~/.m2 as root when it
 # materialised that submount -- take ownership of the directory itself first
 # (NON-recursive: never chown the mounted repository/, which is huge and
@@ -4741,7 +4727,7 @@ substitute_placeholders "${WS_DIR}/README.md"
 
 # Single-repo mode: every generated file lives in the repo's working tree. Keep
 # them out of git without touching anything the repo tracks:
-#  1. A tracked file spawn overwrote (README.md, .idea/*.xml, .mvn/maven.config,
+#  1. A tracked file spawn overwrote (README.md, .idea/*.xml,
 #     AGENTS.md, ...) is restored to the repo's version. The checkout is fresh,
 #     so every modification at this point is spawn's own.
 #  2. Every remaining untracked path, plus each bind-mounted directory, goes into
