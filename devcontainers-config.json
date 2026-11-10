@@ -76,10 +76,12 @@
     // uses 'main' while everything else forks from 'development'.
     // Missing source repos are silently skipped.
     //
-    // MONO-REPO MODE: set "repos" to [] when the source workspace IS the git
-    // repo (no sub-directories per repo).
+    // SINGLE-REPO MODE: set "repos" to [] when the source workspace IS the git
+    // repo (no sub-directories per repo). The story workspace then holds that
+    // one repo in a sub-directory <workspace>/<projectName>/, like any other
+    // repo; the generated .devcontainer/, .idea/, ... sit next to it.
     //
-    // SINGLE-REPO MODE: an entry named "." (with a baseRef) makes the git repo
+    // MONO-REPO MODE: an entry named "." (with a baseRef) makes the git repo
     // this config lives in (any directory name; projectName only names the
     // story workspace) the source AND the story workspace root -- the worktree/clone
     // is created at the workspace root itself, and the generated .devcontainer/,
@@ -117,7 +119,7 @@
     //        non-Maven steps (a script) or a repo with several sub-dir poms,
     //        e.g. "cd a && mvn install && cd ../b && mvn install".
     //
-    // An explicit empty "builds": [] disables all warmup builds. Mono-repo
+    // An explicit empty "builds": [] disables all warmup builds. Single-repo
     // default: if the "builds" key is omitted entirely and a pom.xml exists at
     // the repo root, the project is built as a single Maven reactor ("install").
     "builds": [

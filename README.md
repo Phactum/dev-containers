@@ -181,49 +181,40 @@ this system", allow local scripts for your user once:
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-### Mono-repo support
+### Single-repo mode (`"repos": []`)
 
-Put a `devcontainers-config.json` in the repository (either at its root or in a
-`dev-containers/` subdirectory) and run the scripts from inside it:
-
-```shell
-my-mono-repo $ spawn-workspace.sh feature/my-awesome-feature
-my-mono-repo $ dispose-workspace.sh feature/my-awesome-feature
-```
-
-The story workspaces become siblings of the repository, because the auto-detect
-finds the directory named after `projectName` (the repository itself) and uses
-its parent. Set `"workspacesRoot"` (or pass `--workspaces-root`) to put them
-somewhere else.
+Your repository should be the IntelliJ project itself, without a wrapping
+workspace directory? Then have a look at
+[mono-repo mode](#mono-repo-mode-) instead; the
+[comparison](#one-repository-single-repo-vs-mono-repo-mode) below sums up the
+differences.
 
 Set `"repos": []` in `devcontainers-config.json`. The spawn script then operates in
-**mono-repo mode**:
+**single-repo mode**:
 
-- It creates a single worktree at `<workspace>/<PROJECT_NAME>/` directly from
-  the source workspace (the project directory itself), with no sub-directory lookup.
-- If no build list (`builds` / `mavenBuilds`) is configured **and** a `pom.xml`
-  exists at the project root, the script auto-populates a single
-  `install` Maven build so the warmup runs without manual
-  configuration.
+- It creates a single worktree (or clone) at `<workspace>/<PROJECT_NAME>/`
+  directly from the source workspace (the project directory itself), with no
+  sub-directory lookup. The auto-detect finds the workspaces root as the parent
+  of the directory named after `projectName`.
+- If the `builds` key is omitted entirely **and** a `pom.xml` exists at the
+  project root, the script auto-populates a single `install` Maven build so the
+  warmup runs without manual configuration. An explicit `"builds": []` disables
+  the warmup.
 - IntelliJ imports `$PROJECT_DIR$/<PROJECT_NAME>/pom.xml` as a single Maven
   project → equivalent to opening a classic single-module or multi-module Maven
   project.
 
-Minimal `devcontainers-config.json` for a mono-repo (fill in the project-specific values):
+Minimal `devcontainers-config.json` for single-repo mode (fill in the project-specific values):
 
 ```jsonc
 {
     "projectName": "my-awesome-repo",
     "projectShort": "mar",
-    // mono-repo: the source workspace IS the git repo
+    // single-repo: the source workspace IS the git repo
     "repos": [],
-    // Build steps. Each "command" is a raw bash command run inside "repo"
-    // (write "mvn ..." yourself). Omitting the key entirely, together with a
-    // root pom.xml, auto-selects a single "install" Maven build. The
-    // alternative "mavenBuilds" key instead treats each entry's "goal" as an
-    // mvn goal ("$"-prefix = raw command); if both keys are present,
-    // "mavenBuilds" wins.
-    "builds": [],
+    // "builds" omitted: with a root pom.xml a single "install" Maven build is
+    // run as warmup. Each entry sets "mvn-goal" (run as mvn <goal>) or
+    // "command" (raw bash) inside "repo".
     "hostPorts": [
         { "port": 8080, "label": "app" },
         { "port": 2222, "label": "ssh-tunnel" }
@@ -235,11 +226,16 @@ Minimal `devcontainers-config.json` for a mono-repo (fill in the project-specifi
 }
 ```
 
-### Single-repo mode (`"."`)
+### Mono-repo mode (`"."`)
 
-Mono-repo mode puts the repository in a sub-directory of the story workspace.
+You want everything as with several repos, just with a single one in a
+sub-directory of the story workspace? Then have a look at
+[single-repo mode](#single-repo-mode-repos-) instead; the
+[comparison](#one-repository-single-repo-vs-mono-repo-mode) below sums up the
+differences.
+
 If the repository itself should be the workspace root (the IntelliJ project is
-the repo) and you still want extra directories next to its sources, list it as
+the repo), optionally with extra directories next to its sources, list it as
 `"."`:
 
 ```jsonc
@@ -282,6 +278,51 @@ the repo) and you still want extra directories next to its sources, list it as
   link is relative); use `clone` otherwise.
 - Dispose removes the whole workspace with the worktree; `--delete-branch`
   deletes the branch in the source repo as usual.
+
+### One repository: single-repo vs. mono-repo mode
+
+A project that consists of a single git repository can be set up in two ways.
+Both use the repository the config belongs to as the source (no
+sub-directories per repo); they differ in **where the checkout lands** in the
+story workspace:
+
+```
+single-repo ("repos": [])              mono-repo ("repos": [{ "name": ".", ... }])
+<workspace>/                           <workspace>/          <- the repo itself
+├── .devcontainer/                     ├── .devcontainer/    (kept out of git)
+├── .idea/                             ├── .idea/            (kept out of git)
+├── README.md                          ├── pom.xml
+└── <projectName>/   <- the repo       ├── src/
+    ├── pom.xml                        └── data/             <- optional host mount
+    └── src/
+```
+
+- **Single-repo**: everything as with several repos, just with one of them.
+  The repo sits in a sub-directory, the generated files sit next to it.
+- **Mono-repo**: the repo *is* the workspace, as when you open it directly in
+  IntelliJ (submodules included). The generated files live in its working tree.
+
+| | single-repo (`"repos": []`) | mono-repo (`"."` entry) |
+|---|---|---|
+| Checkout location | `<workspace>/<projectName>/` | `<workspace>/` itself |
+| Generated `.devcontainer/`, `.idea/`, `.claude/`, `README.md` | next to the repo | in the repo's working tree, hidden via `info/exclude`; files the repo tracks are never overwritten |
+| Source repo lookup | `<workspaces-root>/<projectName>`, so the directory must be named after `projectName` | the git repo containing the config, any directory name |
+| `baseRef` | none: `--base`, otherwise `origin/HEAD` | required on `"."` |
+| Further `repos` entries | none | directories without `baseRef`, bind-mounted inside the repo |
+| `repoMode` | all three, including `container` | `worktree` or `clone` only |
+| Warmup build | auto `mvn install` if `builds` is omitted and a root `pom.xml` exists | only what `builds` lists (`"repo": "."`) |
+| IntelliJ Maven import | `$PROJECT_DIR$/<projectName>/pom.xml` | `$PROJECT_DIR$/pom.xml` |
+
+In both modes put a `devcontainers-config.json` in the repository (either at its
+root or in a `dev-containers/` subdirectory) and run the scripts from inside it:
+
+```shell
+my-repo $ spawn-workspace.sh feature/my-awesome-feature
+my-repo $ dispose-workspace.sh feature/my-awesome-feature
+```
+
+The story workspaces become siblings of the repository. Set `"workspacesRoot"`
+(or pass `--workspaces-root`) to put them somewhere else.
 
 ### Rocky Linux / RHEL-family base (`distro`)
 

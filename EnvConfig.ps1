@@ -34,7 +34,7 @@
         BuildsDefined     bool -- whether the "builds" key was present
         ClaudeCodeEnabled bool -- install Claude Code in post-create.sh
         CopilotEnabled    bool -- install the GitHub Copilot CLI in post-create.sh
-        MonoRepo          $true when Repos is empty
+        SingleRepo        $true when Repos is empty
         WorkspacesRoot    '' unless the project pins one
         Path              the resolved config path
         Dir               its directory (base dir for the other project assets)
@@ -111,7 +111,7 @@ function Resolve-DevContainerConfigPath {
         <root>\<PROJECT_NAME>\devcontainers-config.json                  (config in the project root)
     If no such directory is found (the project directory has a different name),
     it falls back to two levels above the config, the historical behaviour.
-    In single-repo mode (-SingleRepoSource, see Get-SingleRepoSource) the
+    In mono-repo mode (-MonoRepoSource, see Get-MonoRepoSource) the
     auto-detect is simply the parent of that repo, whatever its name.
 #>
 function Resolve-WorkspacesRoot {
@@ -120,7 +120,7 @@ function Resolve-WorkspacesRoot {
         [Parameter(Mandatory = $true)] $Config,
         [AllowEmptyString()][string] $Cli = '',
         [Parameter(Mandatory = $true)][string] $EnvVarName,
-        [AllowEmptyString()][string] $SingleRepoSource = ''
+        [AllowEmptyString()][string] $MonoRepoSource = ''
     )
 
     $candidate = ''
@@ -137,8 +137,8 @@ function Resolve-WorkspacesRoot {
             if (-not [System.IO.Path]::IsPathRooted($candidate)) {
                 $candidate = Join-Path $Config.Dir $candidate
             }
-        } elseif ($SingleRepoSource) {
-            $candidate = Join-Path $SingleRepoSource '..'
+        } elseif ($MonoRepoSource) {
+            $candidate = Join-Path $MonoRepoSource '..'
         } else {
             $dir = $Config.Dir
             for ($i = 0; $i -lt 3 -and $dir; $i++) {
@@ -167,7 +167,7 @@ function Resolve-WorkspacesRoot {
 
 <#
 .SYNOPSIS
-    Single-repo source, shared by spawn and dispose.
+    Mono-repo source, shared by spawn and dispose.
 
 .DESCRIPTION
     When "repos" has an entry named "." the source repo is the git repo the
@@ -177,11 +177,11 @@ function Resolve-WorkspacesRoot {
     (next to initialize.sh, runConfigurations\, ...); a config directory named
     dev-containers is skipped explicitly, so this also holds when that
     directory is a git repo of its own (submodule, nested clone).
-    Returns that repo's absolute top level, or '' (not single-repo, or the
-    config is not inside a git repo; spawn's single-repo validation then
+    Returns that repo's absolute top level, or '' (not mono-repo, or the
+    config is not inside a git repo; spawn's mono-repo validation then
     reports the missing repo).
 #>
-function Get-SingleRepoSource {
+function Get-MonoRepoSource {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)] $Config)
 
@@ -322,7 +322,7 @@ function Get-DevContainerConfig {
         # to on; "aiTools" narrows the set (see below).
         ClaudeCodeEnabled  = $true
         CopilotEnabled     = $true
-        MonoRepo           = $false
+        SingleRepo         = $false
     }
 
     foreach ($required in 'ProjectName', 'ProjectShort', 'BaseImage', 'NodeFeatureVersion') {
@@ -359,9 +359,9 @@ function Get-DevContainerConfig {
             [pscustomobject]@{ Name = [string]$r.name; BaseRef = $baseRef }
         })
     }
-    # Mono-repo mode: an empty repos list signals that the source workspace IS
+    # Single-repo mode: an empty repos list signals that the source workspace IS
     # the git repo. The callers synthesise a single virtual entry from it.
-    $cfg.MonoRepo = ($cfg.Repos.Count -eq 0)
+    $cfg.SingleRepo = ($cfg.Repos.Count -eq 0)
 
     if ((& $has 'hostPorts') -and $null -ne $json.hostPorts) {
         $cfg.HostPorts = @(foreach ($p in $json.hostPorts) {
@@ -433,7 +433,7 @@ function Get-DevContainerConfig {
     # "mvn-goal" (Type=mvn, run as `mvn ${MVN_FLAGS} <goal>`) or "command"
     # (Type=cmd, run verbatim). BuildsDefined records whether the key was present,
     # so an explicit "builds": [] disables warmup builds without triggering the
-    # mono-repo auto-build (same as the Bash side).
+    # single-repo auto-build (same as the Bash side).
     if (& $has 'builds') {
         $cfg.BuildsDefined = $true
         if ($null -ne $json.builds) {

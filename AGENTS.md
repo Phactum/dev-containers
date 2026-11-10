@@ -136,15 +136,15 @@ Things that follow from this and must stay in lockstep across both ports:
   source repos. Worktree branches are deleted there; clone/container report that
   the branch lived in the removed clone/container.
 
-### Single-repo mode (`"."` in `repos`)
+### Mono-repo mode (`"."` in `repos`)
 
-A `repos` entry named `.` sets `SINGLE_REPO` / `$SingleRepo`: the source
-workspace is the git repo (as in mono-repo mode) **and** it is checked out at the
+A `repos` entry named `.` sets `MONO_REPO` / `$MonoRepo`: the source
+workspace is the git repo (as in single-repo mode) **and** it is checked out at the
 workspace root (`WS_DIR`, not `WS_DIR/<repo>`). Things to keep in lockstep:
 
 - **Source location:** `SOURCE_WS` is the git top level of `CONFIG_DIR` (of its
   parent when `CONFIG_DIR` is named `dev-containers`)
-  (`single_repo_source` / `Get-SingleRepoSource`, shared by spawn and dispose),
+  (`mono_repo_source` / `Get-MonoRepoSource`, shared by spawn and dispose),
   NOT `<root>/<projectName>` -- the repo's directory name is free, `projectName`
   only names `WS_DIR`, container and volumes. It is computed before the
   workspaces root, whose auto-detect (step 4) then is that repo's parent. The
@@ -158,7 +158,7 @@ workspace root (`WS_DIR`, not `WS_DIR/<repo>`). Things to keep in lockstep:
   config must be inside a git repo that does not track `.devcontainer/`.
 - **Paths:** `.` maps to `SOURCE_WS` / `WS_DIR` (never `.../.` -- `rm -rf dir/.`
   fails) in `create_worktree` / `create_clone`, the source-repo git config loop
-  and both dispose loops. Mono-repo mode is untouched.
+  and both dispose loops. Single-repo mode is untouched.
 - **Root modules:** a `pom.xml` / `package.json` at `WS_DIR` is recorded as `.`
   and gets volumes with slug `root` mounted at `__WORKSPACE_PATH__/target` /
   `node_modules`; IntelliJ's pom list uses `$PROJECT_DIR$/pom.xml`.
@@ -255,7 +255,7 @@ where a workspace lives. Priority:
 4. auto-detect: walk up from `CONFIG_DIR` to the directory named `projectName`
    (the source workspace) and take its parent; fall back to two levels above
    `CONFIG_DIR` (the historical rule) when no such directory is found. In
-   single-repo mode the auto-detect is the parent of the config's git repo
+   mono-repo mode the auto-detect is the parent of the config's git repo
 
 The walk-up is what makes both `<root>/<PROJECT>/devcontainers-config.json` and
 `<root>/<PROJECT>/dev-containers/devcontainers-config.json` resolve to `<root>` without any
@@ -289,7 +289,7 @@ value are NOT supported.
 
 Optional settings are disabled by **omitting the key** (or setting it to `null`
 / `""`). The warmup `builds` list keys off *presence*: an explicit `[]` disables
-all warmup builds, while omitting the key entirely lets the mono-repo auto-build
+all warmup builds, while omitting the key entirely lets the single-repo auto-build
 kick in. Each `builds` entry must set exactly one of `mvn-goal` / `command`.
 
 When adding a setting: extend `devcontainers-config.json` (with a comment), map it in
@@ -528,7 +528,7 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   Docker Desktop / Colima `--memory` only CAPS a container within the shared VM's
   RAM — it never adds headroom; only a bigger VM does. More swap does cut OOM
   kills on spikes.
-- **Mono-repo mode:** `"repos": []` switches spawn to single-worktree mode; if
+- **Single-repo mode:** `"repos": []` switches spawn to single-worktree mode; if
   the `builds` key is omitted entirely (not merely `[]`) and a root `pom.xml`
   exists it auto-populates a single `install` `mvn-goal` build.
 - **Host-mount repos (empty base ref).** A `repos` entry with an empty `baseRef`
@@ -540,7 +540,7 @@ function names in `PascalCase-Verb` form, so the two read side by side:
   created in the story workspace as the mountpoint; it stays empty on the host,
   so the dispose scripts' recursive delete never touches the source. Dispose
   needs no special case â€” its worktree/branch loops are already `.git`-guarded
-  and skip non-git dirs. Guarded by the mono-repo flag so mono-repo's synthetic
+  and skip non-git dirs. Guarded by the single-repo flag so single-repo's synthetic
   empty-base-ref entry still builds a worktree.
 - **Missing host-mount dirs.** Right after the confirmation prompt (before
   anything is created) spawn checks every `repos` entry WITHOUT `baseRef` for

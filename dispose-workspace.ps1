@@ -160,11 +160,11 @@ $EnvVarWorkspacesRoot = ($ProjectShort -replace '[^A-Za-z0-9]', '_').ToUpperInva
 # Resolve the workspaces root. Priority (see Resolve-WorkspacesRoot in
 # EnvConfig.ps1): --workspaces-root flag, env var, "workspacesRoot" in
 # devcontainers-config.json, then auto-detect from the config location.
-# Single-repo mode ("." in "repos"): the source is the config's own git repo,
-# whatever its directory is called (see Get-SingleRepoSource in EnvConfig.ps1).
-$SingleRepoSource = Get-SingleRepoSource -Config $cfg
-$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot -SingleRepoSource $SingleRepoSource
-$SourceWs = if ($SingleRepoSource) { $SingleRepoSource } else { Join-Path $WorkspacesRoot $ProjectName }
+# Mono-repo mode ("." in "repos"): the source is the config's own git repo,
+# whatever its directory is called (see Get-MonoRepoSource in EnvConfig.ps1).
+$MonoRepoSource = Get-MonoRepoSource -Config $cfg
+$WorkspacesRoot = Resolve-WorkspacesRoot -Config $cfg -Cli $WorkspacesRootCli -EnvVarName $EnvVarWorkspacesRoot -MonoRepoSource $MonoRepoSource
+$SourceWs = if ($MonoRepoSource) { $MonoRepoSource } else { Join-Path $WorkspacesRoot $ProjectName }
 
 $DockerAvailable = $null -ne (Get-Command docker -ErrorAction SilentlyContinue)
 
@@ -245,16 +245,16 @@ if (-not $AssumeYes) {
     }
 }
 
-# Mono-repo mode: an empty "repos" list in devcontainers-config.json signals that the source
+# Single-repo mode: an empty "repos" list in devcontainers-config.json signals that the source
 # workspace IS the git repo. Synthesise a single virtual entry so all downstream
 # loops work without special-casing each one (mirrors the spawn script).
-$MonoRepo = $cfg.MonoRepo
-$RepoNames = if ($MonoRepo) { @($ProjectName) } else { @($cfg.Repos | ForEach-Object { $_.Name }) }
+$SingleRepo = $cfg.SingleRepo
+$RepoNames = if ($SingleRepo) { @($ProjectName) } else { @($cfg.Repos | ForEach-Object { $_.Name }) }
 
 function Get-SourceRepoDir {
     param([Parameter(Mandatory = $true)][string] $Repo)
-    # Mono-/single-repo ('.'): the git repo lives at $SourceWs itself.
-    if ($MonoRepo -or $Repo -eq '.') { return $SourceWs }
+    # Single-/mono-repo ('.'): the git repo lives at $SourceWs itself.
+    if ($SingleRepo -or $Repo -eq '.') { return $SourceWs }
     return (Join-Path $SourceWs $Repo)
 }
 
@@ -330,7 +330,7 @@ function Remove-IntellijDevcontainerConfig {
 # realise was there.
 $Dirty = @()
 foreach ($repo in $RepoNames) {
-    # Single-repo mode ('.'): the workspace root itself is the checkout.
+    # Mono-repo mode ('.'): the workspace root itself is the checkout.
     $wt = if ($repo -eq '.') { $WsDir } else { Join-Path $WsDir $repo }
     # -PathType is deliberately unset: a worktree carries a .git *file*, a plain
     # clone a .git directory.
@@ -411,7 +411,7 @@ $Branch = ''   # remembered once read from a worktree (all repos share the name)
 
 foreach ($repo in $RepoNames) {
     $src = Get-SourceRepoDir -Repo $repo
-    # Single-repo mode ('.'): the workspace root itself is the checkout.
+    # Mono-repo mode ('.'): the workspace root itself is the checkout.
     $wt = if ($repo -eq '.') { $WsDir } else { Join-Path $WsDir $repo }
     if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { continue }
 

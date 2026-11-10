@@ -34,7 +34,7 @@
 # `mvn ${MVN_FLAGS} <value>`) or "command" (type=cmd, run verbatim inside the
 # repo). The value may itself contain ':' (e.g. a URL), so only the repo and the
 # type are split off at use sites. BUILDS_DEFINED lets spawn-workspace.sh tell
-# "no builds key" (mono-repo auto-build applies) from "builds": [] (warmup
+# "no builds key" (single-repo auto-build applies) from "builds": [] (warmup
 # builds disabled on purpose).
 
 # The caller normally sets CONFIG_JSON. Falling back to a devcontainers-config.json
@@ -269,7 +269,7 @@ done < <(_env_records '(.proxy.caCertificates // [])[]')
 # "mvn-goal" or "command". Normalise every entry to "<repo>:<type>:<value>"
 # (type = mvn|cmd) and fail loudly on any entry that sets both or neither.
 # BUILDS_DEFINED records whether the key was present at all -- an explicit
-# "builds": [] disables warmup builds without triggering the mono-repo auto-build.
+# "builds": [] disables warmup builds without triggering the single-repo auto-build.
 BUILDS=()
 BUILDS_DEFINED=0
 if _env_json_stripped | jq -e 'has("builds")' >/dev/null; then
@@ -327,7 +327,7 @@ unset _rec _required
 #     <root>/<PROJECT_NAME>/devcontainers-config.json                  (config in the project root)
 # If no such directory is found (the project directory has a different name),
 # it falls back to two levels above CONFIG_DIR, the historical behaviour.
-# In single-repo mode (SINGLE_REPO_SOURCE set, see single_repo_source below) the
+# In mono-repo mode (MONO_REPO_SOURCE set, see mono_repo_source below) the
 # auto-detect is simply the parent of that repo, whatever its name.
 #
 # Echoes the resolved absolute path; the caller assigns it.
@@ -346,8 +346,8 @@ resolve_workspaces_root() {
         # A relative path in devcontainers-config.json is relative to the config itself, so a
         # project can commit e.g. "workspacesRoot": ".." and stay portable.
         [[ "${candidate}" != /* ]] && candidate="${CONFIG_DIR}/${candidate}"
-    elif [[ -n "${SINGLE_REPO_SOURCE:-}" ]]; then
-        candidate="${SINGLE_REPO_SOURCE}/.."
+    elif [[ -n "${MONO_REPO_SOURCE:-}" ]]; then
+        candidate="${MONO_REPO_SOURCE}/.."
     else
         local dir="${CONFIG_DIR}"
         local i
@@ -378,18 +378,18 @@ resolve_workspaces_root() {
 }
 
 # ---------------------------------------------------------------------------
-# Single-repo source, shared by spawn and dispose. When "repos" has an entry
+# Mono-repo source, shared by spawn and dispose. When "repos" has an entry
 # named "." the source repo is the git repo the config lives in -- its
 # directory name need not match projectName (projectName only names the story
 # workspace, container and volumes). The config may sit in the repo root or in
 # its dev-containers/ sub-directory (next to initialize.sh, runConfigurations/,
 # ...); a CONFIG_DIR named dev-containers is skipped explicitly, so this also
 # holds when that directory is a git repo of its own (submodule, nested clone).
-# Echoes that repo's absolute top level, or nothing (not single-repo, or the
-# config is not inside a git repo; spawn's single-repo validation then reports
+# Echoes that repo's absolute top level, or nothing (not mono-repo, or the
+# config is not inside a git repo; spawn's mono-repo validation then reports
 # the missing repo).
 # ---------------------------------------------------------------------------
-single_repo_source() {
+mono_repo_source() {
     local entry base="${CONFIG_DIR}"
     (( ${#REPOS[@]} > 0 )) || return 0
     [[ "$(basename "${CONFIG_DIR}")" == "dev-containers" ]] && base="$(dirname "${CONFIG_DIR}")"
