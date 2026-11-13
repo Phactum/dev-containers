@@ -135,6 +135,13 @@
 #    __DEB_BLOCK_*__ / __RPM_BLOCK_*__ markers in the templates below; exactly
 #    one side survives substitute_placeholders. Default is "debian", which
 #    produces exactly the previous output.
+#    Maven source order on rocky: the optional "mavenDownloadUrl" (internal
+#    mirror, .zip or .tar.gz, '{version}' substituted; Basic auth from the host
+#    env var named by "mavenDownloadTokenEnv", handed to the base-image build
+#    as a BuildKit secret so it never enters a layer), then dlcdn/archive
+#    .apache.org, then the AppStream package as last resort. The resulting
+#    /usr/local/bin/mvn link is why post-create's /usr/local/bin linking loop
+#    skips tools that already resolve there (ln -sf would self-reference).
 #
 # 7. Constant in-container workspace path: /workspaces/<PROJECT_NAME>
 #    Every story container mounts the workspace at the same path. Claude Code
@@ -663,6 +670,14 @@ if (( IS_ROCKY )); then
     JAVA_HOME_PATH="/usr/lib/jvm/devcontainer-java"
     SYSTEM_BASHRC="/etc/bashrc"
     echo "distro:           rocky (jdk ${JAVA_VERSION}, maven ${MAVEN_VERSION}, node ${NODE_FEATURE_VERSION}, no devcontainer features)"
+fi
+# Optional internal Maven mirror (rocky Dockerfile), '{version}' resolved here.
+MAVEN_DOWNLOAD_URL="${MAVEN_DOWNLOAD_URL//\{version\}/${MAVEN_VERSION}}"
+if (( IS_ROCKY )) && [[ -n "${MAVEN_DOWNLOAD_URL}" ]]; then
+    echo "maven mirror:     ${MAVEN_DOWNLOAD_URL}"
+    if [[ -n "${MAVEN_DOWNLOAD_TOKEN_ENV}" && -z "${!MAVEN_DOWNLOAD_TOKEN_ENV:-}" ]]; then
+        echo "WARN: \$${MAVEN_DOWNLOAD_TOKEN_ENV} is not set -- the maven mirror is tried without auth" >&2
+    fi
 fi
 
 # Derive name-only list from REPOS (which is a "<name>:<base-ref>" map).
@@ -2748,16 +2763,44 @@ ENV JAVA_HOME=__JAVA_HOME__
 # the JAVA_VERSION installed above -- so both get pinned back to __JAVA_HOME__
 # unconditionally, regardless of which Maven branch ran.
 ARG MAVEN_VERSION=__MAVEN_VERSION__
-RUN set -eux; \
-    if curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
-       || curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; \
-    then \
+# Optional first source: "mavenDownloadUrl" in devcontainers-config.json (an
+# internal mirror, e.g. a Nexus maven-public repo; .zip or .tar.gz, picked by
+# the URL's suffix). If "mavenDownloadTokenEnv" names a host env var holding
+# base64(user:password), spawn hands it to this build as an optional BuildKit
+# secret and it goes out as Basic auth -- it never lands in an image layer or
+# in `docker history`. Empty URL: straight to apache.org.
+RUN --mount=type=secret,id=maven_dl_token,required=false \
+    set -eux; \
+    mirror='__MAVEN_DOWNLOAD_URL__'; \
+    rm -rf /tmp/maven.tgz /tmp/maven.zip /tmp/maven-unzip; \
+    got=""; \
+    if [ -n "$mirror" ]; then \
+        case "$mirror" in *.zip) kind=zip ;; *) kind=tgz ;; esac; \
+        if [ -s /run/secrets/maven_dl_token ]; then \
+            if curl -fsSL -H "Authorization: Basic $(cat /run/secrets/maven_dl_token)" "$mirror" -o /tmp/maven.$kind; then got=$kind; fi; \
+        else \
+            if curl -fsSL "$mirror" -o /tmp/maven.$kind; then got=$kind; fi; \
+        fi; \
+    fi; \
+    if [ -z "$got" ]; then \
+        if curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
+           || curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; then \
+            got=tgz; \
+        fi; \
+    fi; \
+    if [ -n "$got" ]; then \
         mkdir -p /opt/maven; \
-        tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1; \
-        rm -f /tmp/maven.tgz; \
+        if [ "$got" = zip ]; then \
+            unzip -q /tmp/maven.zip -d /tmp/maven-unzip; \
+            cp -a /tmp/maven-unzip/*/. /opt/maven/; \
+            rm -rf /tmp/maven-unzip; \
+        else \
+            tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1; \
+        fi; \
+        rm -f /tmp/maven.tgz /tmp/maven.zip; \
         ln -sfn /opt/maven/bin/mvn /usr/local/bin/mvn; \
     else \
-        echo "note: apache.org unreachable -- falling back to the AppStream maven package (older, fixed version)" >&2; \
+        echo "WARNING: Maven ${MAVEN_VERSION} not downloadable (mavenDownloadUrl unset/failed, apache.org unreachable) -- falling back to the AppStream maven package (older, fixed version)" >&2; \
         dnf -y install --setopt=install_weak_deps=False maven; \
         dnf clean all; \
         rm -rf /var/cache/dnf; \
@@ -3914,6 +3957,12 @@ sudo chown vscode:vscode /home/vscode/.copilot || true
 for cmd in mvn claude bpmn-to-image; do
     real="$(bash -lc "command -v ${cmd}" 2>/dev/null || true)"
     if [[ -n "${real}" ]]; then
+        # Already there (e.g. the rocky Dockerfile links /usr/local/bin/mvn ->
+        # /opt/maven/bin/mvn): ln -sf would replace it with a self-reference.
+        if [[ "${real}" == "/usr/local/bin/${cmd}" ]]; then
+            echo "already on /usr/local/bin: ${cmd}"
+            continue
+        fi
         sudo ln -sf "${real}" "/usr/local/bin/${cmd}"
         echo "linked ${cmd} -> ${real}"
     else
@@ -4605,6 +4654,8 @@ chmod +x "${WS_DIR}/.devcontainer/post-start.sh"
 # are needed by the port-reservation scan from sibling workspaces, which we
 # do before the rest of the heredocs are even written).
 substitute_placeholders "${WS_DIR}/.devcontainer/Dockerfile"
+# A URL may contain '&' / '|', so it bypasses the sed pass.
+splice_placeholder "${WS_DIR}/.devcontainer/Dockerfile" "__MAVEN_DOWNLOAD_URL__" "${MAVEN_DOWNLOAD_URL}"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-create.sh"
 substitute_placeholders "${WS_DIR}/.devcontainer/post-start.sh"
 
@@ -4680,6 +4731,12 @@ if (( REBUILD_BASE_IMAGE == 1 || BASE_EXISTS == 0 )); then
         if [[ -n "${PROXY_NO}" ]]; then
             _docker_build_args+=(--build-arg "NO_PROXY=${PROXY_NO}" --build-arg "no_proxy=${PROXY_NO}")
         fi
+    fi
+    # The rocky Dockerfile uses RUN --mount (BuildKit only).
+    export DOCKER_BUILDKIT=1
+    if [[ -n "${MAVEN_DOWNLOAD_TOKEN_ENV}" && -n "${!MAVEN_DOWNLOAD_TOKEN_ENV:-}" ]]; then
+        # BuildKit secret, read from the env var -- never put on the command line
+        _docker_build_args+=(--secret "id=maven_dl_token,env=${MAVEN_DOWNLOAD_TOKEN_ENV}")
     fi
     _docker_build_args+=("${WS_DIR}/.devcontainer")
     if ! docker "${_docker_build_args[@]}"; then

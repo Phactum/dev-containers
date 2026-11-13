@@ -172,6 +172,20 @@ fi
 # where the java:1 feature provides Maven and the base image the JDK.
 JAVA_VERSION="$(_env_scalar '.javaVersion // "21"')"
 MAVEN_VERSION="$(_env_scalar '.mavenVersion // "3.9.9"')"
+# Rocky only, optional: Maven distribution tried BEFORE apache.org (internal
+# mirror). '{version}' is replaced by MAVEN_VERSION in the spawn script. The
+# token env var NAMES a host variable holding base64(user:password).
+MAVEN_DOWNLOAD_URL="$(_env_scalar '.mavenDownloadUrl // ""')"
+MAVEN_DOWNLOAD_TOKEN_ENV="$(_env_scalar '.mavenDownloadTokenEnv // ""')"
+case "${MAVEN_DOWNLOAD_URL}" in
+    *[[:space:]\'\\]*)
+        echo "Invalid 'mavenDownloadUrl' in ${ENV_JSON}: must not contain whitespace, quotes or backslashes" >&2
+        exit 1 ;;
+esac
+if [[ -n "${MAVEN_DOWNLOAD_TOKEN_ENV}" && ! "${MAVEN_DOWNLOAD_TOKEN_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "Invalid 'mavenDownloadTokenEnv' in ${ENV_JSON}: '${MAVEN_DOWNLOAD_TOKEN_ENV}' is not an environment variable name" >&2
+    exit 1
+fi
 
 # Arrays. Read NUL-separated so values containing spaces (build commands, port
 # labels) survive intact, and so an empty list yields an empty array rather

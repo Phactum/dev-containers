@@ -340,6 +340,22 @@ Rocky Linux 9 → or any RHEL-compatible base (Alma, CentOS Stream, UBI):
 }
 ```
 
+Where apache.org is blocked, Maven can come from an internal mirror first:
+
+```jsonc
+{
+    // {version} -> mavenVersion; .zip is unzipped, anything else untarred
+    "mavenDownloadUrl": "https://nexus.example.lan/repository/maven-public/org/apache/maven/apache-maven/{version}/apache-maven-{version}-bin.zip",
+    // host env var with base64("user:password"), sent as Basic auth
+    "mavenDownloadTokenEnv": "NEXUS_TOKEN_BASE64"
+}
+```
+
+The token reaches the base-image build as a BuildKit secret, so it never ends
+up in an image layer or in `docker history`. If the variable is not set, spawn
+warns and tries the URL without auth. A failed download falls back to
+apache.org and finally to the (older) AppStream `maven` package.
+
 What changes under the hood:
 
 | | `debian` (default) | `rocky` |

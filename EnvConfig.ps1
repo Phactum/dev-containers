@@ -262,6 +262,11 @@ function Get-DevContainerConfig {
         # JDK.
         JavaVersion        = & $str 'javaVersion' '21'
         MavenVersion       = & $str 'mavenVersion' '3.9.9'
+        # Rocky only, optional: Maven distribution tried BEFORE apache.org
+        # (internal mirror; '{version}' -> MavenVersion) and the NAME of a host
+        # env var holding base64(user:password) for its Basic auth.
+        MavenDownloadUrl      = & $str 'mavenDownloadUrl'
+        MavenDownloadTokenEnv = & $str 'mavenDownloadTokenEnv'
         GlabVersion        = & $str 'glabVersion'
         GlabHostname       = & $str 'glabHostname'
         GhVersion          = & $str 'ghVersion'
@@ -338,6 +343,12 @@ function Get-DevContainerConfig {
         throw "Invalid 'distro' in $($cfg.Path): '$($cfg.Distro)' (expected 'debian' or 'rocky')"
     }
 
+    if ($cfg.MavenDownloadUrl -match "[\s'\\]") {
+        throw "Invalid 'mavenDownloadUrl' in $($cfg.Path): must not contain whitespace, quotes or backslashes"
+    }
+    if ($cfg.MavenDownloadTokenEnv -and $cfg.MavenDownloadTokenEnv -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+        throw "Invalid 'mavenDownloadTokenEnv' in $($cfg.Path): '$($cfg.MavenDownloadTokenEnv)' is not an environment variable name"
+    }
     if ($cfg.RepoMode -notin @('worktree', 'clone', 'container')) {
         throw "Invalid 'repoMode' in $($cfg.Path): '$($cfg.RepoMode)' (expected 'worktree', 'clone' or 'container')"
     }

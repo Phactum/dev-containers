@@ -285,6 +285,19 @@
     "javaVersion": "21",
     "mavenVersion": "3.9.9",
 
+    // Rocky only, OPTIONAL: Maven distribution tried BEFORE apache.org, for
+    // networks that block the open internet (e.g. a Nexus maven-public repo).
+    // "{version}" is replaced by mavenVersion; a ".zip" suffix is unzipped,
+    // anything else is treated as .tar.gz. Changing it rebuilds the base image.
+    // A failed download falls back to apache.org, then to the AppStream package.
+    //   "mavenDownloadUrl": "https://nexus.example.lan/repository/maven-public/org/apache/maven/apache-maven/{version}/apache-maven-{version}-bin.zip",
+    //
+    // Name of a HOST environment variable holding base64("user:password") for
+    // that URL (sent as Basic auth). Passed to the base-image build as a
+    // BuildKit secret, so it never ends up in an image layer or `docker
+    // history`. Unset on the host -> warning, download tried without auth.
+    //   "mavenDownloadTokenEnv": "NEXUS_TOKEN_BASE64",
+
     // Node version. On Debian this is the version of the devcontainers/node
     // feature; on Rocky it is the NodeSource major version (setup_<n>.x).
     "nodeFeatureVersion": "24",

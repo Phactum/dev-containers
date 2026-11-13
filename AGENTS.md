@@ -186,7 +186,7 @@ to reproduce by hand, because the devcontainer features are Debian/Ubuntu-only
 |---|---|
 | base image's user | `vscode` (uid/gid 1000) + `sudoers.d` drop-in with a widened `secure_path` |
 | `java:1` | `java-<javaVersion>-openjdk-devel` from dnf, plus a `/usr/lib/jvm/devcontainer-java` symlink so `JAVA_HOME` has one stable value |
-| `java:1` (`installMaven`) | Apache binary tarball into `/opt/maven`, `mvn` linked into `/usr/local/bin` |
+| `java:1` (`installMaven`) | Apache binary tarball into `/opt/maven`, `mvn` linked into `/usr/local/bin`; optional `mavenDownloadUrl` mirror tried first (Basic auth via BuildKit secret from the env var named by `mavenDownloadTokenEnv`). post-create's `/usr/local/bin` link loop must skip tools already resolving there, or `ln -sf` makes `mvn` a self-reference |
 | `node:1` | NodeSource `setup_<major>.x`, AppStream module as fallback; npm's global prefix moved to `/usr/local` and chowned to `vscode` so `npm install -g` needs no sudo |
 | `docker-in-docker:2` | `docker-ce` from Docker's RHEL repo; `--privileged`, `--init` and the `/var/lib/docker` volume are declared in `devcontainer.json` instead of coming from feature metadata |
 

@@ -66,7 +66,9 @@
        devcontainer.json adds the --privileged/--init flags and the
        /var/lib/docker volume that the docker-in-docker feature would otherwise
        contribute. Default is "debian", which produces exactly the previous
-       output.
+       output. Maven comes from the optional "mavenDownloadUrl" mirror first
+       (Basic auth from the env var named by "mavenDownloadTokenEnv", passed
+       as a BuildKit secret), then apache.org, then the AppStream package.
 
 .PARAMETER Arguments
     Positional/flag arguments, accepted in the same spelling as the Bash script:
@@ -442,6 +444,17 @@ $SystemBashrc = if ($IsRocky) { '/etc/bashrc' } else { '/etc/bash.bashrc' }
 if ($IsRocky) {
     Write-Output ("distro:           rocky (jdk {0}, maven {1}, node {2}, no devcontainer features)" -f `
         $cfg.JavaVersion, $cfg.MavenVersion, $cfg.NodeFeatureVersion)
+}
+# Optional internal Maven mirror (rocky Dockerfile), '{version}' resolved here.
+$MavenDownloadUrl = $cfg.MavenDownloadUrl.Replace('{version}', $cfg.MavenVersion)
+$MavenDownloadToken = if ($cfg.MavenDownloadTokenEnv) {
+    [Environment]::GetEnvironmentVariable($cfg.MavenDownloadTokenEnv)
+} else { $null }
+if ($IsRocky -and $MavenDownloadUrl) {
+    Write-Output "maven mirror:     $MavenDownloadUrl"
+    if ($cfg.MavenDownloadTokenEnv -and -not $MavenDownloadToken) {
+        Write-Err "WARN: `$env:$($cfg.MavenDownloadTokenEnv) is not set -- the maven mirror is tried without auth"
+    }
 }
 
 # Repos: "<name>" + per-repo base ref. Single-repo mode (empty list in devcontainers-config.json)
@@ -2256,16 +2269,44 @@ ENV JAVA_HOME=__JAVA_HOME__
 # the JAVA_VERSION installed above -- so both get pinned back to __JAVA_HOME__
 # unconditionally, regardless of which Maven branch ran.
 ARG MAVEN_VERSION=__MAVEN_VERSION__
-RUN set -eux; \
-    if curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
-       || curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; \
-    then \
+# Optional first source: "mavenDownloadUrl" in devcontainers-config.json (an
+# internal mirror, e.g. a Nexus maven-public repo; .zip or .tar.gz, picked by
+# the URL's suffix). If "mavenDownloadTokenEnv" names a host env var holding
+# base64(user:password), spawn hands it to this build as an optional BuildKit
+# secret and it goes out as Basic auth -- it never lands in an image layer or
+# in `docker history`. Empty URL: straight to apache.org.
+RUN --mount=type=secret,id=maven_dl_token,required=false \
+    set -eux; \
+    mirror='__MAVEN_DOWNLOAD_URL__'; \
+    rm -rf /tmp/maven.tgz /tmp/maven.zip /tmp/maven-unzip; \
+    got=""; \
+    if [ -n "$mirror" ]; then \
+        case "$mirror" in *.zip) kind=zip ;; *) kind=tgz ;; esac; \
+        if [ -s /run/secrets/maven_dl_token ]; then \
+            if curl -fsSL -H "Authorization: Basic $(cat /run/secrets/maven_dl_token)" "$mirror" -o /tmp/maven.$kind; then got=$kind; fi; \
+        else \
+            if curl -fsSL "$mirror" -o /tmp/maven.$kind; then got=$kind; fi; \
+        fi; \
+    fi; \
+    if [ -z "$got" ]; then \
+        if curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
+           || curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; then \
+            got=tgz; \
+        fi; \
+    fi; \
+    if [ -n "$got" ]; then \
         mkdir -p /opt/maven; \
-        tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1; \
-        rm -f /tmp/maven.tgz; \
+        if [ "$got" = zip ]; then \
+            unzip -q /tmp/maven.zip -d /tmp/maven-unzip; \
+            cp -a /tmp/maven-unzip/*/. /opt/maven/; \
+            rm -rf /tmp/maven-unzip; \
+        else \
+            tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1; \
+        fi; \
+        rm -f /tmp/maven.tgz /tmp/maven.zip; \
         ln -sfn /opt/maven/bin/mvn /usr/local/bin/mvn; \
     else \
-        echo "note: apache.org unreachable -- falling back to the AppStream maven package (older, fixed version)" >&2; \
+        echo "WARNING: Maven ${MAVEN_VERSION} not downloadable (mavenDownloadUrl unset/failed, apache.org unreachable) -- falling back to the AppStream maven package (older, fixed version)" >&2; \
         dnf -y install --setopt=install_weak_deps=False maven; \
         dnf clean all; \
         rm -rf /var/cache/dnf; \
@@ -3152,6 +3193,12 @@ sudo chown vscode:vscode /home/vscode/.copilot || true
 for cmd in mvn claude bpmn-to-image; do
     real="$(bash -lc "command -v ${cmd}" 2>/dev/null || true)"
     if [[ -n "${real}" ]]; then
+        # Already there (e.g. the rocky Dockerfile links /usr/local/bin/mvn ->
+        # /opt/maven/bin/mvn): ln -sf would replace it with a self-reference.
+        if [[ "${real}" == "/usr/local/bin/${cmd}" ]]; then
+            echo "already on /usr/local/bin: ${cmd}"
+            continue
+        fi
         sudo ln -sf "${real}" "/usr/local/bin/${cmd}"
         echo "linked ${cmd} -> ${real}"
     else
@@ -3910,6 +3957,7 @@ $Tokens = [ordered]@{
     '__SYSTEM_BASHRC__'        = $SystemBashrc
     '__JAVA_VERSION__'         = $cfg.JavaVersion
     '__MAVEN_VERSION__'        = $cfg.MavenVersion
+    '__MAVEN_DOWNLOAD_URL__'   = $MavenDownloadUrl
 }
 foreach ($k in $PortTokens.Keys) { $Tokens[$k] = $PortTokens[$k] }
 
@@ -4091,6 +4139,12 @@ if ($RebuildBaseImage -or -not $baseExists) {
         foreach ($pair in $pairs) {
             $dockerBuildArgs += @('--build-arg', "$($pair[0])=$($pair[1])")
         }
+    }
+    # The rocky Dockerfile uses RUN --mount (BuildKit only).
+    $env:DOCKER_BUILDKIT = '1'
+    if ($MavenDownloadToken) {
+        # BuildKit secret, read from the env var -- never put on the command line
+        $dockerBuildArgs += @('--secret', "id=maven_dl_token,env=$($cfg.MavenDownloadTokenEnv)")
     }
     $dockerBuildArgs += (Join-Path $WsDir '.devcontainer')
     # docker build writes its progress to stderr; with $ErrorActionPreference =
