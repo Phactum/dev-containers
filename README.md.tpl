@@ -139,6 +139,8 @@ pubkey auth just works.
 
 Port offset for this workspace: **+__PORT_OFFSET__**
 (With `0` the host ports match the container ports.)
+Inside the container the offset is available as `$HOST_PORTOFFSET`
+(e.g. to build host-visible URLs: `http://localhost:$((8080 + HOST_PORTOFFSET))`).
 
 | Host | Container | Service |
 |------|-----------|---------|

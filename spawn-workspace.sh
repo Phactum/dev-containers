@@ -223,7 +223,9 @@
 #    on the detection above. The probe starts from INITIAL_PORT_OFFSET
 #    (default 10000), so the standard host ports (8080 -> 18080, ...) stay free
 #    by default even when idle; set initialPortOffset to 0 to probe from the
-#    native numbers. forwardPorts uses host:container syntax so the
+#    native numbers. The chosen offset is exported into the container as
+#    HOST_PORTOFFSET (containerEnv), e.g. HOST_PORTOFFSET=10000.
+#    forwardPorts uses host:container syntax so the
 #    container itself stays on its native ports (no Spring server.port
 #    override needed). OAuth callback / issuer URIs that *do* depend on the
 #    host-visible port (cockpit's redirect-uri, auth server's registered
@@ -3377,6 +3379,11 @@ __CONTAINER_REPO_MOUNTS__
         // in TimeZone.getDefault(), so Spring Boot logs land in local time
         // instead of the UTC default of the devcontainer base image.
         "TZ": "__HOST_TZ__",
+        // Port offset this workspace was spawned with (host port = container
+        // port + offset, e.g. 8080 -> 18080). Lets apps/scripts inside the
+        // container build host-visible URLs (OAuth redirects, links) without
+        // parsing forwardPorts.
+        "HOST_PORTOFFSET": "__PORT_OFFSET__",
         // Fixed (not auto-negotiated) D-Bus session + keyring address so every
         // process -- login shells, IDE-spawned non-login shells, exec sessions --
         // finds the same Secret Service without needing to source a profile

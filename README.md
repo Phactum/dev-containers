@@ -807,6 +807,8 @@ What it does:
    listener holds it, when another story workspace's `devcontainer.json`
    statically maps it, or when any docker container binds it → including
    stopped containers and containers of unrelated projects.
+   The chosen offset is exported into the container as `HOST_PORTOFFSET`
+   (e.g. `HOST_PORTOFFSET=10000`).
 4. Creates one git worktree per source repo with the requested branch
    (reused, tracked, or → for brand-new branches → forked from the
    per-repo `baseRef` defined in `repos`). On Windows the worktree link file

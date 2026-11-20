@@ -674,6 +674,8 @@ if (-not $SingleRepo) {
 # on the host, so several stories can run their containers in parallel without
 # colliding. The probe starts from initialPortOffset (default 10000) so the
 # standard host ports stay free by default; set it to 0 for the native numbers.
+# The chosen offset is exported into the container as HOST_PORTOFFSET
+# (containerEnv), e.g. HOST_PORTOFFSET=10000.
 # Three sources are probed:
 # ports statically reserved by other story workspaces' devcontainer.json files,
 # ports bound by ANY docker container (including stopped ones and containers of
@@ -2875,6 +2877,11 @@ __CONTAINER_REPO_MOUNTS__
         // in TimeZone.getDefault(), so Spring Boot logs land in local time
         // instead of the UTC default of the devcontainer base image.
         "TZ": "__HOST_TZ__",
+        // Port offset this workspace was spawned with (host port = container
+        // port + offset, e.g. 8080 -> 18080). Lets apps/scripts inside the
+        // container build host-visible URLs (OAuth redirects, links) without
+        // parsing forwardPorts.
+        "HOST_PORTOFFSET": "__PORT_OFFSET__",
         // Fixed (not auto-negotiated) D-Bus session + keyring address so every
         // process -- login shells, IDE-spawned non-login shells, exec sessions --
         // finds the same Secret Service without needing to source a profile
