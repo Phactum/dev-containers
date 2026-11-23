@@ -168,6 +168,10 @@
 #    the original goal, but every new container needs its own /login anyway
 #    (device/session binding), so there was nothing to gain and plenty to lose
 #    (last /login clobbered the others; the daemon/session files raced).
+#    Memory seed: if the source workspace ships <SOURCE_WS>/.claude/memory-seed/,
+#    its files (except its README.md) are copied into the shared memory folder,
+#    but ONLY while that folder holds no *.md note. Existing memory is never
+#    overwritten or mixed with the seed; no seed folder means nothing happens.
 #
 # 9. Host integration mounts (read-only where appropriate)
 #    ~/.ssh is mounted readonly so git finds keys out of the box. Only
@@ -1676,7 +1680,9 @@ fi
 # letting our post-create.sh build each repo separately. No aggregator -> no
 # false-parent shadow.
 
-# carry AGENTS.md and .claude into the new workspace so Claude Code has the same context
+# carry AGENTS.md, CLAUDE.md and .claude into the new workspace so Claude Code has the
+# same context (a CLAUDE.md that only imports @AGENTS.md needs AGENTS.md next to it)
+[[ -f "${SOURCE_WS}/AGENTS.md" ]] && cp "${SOURCE_WS}/AGENTS.md" "${WS_DIR}/"
 [[ -f "${SOURCE_WS}/CLAUDE.md" ]] && cp "${SOURCE_WS}/CLAUDE.md" "${WS_DIR}/"
 [[ -d "${SOURCE_WS}/.claude"   ]] && cp -R "${SOURCE_WS}/.claude" "${WS_DIR}/"
 
@@ -2189,6 +2195,35 @@ fi
 SHARED_MEMORY_DIR="${HOME}/.claude/projects/${MEMORY_KEY}/memory"
 mkdir -p "${SHARED_MEMORY_DIR}"
 [[ -e "${SHARED_MEMORY_DIR}/.keep" ]] || touch "${SHARED_MEMORY_DIR}/.keep"
+
+# Start memory (feature 8, "memory seed"): a project may ship a few notes in
+# <SOURCE_WS>/.claude/memory-seed/. They are copied into the shared memory only
+# while it holds no note at all (dir missing, or no *.md in it -- the .keep
+# marker does not count). A memory with even one note is left alone: the seed
+# never overwrites and never mixes with notes Claude has written. The seed
+# folder's own README.md documents the seed and is not copied. No seed folder
+# means nothing to do, silently.
+seed_shared_memory() {
+    local seed_dir="$1" memory_dir="$2" f name copied=0
+    [[ -d "${seed_dir}" ]] || return 0
+    for f in "${memory_dir}"/*.md; do
+        [[ -e "${f}" ]] && return 0
+    done
+    mkdir -p "${memory_dir}"
+    for f in "${seed_dir}"/*; do
+        [[ -f "${f}" ]] || continue
+        name="$(basename "${f}")"
+        [[ "${name}" == "README.md" ]] && continue
+        [[ -e "${memory_dir}/${name}" ]] && continue
+        cp "${f}" "${memory_dir}/${name}"
+        copied=$(( copied + 1 ))
+    done
+    if (( copied > 0 )); then
+        echo "claude memory: seeded ${copied} file(s) from ${seed_dir}"
+    fi
+    return 0
+}
+seed_shared_memory "${SOURCE_WS}/.claude/memory-seed" "${SHARED_MEMORY_DIR}"
 
 # The generated devcontainer.json overlays a handful of global Claude config
 # files read-only from the host into each container's ~/.claude volume
