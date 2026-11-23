@@ -1294,8 +1294,12 @@ foreach ($cr in $ContainerRepos) {
 # Workspace content: Claude, README, .idea
 # ============================================================================
 
-# Carry CLAUDE.md and .claude into the new workspace so Claude Code has the same
-# project-level context as the source workspace.
+# Carry AGENTS.md, CLAUDE.md and .claude into the new workspace so Claude Code has
+# the same project-level context as the source workspace (a CLAUDE.md that only
+# imports @AGENTS.md needs AGENTS.md next to it).
+if (Test-Path -LiteralPath (Join-Path $SourceWs 'AGENTS.md')) {
+    Copy-Item -LiteralPath (Join-Path $SourceWs 'AGENTS.md') -Destination $WsDir -Force
+}
 if (Test-Path -LiteralPath (Join-Path $SourceWs 'CLAUDE.md')) {
     Copy-Item -LiteralPath (Join-Path $SourceWs 'CLAUDE.md') -Destination $WsDir -Force
 }
@@ -1758,6 +1762,33 @@ foreach ($d in (Join-Path $HomeDir '.m2\repository'), (Join-Path $HomeDir '.ssh'
 # fail to start (see KNOWN-ISSUE-container-start-memory-mount.md).
 $MemoryKeep = Join-Path $SharedMemoryDir '.keep'
 if (-not (Test-Path -LiteralPath $MemoryKeep)) { New-Item -ItemType File -Path $MemoryKeep -Force | Out-Null }
+
+# Start memory (feature 8 "memory seed" in spawn-workspace.sh): a project may ship
+# a few notes in <SourceWs>/.claude/memory-seed/. They are copied into the shared
+# memory only while it holds no note at all (no *.md in it -- the .keep marker
+# does not count). A memory with even one note is left alone: the seed never
+# overwrites and never mixes with notes Claude has written. The seed folder's own
+# README.md documents the seed and is not copied. No seed folder means nothing to
+# do, silently.
+function Copy-MemorySeed {
+    param([string]$SeedDir, [string]$MemoryDir)
+    if (-not (Test-Path -LiteralPath $SeedDir -PathType Container)) { return }
+    if (Test-Path -LiteralPath $MemoryDir -PathType Container) {
+        $notes = @(Get-ChildItem -LiteralPath $MemoryDir -File | Where-Object { $_.Extension -eq '.md' -and -not $_.Name.StartsWith('.') })
+        if ($notes.Count -gt 0) { return }
+    }
+    New-Item -ItemType Directory -Path $MemoryDir -Force | Out-Null
+    $copied = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $SeedDir -File)) {
+        if ($f.Name.StartsWith('.') -or $f.Name -eq 'README.md') { continue }
+        $dst = Join-Path $MemoryDir $f.Name
+        if (Test-Path -LiteralPath $dst) { continue }
+        Copy-Item -LiteralPath $f.FullName -Destination $dst
+        $copied++
+    }
+    if ($copied -gt 0) { Write-Output "claude memory: seeded $copied file(s) from $SeedDir" }
+}
+Copy-MemorySeed -SeedDir (Join-Path $SourceWs '.claude\memory-seed') -MemoryDir $SharedMemoryDir
 
 # The generated devcontainer.json overlays a handful of global Claude config files
 # read-only from the host into each container's ~/.claude volume (CLAUDE.md,

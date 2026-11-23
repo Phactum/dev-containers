@@ -993,6 +993,15 @@ the host copy to reset new containers). Project-specific settings still go in
 `<workspace>/.claude/settings.json` (checked in) or `settings.local.json`, which
 travel with the workspace and override the user settings.
 
+**Memory seed.** A project can ship a start memory in
+`<workspace>/.claude/memory-seed/` (one `.md` file per note plus a `MEMORY.md`
+index). When spawn finds the shared memory folder missing or without any `.md`
+file, it copies the seed files into it (all except the seed folder's own
+`README.md`) and prints one line. As soon as the memory holds a single note,
+spawn leaves it alone: the seed never overwrites a note and is never mixed with
+notes Claude has written. Without a seed folder nothing happens. Changes to the
+seed reach only new, empty memories.
+
 > **Note:** the original motivation for sharing `~/.claude` was to avoid logging
 > in per container — but a new container needs its own `/login` regardless
 > (device/session binding), so nothing was gained by sharing credentials and the
